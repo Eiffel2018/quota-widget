@@ -1,8 +1,8 @@
-# Quota Widget 0.3.16
+# Quota Widget 0.3.17
 
-修正跨重啟的百分比區間起點：按歷史上一個相同百分比變化接續 Token 統計，不再錯用本次開 App 時間。每%用度表只顯示變化時間；Sol、Luna、Astra 及總計的次數和 USD 分兩行，沒有 Token 記錄會顯示未知。主視窗標題顯示 `v3.16`。
+修正跨重啟的百分比區間起點：按歷史上一個相同百分比變化接續 Token 統計，不再錯用本次開 App 時間。每%用度表縮窄欄位並只顯示變化時間；Sol、Luna、Astra 及 Total 的次數和 USD 分兩行，沒有 Token 記錄會顯示未知。主視窗標題顯示 `v3.17`。
 
-[更新說明](docs/RELEASE-0.3.16.md) · [Windows 驗證](VALIDATION-0.3.16.md)
+[更新說明](docs/RELEASE-0.3.17.md) · [Windows 驗證](VALIDATION-0.3.17.md)
 
 ## 0.3.10
 

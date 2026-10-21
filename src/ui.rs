@@ -2769,9 +2769,9 @@ impl WidgetApp {
             return;
         }
         let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
-        const X: [f32; 6] = [0., 115., 365., 545., 725., 905.];
-        const WIDTH: [f32; 6] = [105., 240., 170., 170., 170., 150.];
-        const TABLE_WIDTH: f32 = 1075.;
+        const X: [f32; 6] = [0., 78., 272., 382., 492., 602.];
+        const WIDTH: [f32; 6] = [72., 188., 104., 104., 104., 104.];
+        const TABLE_WIDTH: f32 = 710.;
         egui::ScrollArea::horizontal()
             .id_salt("interval-table-horizontal")
             .show(ui, |ui| {
@@ -2786,7 +2786,7 @@ impl WidgetApp {
                     "Sol",
                     "Luna",
                     "Astra",
-                    "Total USD",
+                    "Total",
                 ]
                 .iter()
                 .enumerate()
@@ -2921,8 +2921,7 @@ impl WidgetApp {
                                         ),
                                         egui::Label::new(RichText::new(&cells[i]).size(
                                             ui.style().text_styles[&egui::TextStyle::Body].size,
-                                        ))
-                                        .truncate(),
+                                        )),
                                     )
                                     .on_hover_text(&hints[i]);
                                 }
