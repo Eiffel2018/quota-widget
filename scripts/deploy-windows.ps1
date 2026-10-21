@@ -27,7 +27,23 @@ if ((Get-FileHash -LiteralPath $quotaIncoming -Algorithm SHA256).Hash -ne $quota
 if (Test-Path -LiteralPath $quotaExecutable) {
     # Replace by renaming on the same volume. A running instance can finish
     # using its old image; its next launch uses the new fixed-path executable.
-    [IO.File]::Replace($quotaIncoming, $quotaExecutable, $quotaPrevious, $true)
+    $quotaInstalledHash = (Get-FileHash -LiteralPath $quotaExecutable -Algorithm SHA256).Hash
+    try {
+        [IO.File]::Replace($quotaIncoming, $quotaExecutable, $quotaPrevious, $true)
+    } catch [IO.IOException] {
+        # A process may still run the image now named previous.exe after an
+        # earlier update. Preserve that mapped backup and use a fresh rollback
+        # file. Retry only if the installed and staged files remain intact.
+        if (-not (Test-Path -LiteralPath $quotaIncoming) -or
+            -not (Test-Path -LiteralPath $quotaExecutable) -or
+            (Get-FileHash -LiteralPath $quotaExecutable -Algorithm SHA256).Hash -ne $quotaInstalledHash -or
+            (Get-FileHash -LiteralPath $quotaIncoming -Algorithm SHA256).Hash -ne $quotaHash) {
+            throw
+        }
+        $quotaRetainedBackup = Join-Path $quotaDestination ("quota-widget.previous-" + [Guid]::NewGuid().ToString('N') + '.exe')
+        [IO.File]::Replace($quotaIncoming, $quotaExecutable, $quotaRetainedBackup, $true)
+        Write-Host "Previous backup in use; rollback image retained at $quotaRetainedBackup"
+    }
 } else {
     [IO.File]::Move($quotaIncoming, $quotaExecutable)
 }

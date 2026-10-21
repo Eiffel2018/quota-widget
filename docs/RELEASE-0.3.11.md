@@ -16,6 +16,8 @@ instance also stayed read-only after the previous writer exited.
   Other live writers retain exclusive ownership.
 - A zero-event, zero-subtotal interval now says it has no Token records rather
   than presenting the subtotal as measured zero usage.
+- Repeated fixed-path deployments preserve a backup still mapped by a running
+  older instance and use a fresh rollback file for the next update.
 - The debit table has five columns: quota change, start, end, duration and USD
   estimate. Click a row for calibration, raw Token subtotals and model details.
   Per-point pricing appears once above the table.
