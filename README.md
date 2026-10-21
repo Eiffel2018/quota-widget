@@ -1,3 +1,14 @@
+# Quota Widget 0.3.9
+
+同一連續額度區間共用一致的每百分點估值，原始 Token 小計另列保留。
+資料覆蓋不完整時標示下限；支援 Windows ImDisk RAM Drive。
+
+[0.3.9 計法與更新說明](docs/RELEASE-0.3.9.md) · [已恢復的版本歷史](docs/SOURCE-HISTORY.md)
+
+建置及測試：`cargo test --locked`、`cargo build --release --locked`。
+編譯輸出及測試暫存可透過 `CARGO_TARGET_DIR`、`TEMP`、`TMP` 放到 RAM Drive；
+重要 source、發佈包及驗證結果應保存在有明確名稱的正式目錄。
+
 # Quota Widget 0.3.8
 
 Hide inactive historical subagent branches from the live Task tree. Keep recent/current-interval contributors and their required ancestors. Historical accounting is preserved. See [release notes](docs/RELEASE-0.3.8.md) and [validation](VALIDATION-0.3.8.md).

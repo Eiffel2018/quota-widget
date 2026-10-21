@@ -16,6 +16,7 @@ use quota_widget::{
     interval_views::{self, IntervalPresentation},
     intervals::{self, CompletedInterval},
     model::{HistoryEvent, QuotaModel, WindowView},
+    quota_estimate::{self, QuotaEstimate},
     storage::{self, DataLock, Settings},
     tokens::{ImportPhase, ModelPrice, Pricing, TokenEvent, TokenStore},
     usage_views::{self, GroupBy},
@@ -209,6 +210,7 @@ struct WidgetApp {
     intervals: Arc<Vec<CompletedInterval>>,
     interval_lookup: BTreeMap<String, usize>,
     interval_presentations: Vec<IntervalPresentation>,
+    interval_estimates: Vec<Option<QuotaEstimate>>,
     history_intervals: bool,
     selected_interval: Option<String>,
     token_generation: u64,
@@ -698,6 +700,7 @@ impl WidgetApp {
             intervals: Arc::new(Vec::new()),
             interval_lookup: BTreeMap::new(),
             interval_presentations: Vec::new(),
+            interval_estimates: Vec::new(),
             history_intervals: true,
             selected_interval: None,
             token_generation: 0,
@@ -1308,7 +1311,12 @@ impl WidgetApp {
             .map(|(i, row)| (row.history_event_key.clone(), i))
             .collect();
         // Reformat only when canonical data changes, never on every repaint.
-        self.interval_presentations = intervals.iter().map(interval_views::present).collect();
+        self.interval_estimates = quota_estimate::shared_estimates(&intervals);
+        self.interval_presentations = intervals
+            .iter()
+            .zip(&self.interval_estimates)
+            .map(|(row, estimate)| interval_views::present_with_estimate(row, estimate.as_ref()))
+            .collect();
         self.intervals = intervals;
         self.history_cache.key = None;
         self.main_cache.key = None;
@@ -1454,12 +1462,13 @@ impl WidgetApp {
         for &index in &recent_intervals {
             let row = &self.interval_presentations[index];
             recent_tooltip.push_str(&format!(
-                "\n{} · {}\n估算 USD {} · 每% {} · {}\n",
+                "\n{} · {}\n估算 USD {} · 每% {} · {}\n區間 Token 小計 {}\n",
                 row.change,
                 row.end,
                 row.total,
                 row.per_point.replace("/百分點", ""),
-                row.status
+                row.status,
+                row.observed_total
             ));
         }
         let boundary = all
@@ -2205,8 +2214,6 @@ impl WidgetApp {
                 })
                 .collect();
             self.history_cache.rows.reverse();
-            let mut cost_total = 0.0;
-            let mut points_total = 0.0;
             self.history_cache.interval_indices.clear();
             for (event, _, _) in &self.history_cache.rows {
                 if let Some(&index) = self
@@ -2214,22 +2221,44 @@ impl WidgetApp {
                     .get(&intervals::history_event_key(event))
                 {
                     self.history_cache.interval_indices.push(index);
-                    let interval = &self.intervals[index];
-                    if interval.comparable && !interval.partial {
-                        cost_total += interval.known_usd;
-                        points_total += interval.percentage_points;
-                    }
                 }
             }
-            self.history_cache.weighted = (points_total > 0.0).then_some(cost_total / points_total);
+            self.history_cache.weighted = self
+                .history_cache
+                .interval_indices
+                .first()
+                .and_then(|&i| self.interval_estimates[i].as_ref())
+                .map(|estimate| estimate.usd_per_point);
             self.history_cache.key = Some(key);
         }
         ui.label(format!("紀錄：{} 筆", self.history_cache.rows.len()));
         ui.separator();
+        let estimate = self
+            .history_cache
+            .interval_indices
+            .first()
+            .and_then(|&i| self.interval_estimates[i].as_ref());
         ui.label(format!(
-            "加權估算：{} / 百分點",
+            "最新連續區間統一估值：{}{} / 百分點",
+            if estimate.is_some_and(|value| value.lower_bound) {
+                "≥ "
+            } else {
+                "≈ "
+            },
             money(self.history_cache.weighted)
         ));
+        if let Some(value) = estimate {
+            ui.label(format!(
+                "樣本：{} 個區間 · {} 百分點{}",
+                value.intervals,
+                value.percentage_points,
+                if value.lower_bound {
+                    " · Token 覆蓋不完整，僅供下限估算"
+                } else {
+                    ""
+                }
+            ));
+        }
         if let Some(message) = self.empty_history_diagnostic() {
             ui.colored_label(ui.visuals().warn_fg_color, message);
         }
@@ -2258,10 +2287,25 @@ impl WidgetApp {
                                 .interval_lookup
                                 .get(&intervals::history_event_key(event))
                                 .and_then(|i| self.intervals.get(*i));
-                            let description = history_description(event, *cost, *partial, interval);
+                            let presentation = self
+                                .interval_lookup
+                                .get(&intervals::history_event_key(event))
+                                .map(|&i| &self.interval_presentations[i]);
+                            let description = presentation
+                                .map(|view| {
+                                    format!(
+                                        "{} · 統一扣額估算 {} · 區間 Token 小計 {}",
+                                        view.change, view.total, view.observed_total
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    history_description(event, *cost, *partial, interval)
+                                });
                             let tooltip = format!(
                                 "{}\n來源：{} · 觀察工作階段：{}",
-                                history_tooltip(&description, interval),
+                                presentation
+                                    .map(|view| view.tooltip.clone())
+                                    .unwrap_or_else(|| history_tooltip(&description, interval)),
                                 event.source_key,
                                 event.session
                             );
@@ -2320,11 +2364,18 @@ impl WidgetApp {
                         interval.percentage_points
                     ));
                     ui.strong(format!(
-                        "已知估算總和 {}{} · 每百分點 {}",
+                        "區間 Token 小計 {}{}",
                         money(Some(interval.known_usd)),
-                        if interval.partial { " *" } else { "" },
-                        money(interval.cost_per_point)
+                        if interval.partial { " *" } else { "" }
                     ));
+                    if let Some(&index) = self.interval_lookup.get(&interval.history_event_key) {
+                        let view = &self.interval_presentations[index];
+                        ui.label(format!(
+                            "統一扣額估算 {} · {} · {}",
+                            view.total, view.per_point, view.status
+                        ))
+                        .on_hover_text(&view.tooltip);
+                    }
                     if !interval.comparable {
                         ui.colored_label(ui.visuals().warn_fg_color, PARTIAL_INTERVAL_WARNING);
                     }
@@ -2402,22 +2453,23 @@ impl WidgetApp {
             return;
         }
         let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
-        const X: [f32; 8] = [0., 90., 260., 430., 525., 675., 840., 1080.];
-        const WIDTH: [f32; 8] = [80., 160., 160., 85., 140., 155., 230., 80.];
+        const X: [f32; 9] = [0., 90., 260., 430., 525., 675., 840., 1030., 1200.];
+        const WIDTH: [f32; 9] = [80., 160., 160., 85., 140., 155., 180., 160., 80.];
         egui::ScrollArea::horizontal()
             .id_salt("interval-table-horizontal")
             .show(ui, |ui| {
-                ui.set_min_width(1160. * scale);
+                ui.set_min_width(1280. * scale);
                 let (header, _) =
-                    ui.allocate_exact_size(Vec2::new(1160. * scale, 26. * scale), Sense::hover());
+                    ui.allocate_exact_size(Vec2::new(1280. * scale, 26. * scale), Sense::hover());
                 for (i, title) in [
                     "額度變化",
                     "開始（香港）",
                     "結束（香港）",
                     "歷時",
-                    "估算 USD 總用度",
-                    "USD / 百分點",
-                    "資料狀態",
+                    "扣額統一估算 USD",
+                    "統一 USD / 百分點",
+                    "估算狀態",
+                    "區間 Token 小計 USD",
                     "模型",
                 ]
                 .iter()
@@ -2444,7 +2496,7 @@ impl WidgetApp {
                                 let interval = &self.intervals[index];
                                 let view = &self.interval_presentations[index];
                                 let (rect, response) = ui.allocate_exact_size(
-                                    Vec2::new(1160. * scale, 42. * scale),
+                                    Vec2::new(1280. * scale, 42. * scale),
                                     Sense::hover(),
                                 );
                                 response.on_hover_text(&view.tooltip);
@@ -2456,6 +2508,7 @@ impl WidgetApp {
                                     &view.total,
                                     &view.per_point,
                                     &view.status,
+                                    &view.observed_total,
                                 ];
                                 for (i, text) in cells.iter().enumerate() {
                                     ui.put(
@@ -2478,7 +2531,7 @@ impl WidgetApp {
                                 if ui
                                     .put(
                                         Rect::from_min_size(
-                                            rect.min + Vec2::new(X[7] * scale, 2.),
+                                            rect.min + Vec2::new(X[8] * scale, 2.),
                                             Vec2::new(76. * scale, 26. * scale),
                                         ),
                                         egui::Button::new("模型分項"),
@@ -3152,6 +3205,9 @@ impl WidgetApp {
                 );
                 let path = folder.join(filename);
                 let mut completed_export: Vec<CompletedInterval> = Vec::new();
+                let mut estimate_by_key: BTreeMap<String, Option<QuotaEstimate>> = canonical_intervals.iter()
+                    .zip(quota_estimate::shared_estimates(&canonical_intervals))
+                    .map(|(row, estimate)| (row.history_event_key.clone(), estimate)).collect();
                 let mut events: Vec<serde_json::Value> = if tokens {
                     usage_events
                         .iter()
@@ -3199,7 +3255,10 @@ impl WidgetApp {
                         let canonical: BTreeMap<_, _> = canonical_intervals.iter().map(|interval| (&interval.history_event_key, interval)).collect();
                         all.iter().map(|event| canonical_interval_cost(canonical.get(&intervals::history_event_key(event)).copied())).collect()
                     } else {
-                        completed_export = intervals::completed_intervals(snapshot.events(), &all).into_iter().filter(|interval|local_day(interval.end)==Some(day)).collect();
+                        let calculated = intervals::completed_intervals(snapshot.events(), &all);
+                        estimate_by_key = calculated.iter().zip(quota_estimate::shared_estimates(&calculated))
+                            .map(|(row, estimate)| (row.history_event_key.clone(), estimate)).collect();
+                        completed_export = calculated.into_iter().filter(|interval|local_day(interval.end)==Some(day)).collect();
                         accounting::history_costs(&snapshot.cost_index, &all)
                     };
                     let interval_map: BTreeMap<_,_> = completed_export.iter().map(|interval|(interval.history_event_key.as_str(),interval)).collect();
@@ -3225,6 +3284,8 @@ impl WidgetApp {
                                 v["interval_comparable"] = serde_json::json!(interval.comparable);
                                 v["interval_reasons"] = serde_json::json!(interval.reasons);
                                 v["interval_models"] = serde_json::json!(interval.models);
+                                let estimate = estimate_by_key.get(&interval.history_event_key).and_then(Option::as_ref);
+                                quota_estimate::annotate_export(&mut v, interval, estimate);
                             }
                             v
                         })
@@ -3341,6 +3402,10 @@ impl WidgetApp {
                                 "interval_comparable",
                                 "interval_reasons",
                                 "interval_models",
+                                "quota_estimated_usd",
+                                "quota_usd_per_point",
+                                "quota_estimate",
+                                "quota_estimate_method",
                                 "pricing_basis",
                                 "pricing_verified_at",
                                 "long_context_adjustment",

@@ -15,6 +15,7 @@ pub struct IntervalPresentation {
     pub end: String,
     pub duration: String,
     pub total: String,
+    pub observed_total: String,
     pub per_point: String,
     pub status: String,
     pub tooltip: String,
@@ -126,11 +127,54 @@ pub fn present(interval: &CompletedInterval) -> IntervalPresentation {
         start,
         end,
         duration,
+        observed_total: total.clone(),
         total,
         per_point,
         status,
         tooltip,
     }
+}
+
+/// Shared quota estimate for display; keep the observed token subtotal separate.
+pub fn present_with_estimate(
+    interval: &CompletedInterval,
+    estimate: Option<&crate::quota_estimate::QuotaEstimate>,
+) -> IntervalPresentation {
+    let mut view = present(interval);
+    let marker = if estimate.is_some_and(|value| value.lower_bound) {
+        " ≥"
+    } else {
+        " ≈"
+    };
+    view.total = estimate
+        .map(|value| format!("{marker} {}", money(value.total(interval))))
+        .unwrap_or_else(|| "未知".into());
+    view.per_point = estimate
+        .map(|value| format!("{marker} {}/百分點", money(value.usd_per_point)))
+        .unwrap_or_else(|| "未知".into());
+    view.status = match estimate {
+        Some(value) if value.lower_bound => "統一估值 · 下限",
+        Some(_) => "統一估值",
+        None => "未有足夠連續資料",
+    }
+    .into();
+    if interval.partial {
+        view.status.push_str(" · 部分");
+    }
+    view.tooltip.push_str(&format!(
+        "\n扣額統一估算：{}\n統一每百分點：{}\n估算狀態：{}",
+        view.total, view.per_point, view.status
+    ));
+    if let Some(value) = estimate {
+        view.tooltip.push_str(&format!(
+            "\n校準樣本：{} 個區間 / {} 百分點\n算法：連續區間 Token 小計總和 ÷ 百分點總和\n估值期間：{} 至 {}\n估值用途：歷史估算，並非官方固定美元換算率",
+            value.intervals,
+            value.percentage_points,
+            display_time::datetime(value.start).unwrap_or_default(),
+            display_time::datetime(value.end).unwrap_or_default()
+        ));
+    }
+    view
 }
 
 /// Indices of every interval, newest end first, then stable event key ascending.

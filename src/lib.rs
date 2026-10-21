@@ -14,6 +14,7 @@ pub mod usage_views;
 
 pub mod interval_views;
 pub mod intervals;
+pub mod quota_estimate;
 
 pub mod db_view;
 
