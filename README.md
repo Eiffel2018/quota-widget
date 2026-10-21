@@ -9,6 +9,12 @@
 編譯輸出及測試暫存可透過 `CARGO_TARGET_DIR`、`TEMP`、`TMP` 放到 RAM Drive；
 重要 source、發佈包及驗證結果應保存在有明確名稱的正式目錄。
 
+`scripts/build-windows.ps1` 完成檢查及編譯後，會固定部署到 repository 上一層的
+`quota-widget.exe`；之後只需重啟同一個 EXE，捷徑毋須隨版本修改。
+未設定 `CARGO_TARGET_DIR` 時，編譯 cache 使用系統 `TEMP` 下的 `quota-widget-build`。
+部署會校驗 SHA-256，並保留上一個 EXE 為 `quota-widget.previous.exe`。
+亦可用 `scripts/deploy-windows.ps1 -SourcePath <已建置的EXE>` 單獨部署。
+
 # Quota Widget 0.3.8
 
 Hide inactive historical subagent branches from the live Task tree. Keep recent/current-interval contributors and their required ancestors. Historical accounting is preserved. See [release notes](docs/RELEASE-0.3.8.md) and [validation](VALIDATION-0.3.8.md).
