@@ -3,6 +3,8 @@
 修正釘選工作列後圖示消失：Windows EXE 內嵌 16–256 像素的原有圖示，
 固定部署位置亦提供 `quota-widget.ico` 供捷徑使用。
 
+[更新說明](docs/RELEASE-0.3.10.md) · [Windows 驗證](VALIDATION-0.3.10.md)
+
 ## 0.3.9
 
 同一連續額度區間共用一致的每百分點估值，原始 Token 小計另列保留。
