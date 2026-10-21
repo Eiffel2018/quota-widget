@@ -249,6 +249,8 @@ struct WidgetApp {
     export_cancel: Option<CancellationToken>,
     closing_since: Option<Instant>,
     close_ready: bool,
+    lock_retry_pending: bool,
+    last_lock_retry: Instant,
     last_import: Instant,
     last_save: Instant,
     last_topmost: Instant,
@@ -739,6 +741,8 @@ impl WidgetApp {
             export_cancel: None,
             closing_since: None,
             close_ready: false,
+            lock_retry_pending: false,
+            last_lock_retry: Instant::now(),
             last_import: Instant::now() - Duration::from_secs(60),
             last_save: Instant::now(),
             last_topmost: Instant::now(),
@@ -919,6 +923,7 @@ impl WidgetApp {
     }
     fn start_import(&mut self) {
         if self.demo
+            || (self.database_mode && !self.persistent)
             || self.import_pending
             || self.worker_failed
             || !self.settings.import_enabled
@@ -1153,6 +1158,25 @@ impl WidgetApp {
             }
         }
     }
+    fn retry_write_lock(&mut self) {
+        if !self.database_mode
+            || !self.read_state
+            || self._lock.is_some()
+            || self.lock_retry_pending
+            || self.load_pending
+            || self.import_pending
+            || self.worker_failed
+            || self.load_error.is_some()
+            || self.closing_since.is_some()
+            || self.last_lock_retry.elapsed() < Duration::from_secs(5)
+        {
+            return;
+        }
+        self.last_lock_retry = Instant::now();
+        self.lock_retry_pending = self.send_work(WorkCommand::AcquireWriter {
+            dir: self.dir.clone(),
+        });
+    }
     fn pump(&mut self) {
         let messages: Vec<_> = self
             .bridge
@@ -1183,6 +1207,7 @@ impl WidgetApp {
             }
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
+        self.retry_write_lock();
         if !self.demo && !self.import_pending && self.last_import.elapsed() > Duration::from_secs(5)
         {
             self.start_import();
@@ -1193,6 +1218,25 @@ impl WidgetApp {
     }
     fn handle_worker_event(&mut self, event: WorkEvent) {
         match event {
+            WorkEvent::WriterLock { lock } => {
+                self.lock_retry_pending = false;
+                if let Some(lock) = lock {
+                    self._lock = Some(lock);
+                    self.persistent = true;
+                    self.load_pending = self.send_work(WorkCommand::Load {
+                        token_path: self.dir.join("tokens.json"),
+                        history_path: Some(self.dir.join("history.json")),
+                        pricing: self.settings.pricing.clone(),
+                    });
+                    self.send_work(WorkCommand::MergeHistory {
+                        events: self.history.as_ref().clone(),
+                        save_path: self.save_path("history.json"),
+                    });
+                    self.import_error = None;
+                    self.notice = "已重新取得寫入權，正在更新本機用量。".into();
+                    self.last_import = Instant::now() - Duration::from_secs(60);
+                }
+            }
             WorkEvent::Progress(progress) => {
                 if self.worker_failed {
                     return;
@@ -2239,7 +2283,7 @@ impl WidgetApp {
             .first()
             .and_then(|&i| self.interval_estimates[i].as_ref());
         ui.label(format!(
-            "最新連續區間統一估值：{}{} / 百分點",
+            "每百分點估值：{}{} / 百分點",
             if estimate.is_some_and(|value| value.lower_bound) {
                 "≥ "
             } else {
@@ -5321,6 +5365,76 @@ mod database_display_tests {
         assert!(!reader.persistent);
         assert!(reader._lock.is_none());
         assert!(reader.bridge.is_none());
+        // The remaining reader automatically becomes the writer once the old
+        // owner closes, then reopens its SQLite connection with write access.
+        let live: HistoryEvent = serde_json::from_value(serde_json::json!({
+            "session":"read-only-observer", "observed_at_unix":1700000000,
+            "source_key":"codex", "epoch":0, "kind":"QuotaDecrease",
+            "window_label":"week", "window_key":"primary",
+            "before":"50", "after":"49", "delta":"1", "partial":true
+        }))
+        .unwrap();
+        writer.worker.shutdown().unwrap();
+        drop(writer._lock.take());
+        reader.load_pending = reader.send_work(WorkCommand::Load {
+            token_path: temp.path().join("tokens.json"),
+            history_path: Some(temp.path().join("history.json")),
+            pricing: reader.settings.pricing.clone(),
+        });
+        for _ in 0..400 {
+            reader.pump();
+            if !reader.load_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            DataLock::acquire(temp.path()).is_err(),
+            "immutable reader holds a shared lock"
+        );
+        reader.history = Arc::new(vec![live.clone()]);
+        reader.last_lock_retry = Instant::now() - Duration::from_secs(6);
+        reader.retry_write_lock();
+        for _ in 0..400 {
+            reader.pump();
+            if reader._lock.is_some() && !reader.load_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reader._lock.is_some());
+        assert!(reader.persistent);
+        assert!(!reader.load_pending);
+        assert!(reader.load_error.is_none(), "{:?}", reader.load_error);
+        assert!(reader.tokens.database.is_some());
+        let logs = temp.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::write(logs.join("synthetic.jsonl"), format!("{}\n", serde_json::json!({
+            "timestamp": now(), "type":"token_usage_record", "payload": {
+                "thread_id":"writer-recovery", "turn_id":"turn", "response_id":"response",
+                "model":"gpt-6.1-sol", "usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10}
+            }
+        }))).unwrap();
+        reader.settings.sessions_path = logs.to_string_lossy().into();
+        reader.settings.import_enabled = true;
+        reader.start_import();
+        for _ in 0..400 {
+            reader.pump();
+            if !reader.import_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reader.import_error.is_none(), "{:?}", reader.import_error);
+        assert_eq!(reader.included_count(), 1);
+        reader.worker.shutdown().unwrap();
+        let saved: serde_json::Value =
+            storage::load_json(&temp.path().join("history.json")).unwrap();
+        assert!(saved["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["observed_at_unix"] == live.observed_at_unix));
     }
     #[test]
     fn long_context_export_labels_thresholds_without_changing_costs() {

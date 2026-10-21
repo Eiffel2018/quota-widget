@@ -31,7 +31,7 @@ pub fn annotate_export(
     value["quota_estimated_usd"] = serde_json::json!(estimate.map(|e| e.total(interval)));
     value["quota_usd_per_point"] = serde_json::json!(estimate.map(|e| e.usd_per_point));
     value["quota_estimate"] = serde_json::json!(estimate);
-    value["quota_estimate_method"] = serde_json::json!("contiguous_ratio_of_sums_v1");
+    value["quota_estimate_method"] = serde_json::json!("contiguous_ratio_of_sums_with_carry_v2");
 }
 
 fn eligible(row: &CompletedInterval) -> bool {
@@ -83,7 +83,7 @@ pub fn shared_estimates(rows: &[CompletedInterval]) -> Vec<Option<QuotaEstimate>
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut group_by_key: BTreeMap<&str, usize> = BTreeMap::new();
     let mut used_predecessors = BTreeSet::new();
-    for i in order {
+    for &i in &order {
         let row = &rows[i];
         if !eligible(row) || counts[&row.history_event_key] != 1 {
             continue;
@@ -128,6 +128,54 @@ pub fn shared_estimates(rows: &[CompletedInterval]) -> Vec<Option<QuotaEstimate>
         for i in group {
             result[i] = Some(estimate.clone());
         }
+    }
+    // A new observer or a temporary token-import gap must not erase a usable
+    // calibration. Carry it forward only along matching quota endpoints for a
+    // known account/window, never across a reset, changed epoch or stale gap.
+    // These rows do NOT contribute zero/missing token costs to calibration.
+    let mut latest: BTreeMap<_, (usize, Option<QuotaEstimate>)> = BTreeMap::new();
+    for i in order {
+        let row = &rows[i];
+        let Some(account) = row.account_id.as_deref() else {
+            continue;
+        };
+        let key = (account, &row.source_key, &row.window_key, &row.window_label);
+        if result[i].is_none() && counts[&row.history_event_key] == 1 {
+            if let Some((prior_index, Some(estimate))) = latest.get(&key) {
+                let prior = &rows[*prior_index];
+                let continuous = row
+                    .start
+                    .is_some_and(|start| start >= prior.end && start < row.end)
+                    && row.end > prior.end
+                    && estimate.end <= prior.end
+                    && row.end - estimate.end <= 86400
+                    && (row.before - prior.after).abs() < 1e-6
+                    && row.before.is_finite()
+                    && row.after.is_finite()
+                    && (0.0..=100.0).contains(&row.after)
+                    && row.percentage_points.is_finite()
+                    && row.percentage_points > 0.0
+                    && ((row.before - row.after) - row.percentage_points).abs() < 1e-6
+                    && (row.session != prior.session || row.epoch == prior.epoch)
+                    && row.start_boundary_kind != StartBoundaryKind::QuotaReset
+                    && !row.reasons.iter().any(|reason| {
+                        matches!(
+                            reason,
+                            IntervalReason::ResetBoundary
+                                | IntervalReason::EpochChanged
+                                | IntervalReason::UncertainQuotaObservation
+                                | IntervalReason::AmbiguousBoundary
+                                | IntervalReason::QuotaBoundaryMismatch
+                                | IntervalReason::InvalidBoundaryTime
+                                | IntervalReason::AmbiguousTokenAccount
+                        )
+                    });
+                if continuous {
+                    result[i] = Some(estimate.clone());
+                }
+            }
+        }
+        latest.insert(key, (i, result[i].clone()));
     }
     result
 }

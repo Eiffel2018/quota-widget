@@ -81,6 +81,7 @@ pub fn data_dir() -> PathBuf {
             .join("quota-widget")
     }
 }
+#[derive(Debug)]
 pub struct DataLock {
     _file: File,
 }

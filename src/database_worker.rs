@@ -568,7 +568,7 @@ fn progress(
 pub(crate) fn run(
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
-    write_authorized: bool,
+    mut write_authorized: bool,
 ) {
     let mut state = State::new(write_authorized);
     let mut saved_settings: Option<(PathBuf, Vec<u8>)> = None;
@@ -595,6 +595,39 @@ pub(crate) fn run(
             continue;
         }
         match command {
+            Command::AcquireWriter { dir } => {
+                if !write_authorized
+                    && state.db.as_ref().is_some_and(|db| {
+                        db.path() == TokenDb::database_path(&dir.join("tokens.json"))
+                    })
+                {
+                    let path = state.db.as_ref().unwrap().path().to_owned();
+                    // An immutable reader may itself own a shared directory
+                    // lock. Release it before requesting exclusive ownership.
+                    state.db = None;
+                    let lock = storage::DataLock::acquire(&dir).ok();
+                    match TokenDb::open(&path, lock.is_some()) {
+                        Ok(db) => state.db = Some(db),
+                        Err(e) => {
+                            let _ = events.send(Event::Updated {
+                                snapshot: None,
+                                normalized_history: None,
+                                report: None,
+                                error: Some(e.to_string()),
+                            });
+                            let _ = events.send(Event::WriterLock { lock: None });
+                            continue;
+                        }
+                    }
+                    if lock.is_some() {
+                        write_authorized = true;
+                        state.write_authorized = true;
+                    }
+                    let _ = events.send(Event::WriterLock { lock });
+                } else {
+                    let _ = events.send(Event::WriterLock { lock: None });
+                }
+            }
             Command::Load {
                 token_path,
                 history_path,

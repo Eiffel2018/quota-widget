@@ -158,6 +158,12 @@ pub fn present_with_estimate(
         None => "未有足夠連續資料",
     }
     .into();
+    if estimate.is_some_and(|value| value.end < interval.end) {
+        view.status.push_str(" · 沿用歷史");
+    }
+    if interval.events == 0 && interval.known_usd == 0.0 {
+        view.observed_total = "未有 Token 記錄".into();
+    }
     if interval.partial {
         view.status.push_str(" · 部分");
     }

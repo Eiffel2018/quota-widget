@@ -85,6 +85,10 @@ impl Snapshot {
 
 #[derive(Debug)]
 pub enum Command {
+    /// Release the reader connection and try exclusive ownership; return the lock.
+    AcquireWriter {
+        dir: PathBuf,
+    },
     View(crate::db_view::ViewRequest),
     Load {
         token_path: PathBuf,
@@ -150,6 +154,9 @@ pub struct Progress {
 
 #[derive(Debug)]
 pub enum Event {
+    WriterLock {
+        lock: Option<storage::DataLock>,
+    },
     /// Opt-in status stream for interactive clients; existing display data stays
     /// valid throughout every stage. Complete follows any authorized writes.
     Progress(Progress),
@@ -919,7 +926,7 @@ fn run(
                     Err(error) => send_save_error(&events, path, error),
                 }
             }
-            Command::View(_) => {}
+            Command::View(_) | Command::AcquireWriter { .. } => {}
             Command::Shutdown => break,
         }
     }

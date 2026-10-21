@@ -183,3 +183,60 @@ fn insufficient_or_invalid_data_is_unknown_and_known_zero_is_retained() {
         assert!(shared_estimates(&rows).iter().all(Option::is_none));
     }
 }
+
+#[test]
+fn restart_and_missing_tokens_reuse_prior_calibration_without_zeroing_it() {
+    let mut rows = chain(&[(1., 14.); 8]);
+    for row in &mut rows[5..] {
+        row.session = "restarted-observer".into();
+        row.epoch = 0;
+        row.events = 0;
+        row.known_usd = 0.;
+        row.partial = true;
+        row.comparable = false;
+        row.reasons = vec![IntervalReason::NoTokenEvents];
+    }
+    rows[5].start_boundary_kind = StartBoundaryKind::ObservedBaseline;
+    let estimates = shared_estimates(&rows);
+    for (row, estimate) in rows.iter().zip(&estimates).skip(5) {
+        let e = estimate.as_ref().unwrap();
+        assert_eq!(e.usd_per_point, 14.);
+        assert_eq!(e.intervals, 5);
+        assert_eq!(e.end, rows[4].end);
+        let view = present_with_estimate(row, Some(e));
+        assert!(view.status.contains("沿用歷史"));
+        assert_eq!(view.observed_total, "未有 Token 記錄");
+    }
+    rows.reverse();
+    assert!(shared_estimates(&rows).iter().all(Option::is_some));
+}
+
+#[test]
+fn historical_fallback_never_crosses_identity_resets_gaps_or_expiry() {
+    for change in 0..10 {
+        let mut rows = chain(&[(1., 14.); 6]);
+        let row = &mut rows[5];
+        row.events = 0;
+        row.partial = true;
+        row.reasons = vec![IntervalReason::NoTokenEvents];
+        match change {
+            0 => row.account_id = Some("other".into()),
+            1 => row.account_id = None,
+            2 => row.source_key = "other".into(),
+            3 => row.window_key = Some("secondary".into()),
+            4 => row.epoch += 1,
+            5 => row.start_boundary_kind = StartBoundaryKind::QuotaReset,
+            6 => row.reasons.push(IntervalReason::ResetBoundary),
+            7 => {
+                row.before -= 1.;
+                row.after -= 1.;
+            }
+            8 => {
+                row.start = Some(100000);
+                row.end = 100060;
+            }
+            _ => row.reasons.push(IntervalReason::AmbiguousTokenAccount),
+        }
+        assert!(shared_estimates(&rows)[5].is_none(), "{change}");
+    }
+}
