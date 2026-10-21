@@ -223,31 +223,52 @@ pub fn recovered_observation(
         .ok()
         .zip(event.after.parse::<f64>().ok())
         .map(|(before, after)| (before - after).abs());
+    let has_tokens = cost.events > 0;
     let lower_bound = cost.unknown_events > 0 || cost.partial;
     let amount = format!(
         "{}{}",
         if lower_bound { "≥ " } else { "≈ " },
         money(cost.known_usd)
     );
-    let per_point = points
-        .filter(|points| *points > 0.0)
-        .map(|points| {
-            format!(
-                "{}{} / 百分點",
-                if lower_bound { "≥ " } else { "≈ " },
-                money(cost.known_usd / points)
-            )
+    let per_point = has_tokens
+        .then(|| {
+            points
+                .filter(|points| *points > 0.0)
+                .map(|points| {
+                    format!(
+                        "{}{} / 百分點",
+                        if lower_bound { "≥ " } else { "≈ " },
+                        money(cost.known_usd / points)
+                    )
+                })
+                .unwrap_or_else(|| "未知".into())
         })
         .unwrap_or_else(|| "未知".into());
+    let (total, observed_total, status, tooltip) = if !has_tokens {
+        (
+            "未知".into(),
+            "無 Token 記錄".into(),
+            "區間沒有 Token 記錄".into(),
+            "已按相鄰百分比變化重建時間區間，但本機沒有該區間的 Token 記錄，因此無法估算費用。"
+                .into(),
+        )
+    } else {
+        (
+            amount.clone(),
+            amount,
+            "歷史 Token 估算 · 額度部分未確認".into(),
+            "按相鄰歷史百分比下降時間統計本機 Token 紀錄；額度快照的帳戶／連續性未完全確認，金額只作估算。".into(),
+        )
+    };
     IntervalPresentation {
         change: format!("{}% → {}%", event.before, event.after),
         start: display_time::datetime(start).unwrap_or_else(|| "未知".into()),
         end: display_time::datetime(event.observed_at_unix).unwrap_or_else(|| "未知".into()),
         duration: elapsed(seconds),
-        total: amount.clone(),
-        observed_total: amount,
+        total,
+        observed_total,
         per_point,
-        status: "歷史 Token 估算 · 額度部分未確認".into(),
-        tooltip: "按相鄰歷史百分比下降時間統計本機 Token 紀錄；額度快照的帳戶／連續性未完全確認，金額只作估算。".into(),
+        status,
+        tooltip,
     }
 }

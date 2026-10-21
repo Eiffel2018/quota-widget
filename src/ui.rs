@@ -317,8 +317,19 @@ fn recovered_history_presentations(
         Vec<quota_widget::intervals::ModelIntervalUsage>,
     ),
 > {
-    let visible = quota_widget::history::visible_observations(history);
-    let mut previous: BTreeMap<(String, String, i64, String), i64> = BTreeMap::new();
+    let mut visible = quota_widget::history::visible_observations(history);
+    visible.sort_by_key(|event| {
+        (
+            event.observed_at_unix,
+            event
+                .evidence
+                .as_ref()
+                .and_then(|e| e.observed_at_ms)
+                .unwrap_or_else(|| event.observed_at_unix.saturating_mul(1000)),
+        )
+    });
+    let mut previous: BTreeMap<(String, String, Option<String>, String), Vec<(i64, i64)>> =
+        BTreeMap::new();
     let mut recovered = BTreeMap::new();
     for event in visible {
         if event.kind != quota_widget::model::HistoryKind::QuotaDecrease {
@@ -327,37 +338,50 @@ fn recovered_history_presentations(
         let reset = event.evidence.as_ref().and_then(|e| e.reset_at);
         let window = event.window_key.clone();
         if let (Some(reset), Some(window)) = (reset, window) {
-            let scope = (event.source_key.clone(), window, reset);
-            let start_key = (
-                scope.0.clone(),
-                scope.1.clone(),
-                scope.2,
+            let account_id = event
+                .evidence
+                .as_ref()
+                .and_then(|evidence| evidence.account_id.clone());
+            let scope = (
+                event.source_key.clone(),
+                window,
+                account_id.clone(),
                 event.before.clone(),
             );
-            if let Some(start) = previous.get(&start_key).copied().filter(|start| {
-                *start < event.observed_at_unix
-                    && event.observed_at_unix.saturating_sub(*start) <= 6 * 60 * 60
-            }) {
+            let start = previous.get(&scope).and_then(|rows| {
+                rows.iter()
+                    .filter(|(at, prior_reset)| {
+                        *at < event.observed_at_unix
+                            && event.observed_at_unix.saturating_sub(*at) <= 6 * 60 * 60
+                            && reset.abs_diff(*prior_reset) <= 90
+                    })
+                    .max_by_key(|(at, _)| *at)
+                    .map(|(at, _)| *at)
+            });
+            if let Some(start) = start {
                 let cost = costs.observed(start, event.observed_at_unix);
-                if cost.events > 0 {
-                    let models =
-                        quota_widget::intervals::model_usage(token_events.iter().filter(|token| {
-                            token.timestamp > start && token.timestamp <= event.observed_at_unix
-                        }));
-                    recovered.insert(
-                        intervals::history_event_key(&event),
-                        (
-                            start,
-                            interval_views::recovered_observation(&event, start, cost),
-                            models,
-                        ),
-                    );
-                }
+                let models =
+                    quota_widget::intervals::model_usage(token_events.iter().filter(|token| {
+                        token.timestamp > start && token.timestamp <= event.observed_at_unix
+                    }));
+                recovered.insert(
+                    intervals::history_event_key(&event),
+                    (
+                        start,
+                        interval_views::recovered_observation(&event, start, cost),
+                        models,
+                    ),
+                );
             }
-            previous.insert(
-                (scope.0, scope.1, scope.2, event.after.clone()),
-                event.observed_at_unix,
-            );
+            previous
+                .entry((
+                    event.source_key.clone(),
+                    scope.1,
+                    account_id,
+                    event.after.clone(),
+                ))
+                .or_default()
+                .push((event.observed_at_unix, reset));
         }
     }
     recovered
@@ -1964,7 +1988,7 @@ impl WidgetApp {
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
                             format!(
-                                "每週額度 V {}",
+                                "每週額度 v{}",
                                 env!("CARGO_PKG_VERSION")
                                     .strip_prefix("0.")
                                     .unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -1975,7 +1999,7 @@ impl WidgetApp {
                     })
                     .unwrap_or_else(|| {
                         format!(
-                            "每週額度 V {}",
+                            "每週額度 v{}",
                             env!("CARGO_PKG_VERSION")
                                 .strip_prefix("0.")
                                 .unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -2758,7 +2782,7 @@ impl WidgetApp {
                 );
                 for (i, title) in [
                     "額度變化",
-                    "區間時間（UTC+08）",
+                    "變化時間（UTC+08）",
                     "Sol",
                     "Luna",
                     "Astra",
@@ -2780,14 +2804,14 @@ impl WidgetApp {
                     .id_salt("interval-table-rows")
                     .show_rows(
                         ui,
-                        46. * scale,
+                        54. * scale,
                         self.history_cache.table_rows.len(),
                         |ui, range| {
                             for row_index in range {
                                 let row = &self.history_cache.table_rows[row_index];
                                 let view = &row.presentation;
                                 let (rect, response) = ui.allocate_exact_size(
-                                    Vec2::new(TABLE_WIDTH * scale, 46. * scale),
+                                    Vec2::new(TABLE_WIDTH * scale, 54. * scale),
                                     Sense::click(),
                                 );
                                 if response
@@ -2803,12 +2827,12 @@ impl WidgetApp {
                                             Some(self.intervals[index].history_event_key.clone());
                                     }
                                 }
-                                let mut time_range = if view.start == "—" {
+                                let mut change_time = if view.end == "—" {
                                     "—".into()
                                 } else {
-                                    format!("{} – {}", view.start, view.end)
+                                    view.end.clone()
                                 };
-                                time_range = time_range.replace(" +08:00", "");
+                                change_time = change_time.replace(" +08:00", "");
                                 let families =
                                     [("sol", "Sol"), ("luna", "Luna"), ("astra", "Astra")];
                                 let family_models: Vec<_> = families
@@ -2816,49 +2840,84 @@ impl WidgetApp {
                                     .map(|(family, _)| model_family_usage(&row.models, family))
                                     .collect();
                                 let total = total_model_usage(&row.models);
+                                let no_token_records = row.models.is_empty();
+                                let family_cell =
+                                    |usage: Option<&intervals::ModelIntervalUsage>| {
+                                        usage.map_or_else(
+                                            || {
+                                                format!(
+                                                    "0 次\n{}",
+                                                    if no_token_records {
+                                                        "未知"
+                                                    } else {
+                                                        "$0.0000"
+                                                    }
+                                                )
+                                            },
+                                            |model| {
+                                                format!(
+                                                    "{} 次\n{}",
+                                                    model.events,
+                                                    interval_model_cost(model)
+                                                )
+                                            },
+                                        )
+                                    };
                                 let cells = [
                                     view.change.clone(),
-                                    time_range,
-                                    family_models[0].as_ref().map_or_else(
-                                        || "0 次 · $0.0000".into(),
-                                        |m| format!("{} 次 · {}", m.events, interval_model_cost(m)),
-                                    ),
-                                    family_models[1].as_ref().map_or_else(
-                                        || "0 次 · $0.0000".into(),
-                                        |m| format!("{} 次 · {}", m.events, interval_model_cost(m)),
-                                    ),
-                                    family_models[2].as_ref().map_or_else(
-                                        || "0 次 · $0.0000".into(),
-                                        |m| format!("{} 次 · {}", m.events, interval_model_cost(m)),
-                                    ),
+                                    change_time,
+                                    family_cell(family_models[0].as_ref()),
+                                    family_cell(family_models[1].as_ref()),
+                                    family_cell(family_models[2].as_ref()),
                                     format!(
-                                        "{} 次 · {}",
+                                        "{} 次\n{}",
                                         total.events,
-                                        interval_model_cost(&total)
+                                        if no_token_records {
+                                            "未知".to_string()
+                                        } else {
+                                            interval_model_cost(&total)
+                                        }
                                     ),
                                 ];
+                                let no_token_hint = "無 Token 記錄，費用未知".to_string();
                                 let hints = [
                                     view.tooltip.clone(),
                                     view.tooltip.clone(),
-                                    model_usage_tooltip(
-                                        "Sol（所有版本合併）",
-                                        family_models[0].as_ref(),
-                                    ),
-                                    model_usage_tooltip(
-                                        "Luna（所有版本合併）",
-                                        family_models[1].as_ref(),
-                                    ),
-                                    model_usage_tooltip(
-                                        "Astra（所有版本合併）",
-                                        family_models[2].as_ref(),
-                                    ),
-                                    model_usage_tooltip("所有模型總計", Some(&total)),
+                                    if no_token_records {
+                                        no_token_hint.clone()
+                                    } else {
+                                        model_usage_tooltip(
+                                            "Sol（所有版本合併）",
+                                            family_models[0].as_ref(),
+                                        )
+                                    },
+                                    if no_token_records {
+                                        no_token_hint.clone()
+                                    } else {
+                                        model_usage_tooltip(
+                                            "Luna（所有版本合併）",
+                                            family_models[1].as_ref(),
+                                        )
+                                    },
+                                    if no_token_records {
+                                        no_token_hint.clone()
+                                    } else {
+                                        model_usage_tooltip(
+                                            "Astra（所有版本合併）",
+                                            family_models[2].as_ref(),
+                                        )
+                                    },
+                                    if no_token_records {
+                                        no_token_hint
+                                    } else {
+                                        model_usage_tooltip("所有模型總計", Some(&total))
+                                    },
                                 ];
                                 for i in 0..cells.len() {
                                     ui.put(
                                         Rect::from_min_size(
                                             rect.min + Vec2::new(X[i] * scale, 0.),
-                                            Vec2::new(WIDTH[i] * scale, 34. * scale),
+                                            Vec2::new(WIDTH[i] * scale, 50. * scale),
                                         ),
                                         egui::Label::new(RichText::new(&cells[i]).size(
                                             ui.style().text_styles[&egui::TextStyle::Body].size,
