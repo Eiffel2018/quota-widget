@@ -29,3 +29,13 @@
 **/writer.lock
 *.pem
 *.key
+
+# Local observations, exports, crash dumps and credentials
+*.jsonl
+!fixtures/*.jsonl
+*.csv
+*.dmp
+*.pfx
+*.p12
+/screenshots/
+/captures/
