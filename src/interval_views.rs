@@ -153,14 +153,11 @@ pub fn present_with_estimate(
         .map(|value| format!("{marker} {}/百分點", money(value.usd_per_point)))
         .unwrap_or_else(|| "未知".into());
     view.status = match estimate {
-        Some(value) if value.lower_bound => "統一估值 · 下限",
-        Some(_) => "統一估值",
-        None => "未有足夠連續資料",
+        Some(value) if value.lower_bound => "本段估算 · 下限",
+        Some(_) => "本段估算",
+        None => "未有足夠區間 Token 資料",
     }
     .into();
-    if estimate.is_some_and(|value| value.end < interval.end) {
-        view.status.push_str(" · 沿用歷史");
-    }
     if interval.events == 0 && interval.known_usd == 0.0 {
         view.observed_total = "未有 Token 記錄".into();
     }
@@ -168,13 +165,13 @@ pub fn present_with_estimate(
         view.status.push_str(" · 部分");
     }
     view.tooltip.push_str(&format!(
-        "\n扣額統一估算：{}\n統一每百分點：{}\n估算狀態：{}",
+        "\n本段 Token 費用估算：{}\n本段 USD / 百分點：{}\n估算狀態：{}",
         view.total, view.per_point, view.status
     ));
     if let Some(value) = estimate {
         view.tooltip.push_str(&format!(
-            "\n校準樣本：{} 個區間 / {} 百分點\n算法：連續區間 Token 小計總和 ÷ 百分點總和\n估值期間：{} 至 {}\n估值用途：歷史估算，並非官方固定美元換算率",
-            value.intervals,
+            "\n本段有價 Token 成本：${:.4} ÷ {} 百分點\n算法：本段有價 Token 成本 ÷ 本段百分點\n估值期間：{} 至 {}\n估值用途：根據本段記錄估算，並非官方固定美元換算率",
+            value.known_usd,
             value.percentage_points,
             display_time::datetime(value.start).unwrap_or_default(),
             display_time::datetime(value.end).unwrap_or_default()

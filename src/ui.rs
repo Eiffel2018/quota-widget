@@ -1356,7 +1356,7 @@ impl WidgetApp {
             .map(|(i, row)| (row.history_event_key.clone(), i))
             .collect();
         // Reformat only when canonical data changes, never on every repaint.
-        self.interval_estimates = quota_estimate::shared_estimates(&intervals);
+        self.interval_estimates = quota_estimate::interval_estimates(&intervals);
         self.interval_presentations = intervals
             .iter()
             .zip(&self.interval_estimates)
@@ -2294,12 +2294,18 @@ impl WidgetApp {
                         .push((None, interval_views::unconfirmed_observation(event)));
                 }
             }
-            self.history_cache.weighted = self
+            let estimates = self
                 .history_cache
                 .interval_indices
-                .first()
-                .and_then(|&i| self.interval_estimates[i].as_ref())
-                .map(|estimate| estimate.usd_per_point);
+                .iter()
+                .filter_map(|&i| self.interval_estimates[i].as_ref());
+            let (usd, points) = estimates.fold((0.0, 0.0), |(usd, points), estimate| {
+                (
+                    usd + estimate.known_usd,
+                    points + estimate.percentage_points,
+                )
+            });
+            self.history_cache.weighted = (points > 0.0).then_some(usd / points);
             self.history_cache.key = Some(key);
         }
         ui.label(format!(
@@ -2311,26 +2317,28 @@ impl WidgetApp {
             }
         ));
         ui.separator();
-        let estimate = self
+        let estimates: Vec<_> = self
             .history_cache
             .interval_indices
-            .first()
-            .and_then(|&i| self.interval_estimates[i].as_ref());
+            .iter()
+            .filter_map(|&i| self.interval_estimates[i].as_ref())
+            .collect();
+        let has_lower_bound = estimates.iter().any(|estimate| estimate.lower_bound);
+        let sample_points: f64 = estimates
+            .iter()
+            .map(|estimate| estimate.percentage_points)
+            .sum();
         ui.label(format!(
-            "每百分點估值：{}{} / 百分點",
-            if estimate.is_some_and(|value| value.lower_bound) {
-                "≥ "
-            } else {
-                "≈ "
-            },
+            "所列區間加權平均：{}{} / 百分點",
+            if has_lower_bound { "≥ " } else { "≈ " },
             money(self.history_cache.weighted)
         ));
-        if let Some(value) = estimate {
+        if !estimates.is_empty() {
             ui.label(format!(
                 "樣本：{} 個區間 · {} 百分點{}",
-                value.intervals,
-                value.percentage_points,
-                if value.lower_bound {
+                estimates.len(),
+                sample_points,
+                if has_lower_bound {
                     " · Token 覆蓋不完整，僅供下限估算"
                 } else {
                     ""
@@ -3275,7 +3283,7 @@ impl WidgetApp {
                 let path = folder.join(filename);
                 let mut completed_export: Vec<CompletedInterval> = Vec::new();
                 let mut estimate_by_key: BTreeMap<String, Option<QuotaEstimate>> = canonical_intervals.iter()
-                    .zip(quota_estimate::shared_estimates(&canonical_intervals))
+                    .zip(quota_estimate::interval_estimates(&canonical_intervals))
                     .map(|(row, estimate)| (row.history_event_key.clone(), estimate)).collect();
                 let mut events: Vec<serde_json::Value> = if tokens {
                     usage_events
@@ -3325,7 +3333,7 @@ impl WidgetApp {
                         all.iter().map(|event| canonical_interval_cost(canonical.get(&intervals::history_event_key(event)).copied())).collect()
                     } else {
                         let calculated = intervals::completed_intervals(snapshot.events(), &all);
-                        estimate_by_key = calculated.iter().zip(quota_estimate::shared_estimates(&calculated))
+                        estimate_by_key = calculated.iter().zip(quota_estimate::interval_estimates(&calculated))
                             .map(|(row, estimate)| (row.history_event_key.clone(), estimate)).collect();
                         completed_export = calculated.into_iter().filter(|interval|local_day(interval.end)==Some(day)).collect();
                         accounting::history_costs(&snapshot.cost_index, &all)
