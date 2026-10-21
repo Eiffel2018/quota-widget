@@ -1,0 +1,1 @@
+{"compilerOptions":{"allowJs":true,"checkJs":true,"noEmit":true,"target":"ES2022","module":"commonjs","strict":false,"skipLibCheck":true,"types":["node"]},"include":["src/core/*.cjs"]}

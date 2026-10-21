@@ -31,3 +31,10 @@ session transcripts, exports and screenshots are not part of this repository.
 `.gitignore` protects common runtime filenames and directories; a review of
 tracked contents is also required before publishing. Only the synthetic JSONL
 fixtures under `fixtures/` are allowlisted.
+
+The earlier Electron implementation is retained under `legacy/quota-glass/`.
+It contains useful references for opt-in alerts and manual reset annotations.
+Its supplied source and assets are copied without modification, with individual
+hashes in `SOURCE-MANIFEST.json`. Runtime data, dependencies and packaged apps
+are excluded. It is historical reference material; the maintained widget is the
+Rust project at the repository root.

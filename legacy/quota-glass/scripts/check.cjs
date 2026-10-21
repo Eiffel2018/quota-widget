@@ -1,0 +1,2 @@
+const fs=require('node:fs');const path=require('node:path');const cp=require('node:child_process');
+function walk(dir){for(const name of fs.readdirSync(dir)){const file=path.join(dir,name);if(fs.statSync(file).isDirectory())walk(file);else if(/\.(cjs|js)$/.test(file)){cp.execFileSync(process.execPath,['--check',file],{stdio:'inherit'});}}}walk('src');walk('tests');console.log('All JavaScript syntax checks passed.');

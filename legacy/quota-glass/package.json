@@ -1,0 +1,95 @@
+{
+  "name": "quota-glass",
+  "version": "0.1.0",
+  "description": "Private local ChatGPT Work quota tray monitor",
+  "author": "Quota Glass contributors",
+  "license": "MIT",
+  "private": true,
+  "main": "src/main/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "demo": "electron . --demo",
+    "test": "node --test tests/*.test.cjs",
+    "lint": "node scripts/check.cjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "build": "node scripts/build.cjs",
+    "dist:win": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
+    "pack:native": "electron-builder --dir"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@types/node": "^24.0.0",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
+    "jsdom": "30.1.1",
+    "typescript": "^5.9.3"
+  },
+  "build": {
+    "appId": "io.quotaglass.desktop",
+    "productName": "Quota Glass",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json",
+      "LICENSE"
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "icon": "assets/icon.png"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": false,
+      "createDesktopShortcut": false
+    },
+    "artifactName": "Quota-Glass-${version}-${os}-${arch}.${ext}",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    }
+  },
+  "engines": {
+    "node": ">=24.15.0 <25"
+  }
+}

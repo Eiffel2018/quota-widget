@@ -1,0 +1,25 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const {JSDOM}=require('jsdom');
+const root=require('node:path').join(__dirname,'../src/renderer/');
+const flush=()=>new Promise(setImmediate);
+const initial={status:'live',message:'',lastRefresh:Date.now(),buckets:[],settings:{refreshSeconds:60,alertThreshold:20,alertsEnabled:false},history:{samples:[],events:[]},loginPending:false};
+async function page(extra={},custom={}){const state={...initial,...extra};let update;const calls=[];const dom=new JSDOM(fs.readFileSync(root+'index.html','utf8'),{runScripts:'outside-only',url:'https://local.test'});dom.window.quota={getState:async()=>state,onState:fn=>{update=fn},...Object.fromEntries(['connect','refresh','login','cancelLogin','chooseBinary','setDemo','setSettings','hide','tagReset','exportHistory','clearHistory'].map(name=>[name,async(...args)=>{calls.push([name,...args]);return state}])),...custom};dom.window.eval(fs.readFileSync(root+'renderer.js','utf8'));await flush();return {dom,doc:dom.window.document,calls,update};}
+const bucket=(rate=null)=>({id:'codex',name:'Codex',windows:[{kind:'primary',remaining:79.12345,durationMins:300,resetsAt:Date.now()/1000+7200,rate}],credits:{balance:'62416',unlimited:false,hasCredits:true,rate:{perMinute:2,observedMinutes:10,etaMinutes:31208}}});
+test('reset times use Unix seconds, remaining source precision is preserved',async()=>{const p=await page({buckets:[bucket()]});assert.match(p.doc.querySelector('.reset-time').textContent,/2 小時/);assert.match(p.doc.querySelector('.remaining-value').textContent,/79\.12345/);assert.ok(p.doc.querySelector('.reset-time').title.includes(String(new Date().getFullYear())));p.dom.window.close()});
+test('positive pace gets conditional estimate, zero pace does not',async()=>{const p=await page({buckets:[bucket({perMinute:1.1,observedMinutes:2,etaMinutes:71.93})]});assert.match(p.doc.querySelector('.quota-window .pace').textContent,/1.1 百分點\/分鐘/);assert.match(p.doc.querySelector('.quota-window .pace').textContent,/按此速度/);p.update({...initial,buckets:[bucket({perMinute:0,observedMinutes:10,etaMinutes:null})]});assert.doesNotMatch(p.doc.querySelector('.quota-window .pace').textContent,/用盡/);p.dom.window.close()});
+test('history objects show exact values and safely transmit edited tags',async()=>{const e={id:'one',timestamp:Date.now(),bucket:'codex',bucketName:'<script>BAD</script>',window:'primary',before:{remaining:20.5},after:{remaining:100},source:'unknown',note:'',elapsedMs:60000,gap:false};const p=await page({history:{samples:[],events:[e]},historyError:'Disk full'});assert.match(p.doc.querySelector('.history-change').textContent,/20.5% → 100%/);assert.equal(p.doc.querySelector('#history-events script'),null);assert.equal(p.doc.getElementById('history-error').textContent,'Disk full');const form=p.doc.querySelector('.history-tag-form');form.querySelector('select').value='coupon';form.querySelector('input').value='Luna, light task';form.dispatchEvent(new p.dom.window.Event('submit',{bubbles:true,cancelable:true}));await flush();assert.deepEqual(JSON.parse(JSON.stringify(p.calls[0])),['tagReset','one',{source:'coupon',note:'Luna, light task'}]);p.dom.window.close()});
+test('export failure is surfaced, export cancel does not claim success',async()=>{const p=await page({}, {exportHistory:async()=>({saved:false,error:'Cannot save'})});p.doc.getElementById('export-history').click();await flush();assert.equal(p.doc.getElementById('error-notice').textContent,'Cannot save');p.dom.window.close()});
+test('login/cancel overlap never leaves actions stuck disabled',async()=>{let resolveLogin,resolveCancel;const p=await page({status:'auth-required'}, {login:()=>new Promise(r=>{resolveLogin=r}),cancelLogin:()=>new Promise(r=>{resolveCancel=r})});p.doc.getElementById('login-button').click();p.update({...initial,status:'auth-required',loginPending:true});p.doc.getElementById('cancel-login').click();resolveLogin({...initial,status:'auth-required',loginPending:false});await flush();resolveCancel({...initial,status:'auth-required',loginPending:false});await flush();assert.equal(p.doc.getElementById('connect-button').disabled,false);p.dom.window.close()});
+
+test('offline and elapsed stale data hide both quota and credit estimates',async()=>{
+  const p=await page({buckets:[bucket({perMinute:1,observedMinutes:2,etaMinutes:79})]});
+  assert.equal(p.doc.querySelector('.pace-row').hidden,false);
+  p.update({...initial,status:'offline',buckets:[bucket({perMinute:1,observedMinutes:2,etaMinutes:79})]});
+  for(const row of p.doc.querySelectorAll('.pace-row,.pace-eta'))assert.equal(row.hidden,true);
+  p.update({...initial,lastRefresh:Date.now()-300000,buckets:[bucket({perMinute:1,observedMinutes:2,etaMinutes:79})]});
+  for(const row of p.doc.querySelectorAll('.pace-row,.pace-eta'))assert.equal(row.hidden,true);
+  p.update({...initial,lastRefresh:Date.now(),buckets:[bucket({perMinute:1,observedMinutes:2,etaMinutes:79})]});
+  assert.equal(p.doc.querySelector('.pace-row').hidden,false);p.dom.window.close();
+});

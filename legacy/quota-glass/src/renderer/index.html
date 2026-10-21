@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta name="color-scheme" content="dark light">
+    <title>Quota Glass</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="renderer.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="Quota Glass">
+          <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M8 6h16v11a8 8 0 0 1-16 0V6Z" stroke="currentColor" stroke-width="1.5"/><path d="M8 15c5-4 11 4 16 0v2a8 8 0 0 1-16 0v-2Z" fill="currentColor" opacity=".28"/><path d="M12 26h8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span>Quota Glass</span>
+        </div>
+        <div class="topbar-actions">
+          <button id="theme-button" class="icon-button" type="button" title="切換外觀" aria-label="切換外觀">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="7" stroke="currentColor" stroke-width="1.6"/><path d="M12 5a7 7 0 0 1 0 14V5Z" fill="currentColor"/></svg>
+          </button>
+          <button id="settings-button" class="icon-button" type="button" title="設定" aria-label="開啟設定" aria-expanded="false" aria-controls="settings-panel">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h10m4 0h2M4 17h2m4 0h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="16" cy="7" r="2" stroke="currentColor" stroke-width="1.6"/><circle cx="8" cy="17" r="2" stroke="currentColor" stroke-width="1.6"/></svg>
+          </button>
+          <button id="hide-button" class="icon-button" type="button" title="收起至系統匣" aria-label="收起至系統匣">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 10 5 5 5-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <main id="main-content">
+        <section class="overview" aria-labelledby="overview-heading">
+          <div class="eyebrow-row">
+            <p class="eyebrow">CODEX 用量</p>
+            <span id="connection-status" class="status-pill" data-status="setup"><span class="status-dot" aria-hidden="true"></span><span id="status-label">尚未連線</span></span>
+          </div>
+          <h1 id="overview-heading">工作有餘裕，心中有數。</h1>
+          <p class="overview-description">剩餘額度、消耗速度，一眼掌握。</p>
+        </section>
+
+        <section id="settings-panel" class="settings-panel" aria-labelledby="settings-heading" hidden>
+          <div class="section-heading"><h2 id="settings-heading">偏好設定</h2><button id="settings-close" class="text-button" type="button">完成</button></div>
+          <form id="settings-form">
+            <div class="settings-grid">
+              <label class="field-label" for="refresh-seconds">更新間隔<select id="refresh-seconds" name="refreshSeconds"><option value="30">30 秒</option><option value="60">1 分鐘</option><option value="120">2 分鐘</option><option value="300">5 分鐘</option></select></label>
+              <label class="field-label" for="alert-threshold">低額度提醒<select id="alert-threshold" name="alertThreshold"><option value="10">剩餘 10%</option><option value="20">剩餘 20%</option><option value="30">剩餘 30%</option><option value="50">剩餘 50%</option></select></label>
+            </div>
+            <label class="toggle-row" for="alerts-enabled"><span><strong>開啟額度提醒</strong><small>額度偏低時，顯示桌面通知。</small></span><input id="alerts-enabled" class="switch-input" type="checkbox" name="alertsEnabled"><span class="switch" aria-hidden="true"></span></label>
+            <div class="settings-bottom"><span id="settings-feedback" class="subtle" role="status"></span><button id="save-settings" type="submit" class="button button-small">儲存設定</button></div>
+          </form>
+          <div class="connection-settings"><span class="field-label">Codex 執行檔<span id="binary-label" class="binary-label">自動尋找</span></span><button id="choose-binary-settings" class="text-button" type="button">選擇…</button></div>
+          <p class="settings-note">透過本機 Codex app-server 讀取資料，登入憑證由 Codex 保管。</p>
+        </section>
+
+        <div id="notice" class="notice" role="status" hidden><span id="notice-text"></span></div>
+        <div id="error-notice" class="notice notice-error" role="alert" hidden></div>
+
+        <section id="setup-panel" class="setup-panel" aria-labelledby="setup-heading">
+          <div class="setup-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><svg viewBox="0 0 48 48" fill="none"><path d="M12 9h24v17a12 12 0 0 1-24 0V9Z" stroke="currentColor" stroke-width="1.7"/><path d="M12 23c8-6 16 6 24 0v3a12 12 0 0 1-24 0v-3Z" fill="currentColor" opacity=".25"/><path d="M19 40h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></div>
+          <p class="eyebrow">讓每一份額度都清清楚楚</p>
+          <h2 id="setup-heading">連接你的 Codex。</h2>
+          <p id="setup-description">讀取這部電腦上已登入的 Codex 額度，無需提供 API 金鑰。</p>
+          <button id="connect-button" class="button button-primary" type="button"><span id="connect-label">連接已登入的 Codex</span><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          <div class="setup-links"><button id="choose-binary" class="text-button" type="button">Choose Codex 執行檔</button><span aria-hidden="true">·</span><button id="login-button" class="text-button" type="button">登入 Codex</button></div>
+          <p class="login-disclosure">登入會開啟瀏覽器，並由 Codex 在本機儲存憑證。開始前會請你確認。</p>
+          <button id="cancel-login" class="text-button" type="button" hidden>取消登入</button>
+        </section>
+
+        <section id="quota-panel" class="quota-panel" aria-labelledby="quota-heading" hidden>
+          <div class="section-heading quota-section-heading"><h2 id="quota-heading">可用額度</h2><span class="subtle">剩餘比例</span></div>
+          <div id="buckets" class="buckets"></div>
+          <div id="empty-state" class="empty-state" hidden><h3>暫未回報額度</h3><p>已連接 Codex，但伺服器尚未回傳額度分組。</p></div>
+          <div class="data-note"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.4"/><path d="M10 9v5m0-8v.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><div><p>依伺服器回報的分組顯示；未獨立回報的模型無法分開計算。</p><p>速度反映整個帳戶，包括其他裝置與工作。以最近最多 15 分鐘、至少 1 分鐘的觀察推算；用盡時間只在速度持續時成立。來源精度及四捨五入會影響估算，顯示 0 不代表沒有消耗。</p></div></div>
+        </section>
+        <details id="history-panel" class="history-panel" hidden>
+          <summary>重設紀錄與比較 <span id="history-count" class="history-count"></span></summary>
+          <div class="history-body">
+            <p id="history-error" class="history-error" role="alert" hidden></p>
+            <p id="history-description-text" class="history-description">記錄額度上升的時間，可自行標記原因，方便比較優惠券與全域重設。</p>
+            <div id="history-events" class="history-events"></div>
+            <p id="history-empty" class="history-description">暫未觀察到重設。使用一段時間後，額度上升會自動記錄。</p>
+            <div class="history-actions"><button id="export-history" class="text-button" type="button">匯出 CSV</button><button id="clear-history" class="text-button danger-text" type="button">清除本機紀錄…</button></div>
+            <p class="history-caveat">間隔是實際經過的時間，並非活躍工作時間。模型、工作量及其他裝置會影響比較；紀錄不能證明優惠券增加了總額度，也不能換算絕對 token 數。</p>
+          </div>
+        </details>
+      </main>
+
+      <footer class="footer">
+        <div class="update-row"><div class="update-copy"><span id="updated-dot" class="updated-dot" aria-hidden="true"></span><span id="updated-label">等待連線</span></div><button id="refresh-button" class="icon-button refresh-button" type="button" title="更新額度" aria-label="更新額度"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M19.4 10a7.5 7.5 0 1 0-1.5 7.1M20 5v5h-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+        <div class="footer-bottom"><span class="local-note"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="4" y="7" width="8" height="6" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.2"/></svg>本機連線</span><label class="demo-toggle" for="demo-toggle"><input id="demo-toggle" type="checkbox"><span>示範預覽</span></label></div>
+      </footer>
+    </div>
+  </body>
+</html>
