@@ -70,7 +70,8 @@ fn screenshot_style_concurrent_stale_replay_has_only_distinct_real_decreases() {
         rows.iter()
             .filter(|e| e.reconciliation == Some(HistoryReconciliation::UncertainRecovery))
             .count(),
-        2
+        0,
+        "same-cycle +1 echoes are omitted by the explicit user policy"
     );
     assert_eq!(raw, raw_before);
     assert_eq!(
@@ -100,9 +101,9 @@ fn imported_two_to_three_reset_is_preserved_when_deadline_really_rolls() {
 }
 
 #[test]
-fn direct_live_small_refills_do_not_require_a_new_reset_deadline() {
+fn direct_live_larger_refills_do_not_require_a_new_reset_deadline() {
     let mut model = QuotaModel::new("synthetic-live");
-    for (t, r) in [(100, 3.), (120, 2.), (130, 3.), (140, 2.)] {
+    for (t, r) in [(100, 3.), (120, 2.), (130, 4.), (140, 3.)] {
         model.ingest_json(&live(t, r, 10_000), t).unwrap();
     }
     let rows = normalized(&model.history);
@@ -156,10 +157,7 @@ fn metadata_jitter_does_not_certify_a_small_historical_recovery() {
         observation(130_000, "A", 2., 10_100),
     ]));
     assert_eq!(confirmed(&rows).len(), 1);
-    assert_eq!(
-        rows[1].reconciliation,
-        Some(HistoryReconciliation::UncertainRecovery)
-    );
+    assert_eq!(rows.len(), 1, "unproven +1 rebound is omitted");
 }
 
 #[test]

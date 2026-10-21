@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_ASSUMED_MODEL: &str = "gpt-6.1-sol";
 pub const DEFAULT_BROWSE_DAYS: i64 = 30;
@@ -18,7 +19,7 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 const STORE_VERSION: u32 = 3;
 // Independent of the storage schema: rebuild derived model/effort attribution once when
 // opening old caches, without dropping raw observations or trusting old offsets.
-const NORMALIZATION_VERSION: u32 = 2;
+const NORMALIZATION_VERSION: u32 = 3;
 const AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const AUTO_REVIEW_EXCLUDED: &str = "excluded_recorded_codex_auto_review";
 const UNATTRIBUTED_MODEL: &str = "unattributed-model";
@@ -196,6 +197,11 @@ pub struct TokenEvent {
     /// A subset of output. Never added again for cost or total-token calculations.
     pub reasoning: u64,
     pub cost_usd: Option<f64>,
+    /// Earliest explicit turn_context time, only when all recorded response
+    /// counters exactly reconcile to a valid, monotone complete turn snapshot.
+    /// This bounds old overlap uncertainty; it never invents a turn or usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_start_timestamp_ms: Option<i64>,
     pub partial_flags: Vec<String>,
 }
 impl TokenEvent {
@@ -256,6 +262,47 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
     /// Newly imported real snapshots only. All retained snapshots are also queryable.
     pub quota_observations: Vec<ImportedQuotaObservation>,
+}
+
+impl ImportReport {
+    fn malformed_json_line(&mut self, path: &Path, offset: u64, reason: impl std::fmt::Display) {
+        const PREFIX: &str = "Skipped malformed JSONL line in ";
+        self.malformed_lines += 1;
+        // Share one five-sample budget across every source and the metadata
+        // index. Once full, stop after finding those five; do not build or retain
+        // an error string for every further bad line. Never include input bytes.
+        if self
+            .warnings
+            .iter()
+            .filter(|warning| warning.starts_with(PREFIX))
+            .take(5)
+            .count()
+            < 5
+        {
+            self.warnings.push(format!(
+                "{PREFIX}{} at byte {offset}: {reason}",
+                path.display()
+            ));
+        }
+    }
+}
+
+/// Small, transient progress only. Never clones history or exposes log content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportPhase {
+    Discovering,
+    Reading,
+    Reconciling,
+    Metadata,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportProgress {
+    pub phase: ImportPhase,
+    pub files_done: usize,
+    pub files_total: usize,
+    pub lines_read: usize,
+    pub observations: usize,
+    pub events: usize,
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TokenSummary {
@@ -352,6 +399,20 @@ struct SourceCursor {
 struct RawTurnCounts {
     input: Option<u64>,
     output: Option<u64>,
+    #[serde(default)]
+    cached: Option<u64>,
+    #[serde(default)]
+    reasoning: Option<u64>,
+}
+impl RawTurnCounts {
+    fn complete(&self) -> Option<Counts> {
+        Some(Counts {
+            input: self.input?,
+            cached: self.cached?,
+            output: self.output?,
+            reasoning: self.reasoning?,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UsageObservation {
@@ -594,6 +655,216 @@ struct RecordedTaskParent {
     timestamp_ms: Option<i64>,
 }
 
+/// Compact, typed global state for the incremental database backend. Raw usage
+/// stays in thread shards. This header retains quota evidence and parser cursors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreHeader {
+    version: u32,
+    normalization_version: u32,
+    sources: BTreeMap<String, SourceCursor>,
+    recorded_task_models: BTreeMap<String, BTreeSet<String>>,
+    recorded_names: BTreeMap<String, RecordedTaskName>,
+    recorded_parents: BTreeMap<String, RecordedTaskParent>,
+    metadata_path: Option<String>,
+    metadata_cursor: SourceCursor,
+    metadata_names: BTreeMap<String, String>,
+    pub revision: u64,
+    pub next_sequence: u64,
+    pub pricing: Option<Pricing>,
+    pub quota: Vec<ImportedQuotaObservation>,
+    pub response_threads: BTreeSet<String>,
+    pub anonymous_threads: BTreeSet<String>,
+    /// Latest raw legacy observation per anonymous owner. Missing entries retain
+    /// unbounded uncertainty when reading an older header.
+    #[serde(default)]
+    pub anonymous_bounds_ms: BTreeMap<String, i64>,
+    #[serde(default)]
+    excluded_tasks: BTreeSet<String>,
+}
+impl StoreHeader {
+    /// Apply the only cross-thread usage dependency without rewriting all rows.
+    /// False means that anonymous legacy usage is retained for audit but is not
+    /// additive alongside authoritative responses with unprovable ownership.
+    pub fn apply_event_policy(&self, event: &mut TokenEvent) -> bool {
+        self.event_policy().apply(event)
+    }
+    /// Bulk queries should prepare this once and reuse it for every event.
+    pub fn event_policy(&self) -> EventPolicy<'_> {
+        EventPolicy::new(
+            &self.response_threads,
+            &self.anonymous_threads,
+            &self.anonymous_bounds_ms,
+        )
+    }
+    pub fn same_event_policy(&self, other: &Self) -> bool {
+        self.response_threads == other.response_threads
+            && self.anonymous_threads == other.anonymous_threads
+            && self.anonymous_bounds_ms == other.anonymous_bounds_ms
+    }
+    pub fn task_names(&self) -> BTreeMap<String, String> {
+        let mut names: BTreeMap<_, _> = self
+            .recorded_names
+            .iter()
+            .map(|(id, row)| (id.clone(), row.name.clone()))
+            .collect();
+        names.extend(self.metadata_names.clone());
+        names
+    }
+    pub fn task_parents(&self) -> BTreeMap<String, String> {
+        self.recorded_parents
+            .iter()
+            .filter_map(|(child, row)| {
+                row.parent
+                    .as_ref()
+                    .filter(|parent| {
+                        !self.excluded_tasks.contains(child)
+                            && !self.excluded_tasks.contains(*parent)
+                    })
+                    .map(|parent| (child.clone(), parent.clone()))
+            })
+            .collect()
+    }
+    pub fn excluded_task_ids(&self) -> &BTreeSet<String> {
+        &self.excluded_tasks
+    }
+    /// Rate/tier changes do not alter recorded attribution. An override/default
+    /// model change requires a coherent all-shard projection before publication.
+    pub fn requires_attribution_rebuild(&self, pricing: &Pricing) -> bool {
+        let default = Pricing::default();
+        let old = self.pricing.as_ref().unwrap_or(&default);
+        self.normalization_version != NORMALIZATION_VERSION
+            || old.model_override != pricing.model_override
+            || old.assumed_model != pricing.assumed_model
+    }
+}
+
+/// Lossless thread accounting evidence, plus its locally normalized cache.
+/// Event IDs/observation identity strings retain their exact legacy tie ordering.
+/// `events` do not include the header's cross-thread anonymous-overlap overlay.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ThreadShard {
+    pub thread_id: String,
+    #[serde(default)]
+    observations: Vec<UsageObservation>,
+    #[serde(default)]
+    contexts: Vec<ModelContext>,
+    #[serde(default)]
+    effort_contexts: Vec<EffortContext>,
+    #[serde(default)]
+    pub events: Vec<TokenEvent>,
+    #[serde(default)]
+    pub turn_usage: Option<TaskTurnUsage>,
+}
+impl ThreadShard {
+    pub fn turn_usage(&self) -> Option<&TaskTurnUsage> {
+        self.turn_usage.as_ref()
+    }
+    pub fn observation_count(&self) -> usize {
+        self.observations.len()
+    }
+}
+
+type ThreadLoader<'a> = dyn FnMut(&str) -> io::Result<Option<ThreadShard>> + 'a;
+
+/// Nondestructive export. A failed database transaction can retry this exact
+/// state; only `mark_committed` is allowed to evict hydrated raw observations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirtyExport {
+    pub header: StoreHeader,
+    pub threads: Vec<ThreadShard>,
+}
+
+fn anonymous_bounds(
+    owners: &BTreeSet<String>,
+    observations: &[UsageObservation],
+    events: &[TokenEvent],
+) -> BTreeMap<String, i64> {
+    let mut bounds: BTreeMap<String, i64> = BTreeMap::new();
+    for row in observations.iter().filter(|row| {
+        owners.contains(&row.session)
+            && row
+                .flags
+                .iter()
+                .any(|flag| flag == "session_identity_missing")
+    }) {
+        bounds
+            .entry(row.session.clone())
+            .and_modify(|time| *time = (*time).max(row.timestamp_ms))
+            .or_insert(row.timestamp_ms);
+    }
+    // Events-only compatibility caches have second precision. Preserve the
+    // entire final second rather than inventing a millisecond cutoff.
+    let raw_owners: BTreeSet<_> = bounds.keys().cloned().collect();
+    for event in events.iter().filter(|event| {
+        owners.contains(&event.session)
+            && !raw_owners.contains(&event.session)
+            && event
+                .partial_flags
+                .iter()
+                .any(|flag| flag == "session_identity_missing")
+    }) {
+        let end = event.timestamp.saturating_mul(1000).saturating_add(999);
+        bounds
+            .entry(event.session.clone())
+            .and_modify(|time| *time = (*time).max(end))
+            .or_insert(end);
+    }
+    bounds
+}
+
+/// Prepare once per query/reconciliation pass. Anonymous-bound lookup is O(A)
+/// once, then authoritative event policy is O(1), not O(events * A).
+pub struct EventPolicy<'a> {
+    response_present: bool,
+    anonymous_threads: &'a BTreeSet<String>,
+    anonymous_bound_ms: Option<i64>,
+}
+#[cfg(test)]
+thread_local! {
+    static POLICY_BOUND_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+impl<'a> EventPolicy<'a> {
+    fn new(
+        response_threads: &BTreeSet<String>,
+        anonymous_threads: &'a BTreeSet<String>,
+        anonymous_bounds_ms: &BTreeMap<String, i64>,
+    ) -> Self {
+        let anonymous_bound_ms = anonymous_threads.iter().try_fold(i64::MIN, |bound, id| {
+            #[cfg(test)]
+            POLICY_BOUND_LOOKUPS.with(|count| count.set(count.get() + 1));
+            anonymous_bounds_ms.get(id).map(|value| bound.max(*value))
+        });
+        Self {
+            response_present: !response_threads.is_empty(),
+            anonymous_threads,
+            anonymous_bound_ms,
+        }
+    }
+    pub fn apply(&self, event: &mut TokenEvent) -> bool {
+        if !self.response_present {
+            return true;
+        }
+        if event.source_kind.as_deref() != Some("token_usage_record") {
+            return !(self.anonymous_threads.contains(&event.session)
+                && event
+                    .partial_flags
+                    .iter()
+                    .any(|f| f == "session_identity_missing"));
+        }
+        let proven_disjoint = self
+            .anonymous_bound_ms
+            .zip(event.coverage_start_timestamp_ms)
+            .is_some_and(|(bound, start)| start > bound);
+        if !self.anonymous_threads.is_empty() && !proven_disjoint {
+            flag(
+                &mut event.partial_flags,
+                "mixed_schema_legacy_overlap_suppressed",
+            );
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TokenStore {
@@ -609,6 +880,12 @@ pub struct TokenStore {
     quota: Vec<ImportedQuotaObservation>,
     last_pricing: Option<Pricing>,
     revision: u64,
+    /// Global ingestion ordering survives lazy hydration and restarts.
+    #[serde(default)]
+    next_sequence: u64,
+    /// Disk revision before any in-memory migration or derived-cache repair.
+    #[serde(skip)]
+    persisted_revision_at_load: Option<u64>,
     recorded_names: BTreeMap<String, RecordedTaskName>,
     recorded_parents: BTreeMap<String, RecordedTaskParent>,
     metadata_path: Option<String>,
@@ -627,6 +904,24 @@ pub struct TokenStore {
     mixed_schema_warning: bool,
     #[serde(skip)]
     usage_dirty: bool,
+    #[serde(skip)]
+    database_mode: bool,
+    #[serde(skip)]
+    hydrated_threads: BTreeSet<String>,
+    #[serde(skip)]
+    dirty_threads: BTreeSet<String>,
+    #[serde(skip)]
+    local_events: BTreeMap<String, Vec<TokenEvent>>,
+    #[serde(skip)]
+    response_threads: BTreeSet<String>,
+    #[serde(skip)]
+    anonymous_threads: BTreeSet<String>,
+    #[serde(skip)]
+    anonymous_bounds_ms: BTreeMap<String, i64>,
+    #[serde(skip)]
+    anonymous_policy_bound_ms: Option<i64>,
+    #[serde(skip)]
+    excluded_task_cache: BTreeSet<String>,
 }
 impl Default for TokenStore {
     fn default() -> Self {
@@ -642,6 +937,8 @@ impl Default for TokenStore {
             quota: Vec::new(),
             last_pricing: None,
             revision: 0,
+            next_sequence: 0,
+            persisted_revision_at_load: None,
             recorded_names: BTreeMap::new(),
             recorded_parents: BTreeMap::new(),
             metadata_path: None,
@@ -653,15 +950,607 @@ impl Default for TokenStore {
             legacy_quota: BTreeMap::new(),
             mixed_schema_warning: false,
             usage_dirty: false,
+            database_mode: false,
+            hydrated_threads: BTreeSet::new(),
+            dirty_threads: BTreeSet::new(),
+            local_events: BTreeMap::new(),
+            response_threads: BTreeSet::new(),
+            anonymous_threads: BTreeSet::new(),
+            anonymous_bounds_ms: BTreeMap::new(),
+            anonymous_policy_bound_ms: None,
+            excluded_task_cache: BTreeSet::new(),
         }
     }
 }
 impl TokenStore {
+    /// Start a lazy database-backed importer without loading historical usage.
+    pub fn from_header(header: StoreHeader) -> Self {
+        let anonymous_policy_bound_ms = header.event_policy().anonymous_bound_ms;
+        Self {
+            version: header.version,
+            normalization_version: header.normalization_version,
+            sources: header.sources,
+            recorded_task_models: header.recorded_task_models,
+            recorded_names: header.recorded_names,
+            recorded_parents: header.recorded_parents,
+            metadata_path: header.metadata_path,
+            metadata_cursor: header.metadata_cursor,
+            metadata_names: header.metadata_names,
+            revision: header.revision,
+            next_sequence: header.next_sequence,
+            last_pricing: header.pricing,
+            quota: header.quota,
+            response_threads: header.response_threads,
+            anonymous_threads: header.anonymous_threads,
+            anonymous_bounds_ms: header.anonymous_bounds_ms,
+            anonymous_policy_bound_ms,
+            excluded_task_cache: header.excluded_tasks,
+            database_mode: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn header(&self) -> StoreHeader {
+        let (response_threads, anonymous_threads) = if self.database_mode {
+            (
+                self.response_threads.clone(),
+                self.anonymous_threads.clone(),
+            )
+        } else {
+            let responses: BTreeSet<_> = self
+                .observations
+                .iter()
+                .filter(|r| r.source_kind.as_deref() == Some("token_usage_record"))
+                .map(|r| r.session.clone())
+                .chain(
+                    self.events
+                        .iter()
+                        .filter(|e| e.source_kind.as_deref() == Some("token_usage_record"))
+                        .map(|e| e.session.clone()),
+                )
+                .collect();
+            let candidates: BTreeSet<_> = self
+                .observations
+                .iter()
+                .filter(|r| r.flags.iter().any(|f| f == "session_identity_missing"))
+                .map(|r| r.session.clone())
+                .collect();
+            let mut anonymous = BTreeSet::new();
+            // Only anonymous candidates require local replay to recover evidence
+            // that the global normalizer intentionally suppressed.
+            let mut candidate_shards: BTreeMap<String, ThreadShard> = BTreeMap::new();
+            if !candidates.is_empty() {
+                for row in self
+                    .observations
+                    .iter()
+                    .filter(|row| candidates.contains(&row.session))
+                {
+                    candidate_shards
+                        .entry(row.session.clone())
+                        .or_insert_with(|| ThreadShard {
+                            thread_id: row.session.clone(),
+                            ..ThreadShard::default()
+                        })
+                        .observations
+                        .push(row.clone());
+                }
+                for row in self
+                    .contexts
+                    .iter()
+                    .filter(|row| candidates.contains(&row.session))
+                {
+                    if let Some(shard) = candidate_shards.get_mut(&row.session) {
+                        shard.contexts.push(row.clone());
+                    }
+                }
+                for row in self
+                    .effort_contexts
+                    .iter()
+                    .filter(|row| candidates.contains(&row.session))
+                {
+                    if let Some(shard) = candidate_shards.get_mut(&row.session) {
+                        shard.effort_contexts.push(row.clone());
+                    }
+                }
+            }
+            for mut shard in candidate_shards.into_values() {
+                self.normalize_shard(
+                    &mut shard,
+                    self.last_pricing.as_ref().unwrap_or(&Pricing::default()),
+                );
+                if !responses.contains(&shard.thread_id)
+                    && shard.events.iter().any(|e| {
+                        e.partial_flags
+                            .iter()
+                            .any(|f| f == "session_identity_missing")
+                    })
+                {
+                    anonymous.insert(shard.thread_id);
+                }
+            }
+            (responses, anonymous)
+        };
+        let anonymous_bounds_ms = if self.database_mode {
+            self.anonymous_bounds_ms.clone()
+        } else {
+            anonymous_bounds(&anonymous_threads, &self.observations, &self.events)
+        };
+        StoreHeader {
+            version: self.version,
+            normalization_version: self.normalization_version,
+            sources: self.sources.clone(),
+            recorded_task_models: self.recorded_task_models.clone(),
+            recorded_names: self.recorded_names.clone(),
+            recorded_parents: self.recorded_parents.clone(),
+            metadata_path: self.metadata_path.clone(),
+            metadata_cursor: self.metadata_cursor.clone(),
+            metadata_names: self.metadata_names.clone(),
+            revision: self.revision,
+            next_sequence: self.next_sequence.max(
+                self.observations
+                    .iter()
+                    .map(|row| row.sequence.saturating_add(1))
+                    .max()
+                    .unwrap_or(0),
+            ),
+            pricing: self.last_pricing.clone(),
+            quota: self.quota.clone(),
+            response_threads,
+            anonymous_threads,
+            anonymous_bounds_ms,
+            excluded_tasks: if self.database_mode {
+                self.excluded_task_cache.clone()
+            } else {
+                self.excluded_auto_review_tasks()
+            },
+        }
+    }
+
+    fn collect_loaded_shards(&self, include_metadata: bool) -> Vec<ThreadShard> {
+        fn shard<'a>(map: &'a mut BTreeMap<String, ThreadShard>, id: &str) -> &'a mut ThreadShard {
+            map.entry(id.to_owned()).or_insert_with(|| ThreadShard {
+                thread_id: id.to_owned(),
+                ..ThreadShard::default()
+            })
+        }
+        let mut shards = BTreeMap::new();
+        for row in &self.observations {
+            shard(&mut shards, &row.session)
+                .observations
+                .push(row.clone());
+        }
+        for row in &self.contexts {
+            shard(&mut shards, &row.session).contexts.push(row.clone());
+        }
+        for row in &self.effort_contexts {
+            shard(&mut shards, &row.session)
+                .effort_contexts
+                .push(row.clone());
+        }
+        if self.database_mode {
+            for (thread, events) in &self.local_events {
+                shard(&mut shards, thread).events = events.clone();
+            }
+            for thread in &self.hydrated_threads {
+                shard(&mut shards, thread);
+            }
+        } else {
+            for event in &self.events {
+                shard(&mut shards, &event.session)
+                    .events
+                    .push(event.clone());
+            }
+        }
+        if include_metadata {
+            for id in self
+                .sources
+                .values()
+                .filter_map(|cursor| cursor.session.as_deref())
+            {
+                shard(&mut shards, id);
+            }
+            for id in self
+                .recorded_task_models
+                .keys()
+                .chain(self.recorded_names.keys())
+                .chain(self.recorded_parents.keys())
+                .chain(self.metadata_names.keys())
+            {
+                shard(&mut shards, id);
+            }
+            for parent in self
+                .recorded_parents
+                .values()
+                .filter_map(|row| row.parent.as_deref())
+            {
+                shard(&mut shards, parent);
+            }
+        }
+        shards.into_values().collect()
+    }
+
+    fn normalize_shard(&self, shard: &mut ThreadShard, pricing: &Pricing) {
+        let mut local = Self {
+            observations: std::mem::take(&mut shard.observations),
+            contexts: std::mem::take(&mut shard.contexts),
+            effort_contexts: std::mem::take(&mut shard.effort_contexts),
+            events: std::mem::take(&mut shard.events),
+            ..Self::default()
+        };
+        if let Some(models) = self.recorded_task_models.get(&shard.thread_id) {
+            local
+                .recorded_task_models
+                .insert(shard.thread_id.clone(), models.clone());
+        }
+        local.reconcile_full(pricing);
+        shard.turn_usage = local.included_task_turn_usage().remove(&shard.thread_id);
+        shard.observations = local.observations;
+        shard.contexts = local.contexts;
+        shard.effort_contexts = local.effort_contexts;
+        shard.events = local.events;
+    }
+
+    /// One-time migration/export. Group in one pass, including metadata-only
+    /// tasks and events-only legacy caches; never serialize the whole store to Value.
+    pub fn thread_shards(&self) -> Vec<ThreadShard> {
+        let mut shards = self.collect_loaded_shards(!self.database_mode);
+        let pricing = self.last_pricing.clone().unwrap_or_default();
+        for shard in &mut shards {
+            self.normalize_shard(shard, &pricing);
+        }
+        shards
+    }
+
+    /// Consuming migration path: move retained evidence instead of making a
+    /// second complete in-memory copy. Capture `header()` before this call.
+    /// Parsing the source JSON itself is still a separate migration concern.
+    pub fn into_thread_shards(mut self) -> Vec<ThreadShard> {
+        fn shard<'a>(map: &'a mut BTreeMap<String, ThreadShard>, id: &str) -> &'a mut ThreadShard {
+            map.entry(id.to_owned()).or_insert_with(|| ThreadShard {
+                thread_id: id.to_owned(),
+                ..ThreadShard::default()
+            })
+        }
+        let mut shards = BTreeMap::new();
+        for row in std::mem::take(&mut self.observations) {
+            shard(&mut shards, &row.session).observations.push(row);
+        }
+        for row in std::mem::take(&mut self.contexts) {
+            shard(&mut shards, &row.session).contexts.push(row);
+        }
+        for row in std::mem::take(&mut self.effort_contexts) {
+            shard(&mut shards, &row.session).effort_contexts.push(row);
+        }
+        if self.database_mode {
+            for (thread, events) in std::mem::take(&mut self.local_events) {
+                shard(&mut shards, &thread).events = events;
+            }
+        } else {
+            for event in std::mem::take(&mut self.events) {
+                shard(&mut shards, &event.session).events.push(event);
+            }
+        }
+        for id in self
+            .sources
+            .values()
+            .filter_map(|cursor| cursor.session.as_deref())
+        {
+            shard(&mut shards, id);
+        }
+        for id in self
+            .recorded_task_models
+            .keys()
+            .chain(self.recorded_names.keys())
+            .chain(self.recorded_parents.keys())
+            .chain(self.metadata_names.keys())
+        {
+            shard(&mut shards, id);
+        }
+        for parent in self
+            .recorded_parents
+            .values()
+            .filter_map(|row| row.parent.as_deref())
+        {
+            shard(&mut shards, parent);
+        }
+        let pricing = self.last_pricing.clone().unwrap_or_default();
+        let mut result: Vec<_> = shards.into_values().collect();
+        for shard in &mut result {
+            self.normalize_shard(shard, &pricing);
+        }
+        result
+    }
+
+    pub fn hydrate_thread(&mut self, shard: ThreadShard) -> io::Result<()> {
+        if !self.database_mode {
+            return Err(invalid_data("Thread hydration requires database mode"));
+        }
+        if self.hydrated_threads.contains(&shard.thread_id) {
+            return Ok(());
+        }
+        if shard
+            .observations
+            .iter()
+            .any(|r| r.session != shard.thread_id)
+            || shard.contexts.iter().any(|r| r.session != shard.thread_id)
+            || shard
+                .effort_contexts
+                .iter()
+                .any(|r| r.session != shard.thread_id)
+            || shard.events.iter().any(|r| r.session != shard.thread_id)
+        {
+            return Err(invalid_data("Thread shard contains another logical thread"));
+        }
+        self.ensure_indexes();
+        // Validate the complete shard before mutating any importer state. A bad
+        // row halfway through must not create a partial replacement on retry.
+        let mut identities = BTreeSet::new();
+        if shard.observations.iter().any(|row| {
+            self.known_observations.contains_key(&row.identity) || !identities.insert(&row.identity)
+        }) {
+            return Err(invalid_data(
+                "Thread shard contains duplicate observation identities",
+            ));
+        }
+        for row in shard.observations {
+            self.next_sequence = self.next_sequence.max(row.sequence.saturating_add(1));
+            let at = self.observations.len();
+            self.known_observations.insert(row.identity.clone(), at);
+            self.observations.push(row);
+        }
+        self.contexts.extend(shard.contexts);
+        self.effort_contexts.extend(shard.effort_contexts);
+        let policy = EventPolicy {
+            response_present: !self.response_threads.is_empty(),
+            anonymous_threads: &self.anonymous_threads,
+            anonymous_bound_ms: self.anonymous_policy_bound_ms,
+        };
+        for event in &shard.events {
+            let mut event = event.clone();
+            if policy.apply(&mut event) {
+                self.events.push(event);
+            }
+        }
+        self.local_events
+            .insert(shard.thread_id.clone(), shard.events);
+        self.hydrated_threads.insert(shard.thread_id);
+        Ok(())
+    }
+
+    fn reconcile_hydrated(&mut self, pricing: &Pricing) {
+        let mut shards = self.collect_loaded_shards(false);
+        for shard in &mut shards {
+            self.normalize_shard(shard, pricing);
+            let response = shard
+                .observations
+                .iter()
+                .any(|r| r.source_kind.as_deref() == Some("token_usage_record"))
+                || shard
+                    .events
+                    .iter()
+                    .any(|e| e.source_kind.as_deref() == Some("token_usage_record"));
+            if response {
+                self.response_threads.insert(shard.thread_id.clone());
+            } else {
+                self.response_threads.remove(&shard.thread_id);
+            }
+            let anonymous = !response
+                && shard.events.iter().any(|e| {
+                    e.partial_flags
+                        .iter()
+                        .any(|f| f == "session_identity_missing")
+                });
+            if anonymous {
+                self.anonymous_threads.insert(shard.thread_id.clone());
+                self.anonymous_bounds_ms.extend(anonymous_bounds(
+                    &BTreeSet::from([shard.thread_id.clone()]),
+                    &shard.observations,
+                    &shard.events,
+                ));
+            } else {
+                self.anonymous_threads.remove(&shard.thread_id);
+                self.anonymous_bounds_ms.remove(&shard.thread_id);
+            }
+            let mut models = self
+                .recorded_task_models
+                .get(&shard.thread_id)
+                .cloned()
+                .unwrap_or_default();
+            models.extend(shard.contexts.iter().map(|context| context.model.clone()));
+            let only_review_models = models.len() == 1 && models.contains(AUTO_REVIEW_MODEL);
+            let any_review = shard.events.iter().any(TokenEvent::is_excluded_auto_review);
+            let any_included = shard.events.iter().any(|e| !e.is_excluded_auto_review());
+            if (only_review_models || any_review) && !any_included {
+                self.excluded_task_cache.insert(shard.thread_id.clone());
+            } else {
+                self.excluded_task_cache.remove(&shard.thread_id);
+            }
+            self.dirty_threads.insert(shard.thread_id.clone());
+            self.local_events
+                .insert(shard.thread_id.clone(), shard.events.clone());
+        }
+        // Keep the persisted evidence in the same canonical order/deduplicated
+        // context form as the full normalizer; otherwise copied contexts would
+        // accumulate indefinitely even though their event output is unchanged.
+        self.observations.clear();
+        self.contexts.clear();
+        self.effort_contexts.clear();
+        for shard in shards {
+            self.observations.extend(shard.observations);
+            self.contexts.extend(shard.contexts);
+            self.effort_contexts.extend(shard.effort_contexts);
+        }
+        self.observations
+            .sort_by_key(|a| (a.timestamp_ms, a.sequence));
+        self.contexts.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then(a.session.cmp(&b.session))
+                .then(a.model.cmp(&b.model))
+        });
+        self.effort_contexts.sort();
+        self.known_observations = self
+            .observations
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row.identity.clone(), index))
+            .collect();
+        self.events.clear();
+        let policy = EventPolicy::new(
+            &self.response_threads,
+            &self.anonymous_threads,
+            &self.anonymous_bounds_ms,
+        );
+        self.anonymous_policy_bound_ms = policy.anonymous_bound_ms;
+        for events in self.local_events.values() {
+            for event in events {
+                let mut event = event.clone();
+                if policy.apply(&mut event) {
+                    self.events.push(event);
+                }
+            }
+        }
+        self.events
+            .sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+        self.last_pricing = Some(pricing.clone());
+        self.normalization_version = NORMALIZATION_VERSION;
+        self.usage_dirty = false;
+        self.refresh_mixed_schema_warning();
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub fn dirty_export(&self) -> DirtyExport {
+        let mut shards: Vec<_> = self
+            .collect_loaded_shards(false)
+            .into_iter()
+            .filter(|s| self.dirty_threads.contains(&s.thread_id))
+            .collect();
+        // Derive tooltip data from each already-normalized local event cache.
+        for shard in &mut shards {
+            let local = Self {
+                observations: shard.observations.clone(),
+                events: shard.events.clone(),
+                ..Self::default()
+            };
+            shard.turn_usage = local.included_task_turn_usage().remove(&shard.thread_id);
+        }
+        DirtyExport {
+            header: self.header(),
+            threads: shards,
+        }
+    }
+
+    /// Finish an all-shard compatibility export without changing its committed
+    /// revision or recomputing accounting. Exporters must hydrate every shard.
+    pub fn finish_hydration_for_export(&mut self) {
+        self.observations
+            .sort_by_key(|a| (a.timestamp_ms, a.sequence));
+        self.contexts.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then(a.session.cmp(&b.session))
+                .then(a.model.cmp(&b.model))
+        });
+        self.effort_contexts.sort();
+        self.events
+            .sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+        self.indexes_ready = false;
+        // A complete compatibility export is an ordinary standalone TokenStore.
+        // It can be inspected/repriced without a database hydration callback.
+        self.database_mode = false;
+        self.local_events.clear();
+        self.hydrated_threads.clear();
+        self.dirty_threads.clear();
+        if let Some(pricing) = self.last_pricing.clone() {
+            self.refresh_cached_prices(&pricing);
+        }
+    }
+
+    /// Refresh derived display prices without replaying accounting evidence.
+    /// Model override/default changes must be reconciled before calling this.
+    pub fn refresh_cached_prices(&mut self, pricing: &Pricing) {
+        for event in &mut self.events {
+            event.cost_usd = event_cost(event, pricing);
+        }
+    }
+
+    /// Call only after the matching DirtyExport commits successfully. A failed
+    /// commit must keep the hydrated state and its cursors available for retry.
+    pub fn mark_committed(&mut self) {
+        if !self.database_mode {
+            return;
+        }
+        self.observations = Vec::new();
+        self.contexts = Vec::new();
+        self.effort_contexts = Vec::new();
+        self.events = Vec::new();
+        self.known_observations.clear();
+        self.local_events.clear();
+        self.hydrated_threads.clear();
+        self.dirty_threads.clear();
+        self.usage_dirty = false;
+        self.persisted_revision_at_load = Some(self.revision);
+    }
+
+    /// Explicitly reproject a loaded shard after a model override/default change.
+    /// Callers hydrate every affected shard and atomically publish one revision.
+    pub fn reprice_hydrated(&mut self, pricing: &Pricing) {
+        if self.database_mode {
+            self.reconcile_hydrated(pricing);
+        } else {
+            self.reprice(pricing);
+        }
+    }
+
+    pub fn import_dir_hydrated(
+        &mut self,
+        root: &Path,
+        metadata_path: Option<&Path>,
+        pricing: &Pricing,
+        loader: &mut dyn FnMut(&str) -> io::Result<Option<ThreadShard>>,
+        progress: &mut dyn FnMut(ImportProgress),
+    ) -> io::Result<ImportReport> {
+        if !self.database_mode {
+            return Err(invalid_data("Hydrated import requires database mode"));
+        }
+        let mut report = self.import_dir_progress_inner(root, pricing, progress, Some(loader))?;
+        if let Some(path) = metadata_path {
+            self.report_progress(
+                ImportPhase::Metadata,
+                &report,
+                report.files_scanned,
+                progress,
+            );
+            if let Err(error) = self.import_metadata_index(path, &mut report) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    report.warnings.push(format!(
+                        "Could not read task-name metadata {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        } else if self.metadata_path.take().is_some() {
+            self.metadata_cursor = SourceCursor::default();
+            self.metadata_names.clear();
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(report)
+    }
+
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         match File::open(path.as_ref()) {
             Ok(file) => {
                 let mut store: Self =
                     serde_json::from_reader(BufReader::new(file)).map_err(invalid_data)?;
+                store.persisted_revision_at_load = Some(store.revision);
+                store.next_sequence = store.next_sequence.max(
+                    store
+                        .observations
+                        .iter()
+                        .map(|row| row.sequence.saturating_add(1))
+                        .max()
+                        .unwrap_or(0),
+                );
                 if matches!(store.version, 1 | 2) {
                     // v1 skipped response records; v2 skipped official names and
                     // quota provenance. Replay selected roots once, retaining history.
@@ -696,6 +1585,16 @@ impl TokenStore {
                     let pricing = store.last_pricing.clone().unwrap_or_default();
                     store.reconcile(&pricing);
                 }
+                // Events are a derived cache. A current-version file may still
+                // have retained observations but a missing/empty event cache
+                // (for example, an interrupted older migration). Source cursors
+                // can already be at EOF, so an unchanged scan will never repair
+                // this on its own. Recover from retained inputs once on load;
+                // do not clear cursors or touch the source file.
+                if store.events.is_empty() && !store.observations.is_empty() {
+                    let pricing = store.last_pricing.clone().unwrap_or_default();
+                    store.reconcile(&pricing);
+                }
                 store.refresh_mixed_schema_warning();
                 Ok(store)
             }
@@ -719,9 +1618,11 @@ impl TokenStore {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            serde_json::to_writer(&mut file, self).map_err(invalid_data)?;
-            file.write_all(b"\n")?;
+            write_token_store(&mut file, self)?;
             file.sync_all()?;
+            // In particular on Windows, release the completed temporary file
+            // before attempting the same-directory atomic replacement.
+            drop(file);
             fs::rename(&temporary, path)
         })();
         if result.is_err() {
@@ -729,6 +1630,48 @@ impl TokenStore {
         }
         result
     }
+    /// Publish a new compatibility export atomically without ever replacing an
+    /// existing destination, including one created during serialization.
+    /// Filesystems without same-directory hard links fail explicitly.
+    pub fn save_new(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.save_new_before_publish(path.as_ref(), || {})
+    }
+
+    fn save_new_before_publish(
+        &self,
+        path: &Path,
+        before_publish: impl FnOnce(),
+    ) -> io::Result<()> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(invalid_data)?
+            .as_nanos();
+        let temporary = path.with_extension(format!("tmp-export-{}-{suffix}", std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let result = (|| {
+            write_token_store(&mut file, self)?;
+            file.sync_all()?;
+            // Windows requires the completed temporary file to be closed before
+            // publishing it. A hard link creates a new name or fails atomically.
+            drop(file);
+            before_publish();
+            fs::hard_link(&temporary, path).map_err(|error| {
+                io::Error::new(error.kind(), format!(
+                    "Could not publish export without replacing existing data; atomic same-directory hard links are required: {error}"))
+            })
+        })();
+        // This is only the unique temporary file created by this call. Earlier
+        // failed/cache temporary files are never discovered or removed here.
+        let _ = fs::remove_file(&temporary);
+        result
+    }
+
     /// In-memory screenshot/test data. Every count and price is fictional; never live account data.
     /// This constructor does not read files or populate actual rate-limit observations.
     pub fn demo(now: i64) -> Self {
@@ -787,6 +1730,8 @@ impl TokenStore {
                 raw_turn_counts: Some(RawTurnCounts {
                     input: Some(turn_total.input),
                     output: Some(turn_total.output),
+                    cached: Some(turn_total.cached),
+                    reasoning: Some(turn_total.reasoning),
                 }),
                 thread_total: None,
                 model: Some(model.into()),
@@ -823,6 +1768,11 @@ impl TokenStore {
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    /// A load may repair data before returning. Only this original revision is
+    /// known to be on disk; authorized worker saves track later revisions.
+    pub(crate) fn persisted_revision_at_load(&self) -> Option<u64> {
+        self.persisted_revision_at_load
     }
     /// Explicit official metadata only. Never inferred from a prompt, cwd or ID.
     pub fn task_name(&self, task: &str) -> Option<&str> {
@@ -1064,6 +2014,13 @@ impl TokenStore {
 
     fn ensure_indexes(&mut self) {
         if !self.indexes_ready {
+            self.next_sequence = self.next_sequence.max(
+                self.observations
+                    .iter()
+                    .map(|row| row.sequence.saturating_add(1))
+                    .max()
+                    .unwrap_or(0),
+            );
             self.known_observations = self
                 .observations
                 .iter()
@@ -1142,28 +2099,85 @@ impl TokenStore {
         root: impl AsRef<Path>,
         pricing: &Pricing,
     ) -> io::Result<ImportReport> {
-        let root = root.as_ref();
+        self.import_dir_progress(root, pricing, &mut |_| {})
+    }
+
+    fn report_progress(
+        &self,
+        phase: ImportPhase,
+        report: &ImportReport,
+        files_total: usize,
+        progress: &mut dyn FnMut(ImportProgress),
+    ) {
+        progress(ImportProgress {
+            phase,
+            files_done: report.files_scanned,
+            files_total,
+            lines_read: report.lines_read,
+            observations: self.observations.len(),
+            events: self.events.len(),
+        });
+    }
+
+    fn import_dir_progress(
+        &mut self,
+        root: impl AsRef<Path>,
+        pricing: &Pricing,
+        progress: &mut dyn FnMut(ImportProgress),
+    ) -> io::Result<ImportReport> {
+        self.import_dir_progress_inner(root.as_ref(), pricing, progress, None)
+    }
+
+    fn import_dir_progress_inner(
+        &mut self,
+        root: &Path,
+        pricing: &Pricing,
+        progress: &mut dyn FnMut(ImportProgress),
+        mut loader: Option<&mut ThreadLoader<'_>>,
+    ) -> io::Result<ImportReport> {
         let mut report = ImportReport::default();
+        self.report_progress(ImportPhase::Discovering, &report, 0, progress);
+        if fs::symlink_metadata(root)?.file_type().is_symlink() {
+            return Err(invalid_data(
+                "Selected sessions root is a symbolic link; select its actual directory explicitly",
+            ));
+        }
         let mut paths = Vec::new();
         collect_jsonl(root, &mut paths, &mut report)?;
         paths.sort();
+        let files_total = paths.len();
+        self.report_progress(ImportPhase::Reading, &report, files_total, progress);
+        let mut last_progress = Instant::now();
         let old_observation_count = self.observations.len();
         let old_context_count = self.contexts.len();
         let old_effort_context_count = self.effort_contexts.len();
         for path in paths {
-            report.files_scanned += 1;
-            if let Err(error) = self.import_file(&path, &mut report) {
+            if let Err(error) = self.import_file(
+                &path,
+                &mut report,
+                files_total,
+                &mut last_progress,
+                progress,
+                &mut loader,
+            ) {
                 report
                     .warnings
                     .push(format!("Could not read {}: {error}", path.display()));
             }
+            report.files_scanned += 1;
+            if last_progress.elapsed() >= Duration::from_millis(250) {
+                self.report_progress(ImportPhase::Reading, &report, files_total, progress);
+                last_progress = Instant::now();
+            }
         }
+        self.report_progress(ImportPhase::Reading, &report, files_total, progress);
         if self.usage_dirty
             || self.observations.len() != old_observation_count
             || self.contexts.len() != old_context_count
             || self.effort_contexts.len() != old_effort_context_count
             || self.last_pricing.as_ref() != Some(pricing)
         {
+            self.report_progress(ImportPhase::Reconciling, &report, files_total, progress);
             // Only a real reconciliation needs an old-ID set, never an idle poll.
             let old_ids: BTreeSet<_> = self.events.iter().map(|event| event.id.clone()).collect();
             self.reconcile(pricing);
@@ -1201,8 +2215,26 @@ impl TokenStore {
         metadata_path: Option<&Path>,
         pricing: &Pricing,
     ) -> io::Result<ImportReport> {
-        let mut report = self.import_dir(root, pricing)?;
+        self.import_dir_with_metadata_progress(root, metadata_path, pricing, &mut |_| {})
+    }
+
+    /// Report bounded metadata-only progress while preserving the ordinary
+    /// import's complete, chronological reconciliation and accounting semantics.
+    pub fn import_dir_with_metadata_progress(
+        &mut self,
+        root: impl AsRef<Path>,
+        metadata_path: Option<&Path>,
+        pricing: &Pricing,
+        progress: &mut dyn FnMut(ImportProgress),
+    ) -> io::Result<ImportReport> {
+        let mut report = self.import_dir_progress(root, pricing, progress)?;
         if let Some(path) = metadata_path {
+            self.report_progress(
+                ImportPhase::Metadata,
+                &report,
+                report.files_scanned,
+                progress,
+            );
             if let Err(error) = self.import_metadata_index(path, &mut report) {
                 if error.kind() != io::ErrorKind::NotFound {
                     report.warnings.push(format!(
@@ -1262,7 +2294,10 @@ impl TokenStore {
             report.source_resets += 1;
         }
         file.seek(SeekFrom::Start(cursor.offset))?;
-        let mut reader = BufReader::new(file);
+        // Pin a finite high-water mark from the opened file. Concurrent append
+        // belongs to the next import, and a partial boundary line is retried.
+        let available = metadata.len().saturating_sub(cursor.offset);
+        let mut reader = BufReader::new(file.take(available));
         loop {
             let (bytes, length, complete, oversized) = read_bounded_line(&mut reader)?;
             if length == 0 {
@@ -1272,10 +2307,11 @@ impl TokenStore {
                 report.partial_lines += 1;
                 break;
             }
+            let offset = cursor.offset;
             cursor.offset = cursor.offset.saturating_add(length);
             report.lines_read += 1;
             if oversized {
-                report.malformed_lines += 1;
+                report.malformed_json_line(path, offset, "oversized line exceeds the 4 MiB limit");
                 continue;
             }
             if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -1283,8 +2319,8 @@ impl TokenStore {
             }
             let value: Value = match serde_json::from_slice(&bytes) {
                 Ok(value) => value,
-                Err(_) => {
-                    report.malformed_lines += 1;
+                Err(error) => {
+                    report.malformed_json_line(path, offset, error);
                     continue;
                 }
             };
@@ -1298,7 +2334,11 @@ impl TokenStore {
                 self.metadata_names.insert(id, name.trim().to_owned());
             }
         }
-        finish_cursor(&mut reader.into_inner(), &mut cursor, &metadata)?;
+        finish_cursor(
+            &mut reader.into_inner().into_inner(),
+            &mut cursor,
+            &metadata,
+        )?;
         if self.metadata_cursor != cursor {
             self.metadata_cursor = cursor;
             self.revision = self.revision.saturating_add(1);
@@ -1306,7 +2346,15 @@ impl TokenStore {
         Ok(())
     }
 
-    fn import_file(&mut self, path: &Path, report: &mut ImportReport) -> io::Result<()> {
+    fn import_file(
+        &mut self,
+        path: &Path,
+        report: &mut ImportReport,
+        files_total: usize,
+        last_progress: &mut Instant,
+        progress: &mut dyn FnMut(ImportProgress),
+        loader: &mut Option<&mut ThreadLoader<'_>>,
+    ) -> io::Result<()> {
         let canonical = fs::canonicalize(path)?;
         let key = canonical.to_string_lossy().into_owned();
         let mut cursor = self.sources.get(&key).cloned().unwrap_or_default();
@@ -1336,7 +2384,10 @@ impl TokenStore {
             ));
         }
         file.seek(SeekFrom::Start(cursor.offset))?;
-        let mut reader = BufReader::new(file);
+        // Pin a finite high-water mark from the opened file. Concurrent append
+        // belongs to the next import, and a partial boundary line is retried.
+        let available = metadata.len().saturating_sub(cursor.offset);
+        let mut reader = BufReader::new(file.take(available));
         loop {
             let (bytes, length, complete, oversized) = read_bounded_line(&mut reader)?;
             if length == 0 {
@@ -1349,12 +2400,14 @@ impl TokenStore {
             let offset = cursor.offset;
             cursor.offset = cursor.offset.saturating_add(length);
             report.lines_read += 1;
+            if report.lines_read.is_multiple_of(512)
+                && last_progress.elapsed() >= Duration::from_millis(250)
+            {
+                self.report_progress(ImportPhase::Reading, report, files_total, progress);
+                *last_progress = Instant::now();
+            }
             if oversized {
-                report.malformed_lines += 1;
-                report.warnings.push(format!(
-                    "Skipped oversized JSONL line in {} at byte {offset}",
-                    path.display()
-                ));
+                report.malformed_json_line(path, offset, "oversized line exceeds the 4 MiB limit");
                 continue;
             }
             if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -1362,14 +2415,18 @@ impl TokenStore {
             }
             let value: Value = match serde_json::from_slice(&bytes) {
                 Ok(value) => value,
-                Err(_) => {
-                    report.malformed_lines += 1;
+                Err(error) => {
+                    report.malformed_json_line(path, offset, error);
                     continue;
                 }
             };
-            self.consume_value(&value, &key, &mut cursor, changed, report);
+            self.consume_value(&value, &key, &mut cursor, changed, report, loader)?;
         }
-        finish_cursor(&mut reader.into_inner(), &mut cursor, &metadata)?;
+        finish_cursor(
+            &mut reader.into_inner().into_inner(),
+            &mut cursor,
+            &metadata,
+        )?;
         if self.sources.get(&key) != Some(&cursor) {
             self.revision = self.revision.saturating_add(1);
             self.sources.insert(key, cursor);
@@ -1384,7 +2441,8 @@ impl TokenStore {
         cursor: &mut SourceCursor,
         rewritten: bool,
         report: &mut ImportReport,
-    ) {
+        loader: &mut Option<&mut ThreadLoader<'_>>,
+    ) -> io::Result<()> {
         let payload = value.get("payload").unwrap_or(value);
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1416,6 +2474,23 @@ impl TokenStore {
             .clone()
             .or_else(|| cursor.session.clone())
             .unwrap_or_else(|| format!("unidentified:{}", stable_hash(source.as_bytes())));
+        if self.database_mode && !self.hydrated_threads.contains(&session) {
+            let loader = loader
+                .as_deref_mut()
+                .ok_or_else(|| invalid_data("Database import requires a thread loader"))?;
+            if let Some(shard) = loader(&session)? {
+                if shard.thread_id != session {
+                    return Err(invalid_data(
+                        "Thread loader returned a different logical identity",
+                    ));
+                }
+                self.hydrate_thread(shard)?;
+            } else {
+                self.hydrated_threads.insert(session.clone());
+            }
+            self.dirty_threads.insert(session.clone());
+            self.usage_dirty = true;
+        }
         if cursor.session.as_deref() == Some(session.as_str())
             && (kind == "turn_context" || matches!(payload_kind, "task_started" | "turn_started"))
         {
@@ -1549,24 +2624,24 @@ impl TokenStore {
             && total_value.is_none()
             && last_value.is_none()
         {
-            return;
+            return Ok(());
         }
         if total_value.is_none() && last_value.is_none() {
-            return;
+            return Ok(());
         }
         let Some(timestamp_ms) = timestamp_ms else {
             report.malformed_lines += 1;
             report
                 .warnings
                 .push("Ignored token usage without a valid timestamp; no date was invented".into());
-            return;
+            return Ok(());
         };
         let mut flags = Vec::new();
         let total = total_value.and_then(|v| parse_counts(v, &mut flags));
         let last = last_value.and_then(|v| parse_counts(v, &mut flags));
         if total.is_none() && last.is_none() {
             report.malformed_lines += 1;
-            return;
+            return Ok(());
         }
         if cursor.session.is_none() && explicit_thread.is_none() {
             flag(&mut flags, "session_identity_missing");
@@ -1587,7 +2662,7 @@ impl TokenStore {
                 "Ignored response usage without thread_id or response_id; no identity was invented"
                     .into(),
             );
-            return;
+            return Ok(());
         }
         if response_scoped && turn_id.is_none() {
             flag(&mut flags, "turn_identity_missing");
@@ -1604,6 +2679,14 @@ impl TokenStore {
             .map(|value| RawTurnCounts {
                 input: raw_count(value, &["input_tokens", "input"]),
                 output: raw_count(value, &["output_tokens", "output"]),
+                cached: raw_count(
+                    value,
+                    &["cached_input_tokens", "cache_read_input_tokens", "cached"],
+                ),
+                reasoning: raw_count(
+                    value,
+                    &["reasoning_output_tokens", "reasoning_tokens", "reasoning"],
+                ),
             });
         let turn_total = payload
             .get("turn_token_usage")
@@ -1697,6 +2780,8 @@ impl TokenStore {
                 if let Some(existing_raw) = &mut existing.raw_turn_counts {
                     existing_raw.input = existing_raw.input.or(raw.input);
                     existing_raw.output = existing_raw.output.or(raw.output);
+                    existing_raw.cached = existing_raw.cached.or(raw.cached);
+                    existing_raw.reasoning = existing_raw.reasoning.or(raw.reasoning);
                 } else {
                     existing.raw_turn_counts = Some(raw);
                 }
@@ -1705,14 +2790,14 @@ impl TokenStore {
                 self.usage_dirty = true;
             }
             report.duplicate_observations += 1;
-            return;
+            return Ok(());
         }
         self.known_observations
             .insert(identity.clone(), self.observations.len());
         self.observations.push(UsageObservation {
             identity,
             timestamp_ms,
-            sequence: self.observations.len() as u64,
+            sequence: self.next_sequence,
             session,
             request_id,
             response_id,
@@ -1731,9 +2816,20 @@ impl TokenStore {
             last,
             flags,
         });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        Ok(())
     }
 
     fn reconcile(&mut self, pricing: &Pricing) {
+        if self.database_mode {
+            self.reconcile_hydrated(pricing);
+        } else {
+            self.reconcile_full(pricing);
+        }
+    }
+
+    /// Whole-store correctness oracle, also used inside one logical thread.
+    fn reconcile_full(&mut self, pricing: &Pricing) {
         if self.observations.is_empty() {
             for event in &mut self.events {
                 if !event.model_assumed
@@ -1929,6 +3025,7 @@ impl TokenStore {
                             output: residual.output,
                             reasoning: residual.reasoning,
                             cost_usd: None,
+                            coverage_start_timestamp_ms: None,
                             partial_flags: residual_flags,
                         });
                     }
@@ -1979,6 +3076,7 @@ impl TokenStore {
                 output: counts.output,
                 reasoning: counts.reasoning,
                 cost_usd: None,
+                coverage_start_timestamp_ms: None,
                 partial_flags: flags,
             };
             if let Some(index) = event_positions.get(&event.id).copied() {
@@ -2074,6 +3172,139 @@ impl TokenStore {
         }
     }
 
+    /// Only explicit turn boundaries and fully present recorded counters can
+    /// certify independence from older ambiguous legacy evidence.
+    fn complete_turn_starts<'a>(
+        &'a self,
+        selected: &BTreeMap<(&'a str, &'a str), &'a UsageObservation>,
+        versions: &BTreeMap<(&'a str, &'a str), Vec<&'a UsageObservation>>,
+    ) -> BTreeMap<(&'a str, &'a str), i64> {
+        #[derive(Default)]
+        struct Proof<'a> {
+            start: Option<i64>,
+            sum: Counts,
+            invalid: bool,
+            first_response: Option<i64>,
+            last_response: Option<i64>,
+            snapshots: Vec<&'a UsageObservation>,
+        }
+        fn add_exact(a: Counts, b: Counts) -> Option<Counts> {
+            Some(Counts {
+                input: a.input.checked_add(b.input)?,
+                cached: a.cached.checked_add(b.cached)?,
+                output: a.output.checked_add(b.output)?,
+                reasoning: a.reasoning.checked_add(b.reasoning)?,
+            })
+        }
+        let mut proof: BTreeMap<(&str, &str), Proof<'_>> = BTreeMap::new();
+        for (&(thread, response), &row) in selected {
+            let Some(turn) = row.turn_id.as_deref() else {
+                continue;
+            };
+            let state = proof.entry((thread, turn)).or_default();
+            if let Some(sum) = row.last.and_then(|counts| add_exact(state.sum, counts)) {
+                state.sum = sum;
+            } else {
+                state.invalid = true;
+            }
+            for version in &versions[&(thread, response)] {
+                state.first_response = Some(
+                    state
+                        .first_response
+                        .map_or(version.timestamp_ms, |old| old.min(version.timestamp_ms)),
+                );
+                state.last_response = Some(
+                    state
+                        .last_response
+                        .map_or(version.timestamp_ms, |old| old.max(version.timestamp_ms)),
+                );
+                if version.turn_id.as_deref() != Some(turn)
+                    || version.flags.iter().any(|flag| {
+                        flag.ends_with("_count_unavailable")
+                            || matches!(
+                                flag.as_str(),
+                                "invalid_token_counts"
+                                    | "missing_token_fields"
+                                    | "cached_exceeded_input"
+                                    | "reasoning_exceeded_output"
+                                    | "invalid_usage_snapshot"
+                            )
+                    })
+                {
+                    state.invalid = true;
+                }
+            }
+            // Conflicting simultaneous versions cannot certify a complete turn.
+            let rows = &versions[&(thread, response)];
+            let mut seen: BTreeMap<i64, (Option<Counts>, Option<&str>)> = BTreeMap::new();
+            for version in rows {
+                let value = (version.last, version.turn_id.as_deref());
+                if seen
+                    .insert(version.timestamp_ms, value)
+                    .is_some_and(|old| old != value)
+                {
+                    state.invalid = true;
+                }
+            }
+        }
+        for context in &self.effort_contexts {
+            if let Some(turn) = context.turn_id.as_deref() {
+                if let Some(state) = proof.get_mut(&(context.session.as_str(), turn)) {
+                    state.start = Some(
+                        state
+                            .start
+                            .map_or(context.timestamp_ms, |old| old.min(context.timestamp_ms)),
+                    );
+                }
+            }
+        }
+        for row in &self.observations {
+            if row.source_kind.as_deref() == Some("token_usage_record") {
+                if let Some(turn) = row.turn_id.as_deref() {
+                    if let Some(state) = proof.get_mut(&(row.session.as_str(), turn)) {
+                        if row.turn_total.is_some() || row.raw_turn_counts.is_some() {
+                            state.snapshots.push(row);
+                        }
+                    }
+                }
+            }
+        }
+        proof
+            .into_iter()
+            .filter_map(|(key, mut state)| {
+                let start = state.start?;
+                if state.invalid || state.first_response.is_none_or(|time| time < start) {
+                    return None;
+                }
+                state
+                    .snapshots
+                    .sort_by_key(|row| (row.timestamp_ms, &row.identity));
+                let mut previous: Option<(i64, Counts)> = None;
+                for row in &state.snapshots {
+                    let raw = row.raw_turn_counts.as_ref()?.complete()?;
+                    if row.turn_total != Some(raw)
+                        || raw.cached > raw.input
+                        || raw.reasoning > raw.output
+                        || row
+                            .flags
+                            .iter()
+                            .any(|flag| flag == "invalid_usage_snapshot")
+                        || previous.is_some_and(|(time, counts)| {
+                            raw.decreased_from(counts)
+                                || (time == row.timestamp_ms && counts != raw)
+                        })
+                    {
+                        return None;
+                    }
+                    previous = Some((row.timestamp_ms, raw));
+                }
+                let (time, snapshot) = previous?;
+                (snapshot == state.sum && state.last_response.is_some_and(|latest| latest <= time))
+                    .then_some((key, start))
+            })
+            .collect()
+    }
+
     /// A response is one completed provider response, a turn is `(thread_id,
     /// turn_id)`, and a task is the logical thread. Root session/turn IDs do not
     /// create an inferred parent-task grouping. Official schema checked 2026-10-17:
@@ -2164,9 +3395,9 @@ impl TokenStore {
         let coverage: BTreeMap<_, _> = by_thread
             .iter()
             .map(|(thread, responses)| {
-                let ranges: Option<Vec<_>> = responses
+                let ranges: Vec<_> = responses
                     .iter()
-                    .map(|r| {
+                    .filter_map(|r| {
                         let usage = r.last?;
                         let end = r.thread_total?;
                         (!end.decreased_from(usage)
@@ -2174,12 +3405,22 @@ impl TokenStore {
                         .then_some((end.sub(usage), end))
                     })
                     .collect();
-                (*thread, ranges.map(CoverageRanges::new))
+                let complete = ranges.len() == responses.len();
+                (*thread, (CoverageRanges::new(ranges), complete))
             })
             .collect();
-        let mut coverage_unknown: BTreeSet<String> = BTreeSet::new();
+        let mut coverage_unknown: BTreeMap<String, i64> = BTreeMap::new();
+        let mut conflicting_turns: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut conflicting_responses: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut anonymous_legacy_overlap: Option<i64> = None;
         let mut kept = Vec::new();
         for mut event in legacy.drain(..) {
+            let rows = legacy_rows.get(&event.id).map(Vec::as_slice).unwrap_or(&[]);
+            let upper_bound = rows
+                .iter()
+                .map(|r| r.timestamp_ms)
+                .max()
+                .unwrap_or_else(|| event.timestamp.saturating_mul(1000).saturating_add(999));
             let Some(_) = by_thread.get(event.session.as_str()) else {
                 if event
                     .partial_flags
@@ -2189,13 +3430,17 @@ impl TokenStore {
                     // An anonymous legacy archive cannot establish that it belongs
                     // to a different task. Preserve its observations, but avoid an
                     // unprovable addition when authoritative records are present.
-                    coverage_unknown.extend(by_thread.keys().map(|thread| (*thread).to_owned()));
+                    // A later, explicitly started and fully reconciled turn is
+                    // independent of this historical unknown. Ownership itself
+                    // remains unknown; no cross-thread match is inferred.
+                    anonymous_legacy_overlap = Some(
+                        anonymous_legacy_overlap.map_or(upper_bound, |old| old.max(upper_bound)),
+                    );
                 } else {
                     kept.push(event);
                 }
                 continue;
             };
-            let rows = legacy_rows.get(&event.id).map(Vec::as_slice).unwrap_or(&[]);
             let matched_response = event
                 .response_id
                 .as_deref()
@@ -2209,7 +3454,16 @@ impl TokenStore {
                 });
             if let Some(response) = matched_response {
                 if response.last != Some(event_counts(&event)) {
-                    coverage_unknown.insert(event.session.clone());
+                    coverage_unknown
+                        .entry(event.session.clone())
+                        .and_modify(|old| *old = (*old).max(upper_bound))
+                        .or_insert(upper_bound);
+                    if let Some(response_id) = &response.response_id {
+                        conflicting_responses.insert((event.session.clone(), response_id.clone()));
+                    }
+                    if let Some(turn) = &response.turn_id {
+                        conflicting_turns.insert((event.session.clone(), turn.clone()));
+                    }
                 }
                 continue;
             }
@@ -2244,7 +3498,7 @@ impl TokenStore {
             });
             // One legacy aggregate endpoint plus non-reset cumulative coordinates
             // lets us remove covered response ranges without relying on file order.
-            if let (Some(Some(ranges)), Some(end)) =
+            if let (Some((ranges, all_responses_comparable)), Some(end)) =
                 (coverage.get(event.session.as_str()), endpoint)
             {
                 if monotonic.contains(event.session.as_str())
@@ -2253,26 +3507,41 @@ impl TokenStore {
                     let old = event_counts(&event);
                     if !end.decreased_from(old) {
                         let residual = ranges.uncovered(end.sub(old), end);
-                        if residual == old {
-                            kept.push(event);
-                        } else if !residual.is_zero() {
-                            set_event_counts(&mut event, residual);
-                            flag(
-                                &mut event.partial_flags,
-                                "mixed_schema_residual_unattributed",
-                            );
-                            event.response_id = None;
-                            event.cost_usd = None;
-                            kept.push(event);
+                        // Fully covered legacy usage remains proven overlap
+                        // even if a newer response omits its thread snapshot.
+                        // A residual, however, might overlap that unknown range;
+                        // add it only when every response has comparable ranges.
+                        if residual.is_zero() {
+                            continue;
                         }
-                        continue;
+                        if *all_responses_comparable {
+                            if residual == old {
+                                kept.push(event);
+                            } else {
+                                set_event_counts(&mut event, residual);
+                                flag(
+                                    &mut event.partial_flags,
+                                    "mixed_schema_residual_unattributed",
+                                );
+                                event.response_id = None;
+                                event.cost_usd = None;
+                                kept.push(event);
+                            }
+                            continue;
+                        }
                     }
                 }
             }
             // Without an ID or comparable cumulative axis the overlap is unknown.
             // Choosing response records prevents double counting; mark the result
             // incomplete instead of asserting that discarded legacy usage was zero.
-            coverage_unknown.insert(event.session.clone());
+            coverage_unknown
+                .entry(event.session.clone())
+                .and_modify(|old| *old = (*old).max(upper_bound))
+                .or_insert(upper_bound);
+            if let Some(turn) = &event.turn_id {
+                conflicting_turns.insert((event.session.clone(), turn.clone()));
+            }
         }
         let mut turn_sums: BTreeMap<(&str, &str), Counts> = BTreeMap::new();
         let mut thread_sums: BTreeMap<&str, Counts> = BTreeMap::new();
@@ -2353,6 +3622,7 @@ impl TokenStore {
                     .map(|_| ((*thread).to_owned(), (*turn).to_owned()))
             })
             .collect();
+        let complete_turn_starts = self.complete_turn_starts(&selected, &versions);
         for ((thread, response), row) in selected {
             let Some(counts) = row.last else { continue };
             let mut flags = row.flags.clone();
@@ -2374,7 +3644,25 @@ impl TokenStore {
             }) {
                 flag(&mut flags, "response_record_conflict");
             }
-            if coverage_unknown.contains(thread) {
+            let coverage_start = row
+                .turn_id
+                .as_deref()
+                .and_then(|turn| complete_turn_starts.get(&(thread, turn)).copied());
+            let uncertainty_bound = coverage_unknown
+                .get(thread)
+                .copied()
+                .into_iter()
+                .chain(anonymous_legacy_overlap)
+                .max();
+            let explicit_conflict = conflicting_responses
+                .contains(&(thread.to_owned(), response.to_owned()))
+                || row.turn_id.as_ref().is_some_and(|turn| {
+                    conflicting_turns.contains(&(thread.to_owned(), turn.clone()))
+                });
+            if explicit_conflict
+                || uncertainty_bound
+                    .is_some_and(|bound| coverage_start.is_none_or(|start| start <= bound))
+            {
                 flag(&mut flags, "mixed_schema_legacy_overlap_suppressed");
             }
             // Updated/replayed records may omit the model that an earlier
@@ -2430,6 +3718,7 @@ impl TokenStore {
                 output: counts.output,
                 reasoning: counts.reasoning,
                 cost_usd: None,
+                coverage_start_timestamp_ms: coverage_start,
                 partial_flags: flags,
             };
             event.cost_usd = event_cost(&event, pricing);
@@ -2525,7 +3814,7 @@ impl CoverageRanges {
     }
 }
 
-fn event_cost(event: &TokenEvent, pricing: &Pricing) -> Option<f64> {
+pub(crate) fn event_cost(event: &TokenEvent, pricing: &Pricing) -> Option<f64> {
     if event.partial_flags.iter().any(|s| {
         matches!(
             s.as_str(),
@@ -2570,6 +3859,15 @@ fn effort_fields(value: &Value, names: &[&str]) -> BTreeSet<String> {
         .map(str::to_owned)
         .collect()
 }
+/// serde_json issues small writes for individual tokens. Batch them before
+/// reaching the filesystem, and propagate flush errors before sync/rename.
+fn write_token_store(writer: impl Write, store: &TokenStore) -> io::Result<()> {
+    let mut buffered = BufWriter::with_capacity(256 * 1024, writer);
+    serde_json::to_writer(&mut buffered, store).map_err(invalid_data)?;
+    buffered.write_all(b"\n")?;
+    buffered.flush()
+}
+
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -2837,6 +4135,68 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn token_store_writer_batches_small_json_writes_and_preserves_bytes() {
+        #[derive(Default)]
+        struct CountWriter {
+            calls: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for CountWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut store = TokenStore::demo(1_791_158_400);
+        let row = store.events[0].clone();
+        store.events = vec![row; 10_000];
+        let mut expected = serde_json::to_vec(&store).unwrap();
+        expected.push(b'\n');
+        let mut writer = CountWriter::default();
+        write_token_store(&mut writer, &store).unwrap();
+        assert_eq!(writer.bytes, expected);
+        assert!(writer.calls > 1, "exercise multiple buffer flushes");
+        assert!(
+            writer.calls <= expected.len() / (128 * 1024) + 2,
+            "small JSON tokens must not become individual filesystem writes: {} writes for {} bytes",
+            writer.calls,
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn token_store_writer_propagates_buffer_write_and_flush_failures() {
+        struct FailingWriter {
+            fail_write: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::other("synthetic write failure"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("synthetic flush failure"))
+            }
+        }
+        for fail_write in [true, false] {
+            let error = write_token_store(FailingWriter { fail_write }, &TokenStore::default())
+                .unwrap_err();
+            assert!(error.to_string().contains(if fail_write {
+                "synthetic write failure"
+            } else {
+                "synthetic flush failure"
+            }));
+        }
+    }
 
     fn c(input: u64, cached: u64, output: u64, reasoning: u64) -> Value {
         json!({"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output,"reasoning_output_tokens":reasoning})
@@ -4050,5 +5410,61 @@ mod tests {
         assert!(store.events()[0]
             .partial_flags
             .contains(&"cache_write_pricing_unmodeled".into()));
+    }
+    #[test]
+    fn new_export_publication_never_clobbers_a_racing_destination() {
+        let dir = TempDir::new().unwrap();
+        let destination = dir.path().join("export.json");
+        let prior_temporary = dir.path().join("tokens.tmp-older-preserve");
+        fs::write(&prior_temporary, b"unassessed prior temporary").unwrap();
+        let result = TokenStore::default().save_new_before_publish(&destination, || {
+            fs::write(&destination, b"another writer won the race").unwrap();
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"another writer won the race"
+        );
+        assert_eq!(
+            fs::read(&prior_temporary).unwrap(),
+            b"unassessed prior temporary"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        let new = dir.path().join("new-export.json");
+        let store = TokenStore::demo(1000);
+        store.save_new(&new).unwrap();
+        assert_eq!(TokenStore::load(new).unwrap().events(), store.events());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn prepared_policy_looks_up_anonymous_bounds_once_not_per_event() {
+        let mut header = TokenStore::default().header();
+        header.response_threads.insert("response-thread".into());
+        for n in 0..10_000 {
+            let id = format!("anonymous-{n:05}");
+            header.anonymous_threads.insert(id.clone());
+            header.anonymous_bounds_ms.insert(id, n);
+        }
+        POLICY_BOUND_LOOKUPS.with(|count| count.set(0));
+        let policy = header.event_policy();
+        assert_eq!(POLICY_BOUND_LOOKUPS.with(std::cell::Cell::get), 10_000);
+        let mut event = TokenStore::demo(1000).events()[0].clone();
+        event.coverage_start_timestamp_ms = Some(10_001);
+        for _ in 0..10_000 {
+            assert!(policy.apply(&mut event));
+        }
+        assert_eq!(POLICY_BOUND_LOOKUPS.with(std::cell::Cell::get), 10_000);
+        assert!(!event
+            .partial_flags
+            .iter()
+            .any(|f| f == "mixed_schema_legacy_overlap_suppressed"));
+        header.anonymous_bounds_ms.remove("anonymous-09999");
+        let missing = header.event_policy();
+        assert!(missing.apply(&mut event));
+        assert!(event
+            .partial_flags
+            .iter()
+            .any(|f| f == "mixed_schema_legacy_overlap_suppressed"));
     }
 }

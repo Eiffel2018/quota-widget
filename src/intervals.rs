@@ -15,7 +15,11 @@ use crate::{
     usage_views::coverage_incomplete,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
+    io,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -190,6 +194,43 @@ impl Totals {
             coverage: self.coverage - before.coverage,
         }
     }
+    fn model_usage(self, model: String) -> ModelIntervalUsage {
+        let capped = |n: u128| n.min(u128::from(u64::MAX)) as u64;
+        ModelIntervalUsage {
+            model,
+            input: capped(self.input),
+            cached: capped(self.cached),
+            uncached: capped(self.uncached),
+            output: capped(self.output),
+            reasoning: capped(self.reasoning),
+            known_usd: self.known_usd,
+            unknown_cost_events: self.unknown,
+            events: self.events,
+            assumed_model_events: self.assumed,
+            model_assumed: self.assumed != 0,
+            partial_events: self.partial,
+            coverage_gap_events: self.coverage,
+        }
+    }
+}
+/// Aggregate an already selected range of token events into sorted model rows.
+/// Recorded automatic-review events are excluded, just as in `IntervalIndex`.
+/// This consumes an iterator without retaining its events: additional memory is
+/// proportional to the number of distinct models. Supply events in a stable
+/// order (normally timestamp, then ID) for reproducible floating-point subtotals.
+pub fn model_usage<'a>(
+    events: impl IntoIterator<Item = &'a TokenEvent>,
+) -> Vec<ModelIntervalUsage> {
+    let mut models: BTreeMap<&str, Totals> = BTreeMap::new();
+    for event in events {
+        if !event.is_excluded_auto_review() {
+            models.entry(&event.model).or_default().add(event);
+        }
+    }
+    models
+        .into_iter()
+        .map(|(model, totals)| totals.model_usage(model.to_owned()))
+        .collect()
 }
 #[derive(Debug, Clone)]
 struct ModelSeries {
@@ -202,22 +243,7 @@ impl ModelSeries {
         let a = self.positions.partition_point(|p| *p < lo);
         let b = self.positions.partition_point(|p| *p < hi);
         let t = self.prefixes[b].difference(self.prefixes[a]);
-        let capped = |n: u128| n.min(u128::from(u64::MAX)) as u64;
-        ModelIntervalUsage {
-            model: self.model.clone(),
-            input: capped(t.input),
-            cached: capped(t.cached),
-            uncached: capped(t.uncached),
-            output: capped(t.output),
-            reasoning: capped(t.reasoning),
-            known_usd: t.known_usd,
-            unknown_cost_events: t.unknown,
-            events: t.events,
-            assumed_model_events: t.assumed,
-            model_assumed: t.assumed != 0,
-            partial_events: t.partial,
-            coverage_gap_events: t.coverage,
-        }
+        t.model_usage(self.model.clone())
     }
 }
 /// Immutable owned index, suitable for caching on a background token snapshot.
@@ -315,7 +341,12 @@ impl IntervalIndex {
     /// Unconfirmed observations never establish boundaries, and partial flags
     /// from observations/usage remain visible as non-comparability reasons.
     pub fn completed_intervals(&self, history: &[HistoryEvent]) -> Vec<CompletedInterval> {
-        completed_indexed(self, history)
+        match completed_with_usage(history, self.times.first().copied(), &mut |start, end| {
+            Ok::<_, Infallible>(self.usage(start, end))
+        }) {
+            Ok(intervals) => intervals,
+            Err(never) => match never {},
+        }
     }
 }
 /// Convenience API. Reuse `IntervalIndex` when only history changes.
@@ -325,6 +356,26 @@ pub fn completed_intervals(
     history: &[HistoryEvent],
 ) -> Vec<CompletedInterval> {
     IntervalIndex::new(events).completed_intervals(history)
+}
+
+/// Build completed intervals from normalized history using bounded token queries.
+///
+/// `earliest_token_timestamp` is the earliest non-excluded event in the complete
+/// token dataset, not just the queried ranges. `usage` must return sorted model
+/// rows for events in `(start, end]`, with automatic-review exclusions and totals
+/// equivalent to `model_usage`. It is called only for defensible, nonempty time
+/// ranges. No token query is needed for an unavailable or invalid boundary.
+///
+/// Callers may cache queries by `(start, end)` and invalidate them when token
+/// changes intersect that range. History/account/session/epoch/partial semantics
+/// use the same core as `IntervalIndex::completed_intervals`. Any query error is
+/// returned immediately; a failed query is never reported as an empty interval.
+pub fn completed_intervals_with_provider(
+    history: &[HistoryEvent],
+    earliest_token_timestamp: Option<i64>,
+    mut usage: impl FnMut(i64, i64) -> io::Result<Vec<ModelIntervalUsage>>,
+) -> io::Result<Vec<CompletedInterval>> {
+    completed_with_usage(history, earliest_token_timestamp, &mut usage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -358,7 +409,11 @@ fn base_scope<'a>(
         e.window_label.as_str(),
     )
 }
-fn completed_indexed(index: &IntervalIndex, history: &[HistoryEvent]) -> Vec<CompletedInterval> {
+fn completed_with_usage<E>(
+    history: &[HistoryEvent],
+    earliest_token_timestamp: Option<i64>,
+    usage: &mut impl FnMut(i64, i64) -> Result<Vec<ModelIntervalUsage>, E>,
+) -> Result<Vec<CompletedInterval>, E> {
     let mut aliases: BTreeMap<Alias<'_>, BTreeSet<&str>> = BTreeMap::new();
     for e in history.iter().filter(|e| is_confirmed_quota_change(e)) {
         if let Some(key) = e.window_key.as_deref() {
@@ -404,8 +459,17 @@ fn completed_indexed(index: &IntervalIndex, history: &[HistoryEvent]) -> Vec<Com
                 for current in confirmed {
                     if history[current].kind == HistoryKind::QuotaDecrease {
                         result.push(build_interval(
-                            index, history, current, None, true, uncertain, false,
-                        ));
+                            earliest_token_timestamp,
+                            usage,
+                            history,
+                            BoundaryContext {
+                                current,
+                                previous: None,
+                                ambiguous: true,
+                                uncertain,
+                                ambiguous_predecessor: false,
+                            },
+                        )?);
                     }
                 }
                 previous = None;
@@ -416,14 +480,17 @@ fn completed_indexed(index: &IntervalIndex, history: &[HistoryEvent]) -> Vec<Com
                 uncertain |= end - at > 1;
                 if history[current].kind == HistoryKind::QuotaDecrease {
                     result.push(build_interval(
-                        index,
+                        earliest_token_timestamp,
+                        usage,
                         history,
-                        current,
-                        previous,
-                        false,
-                        uncertain,
-                        ambiguous_predecessor,
-                    ));
+                        BoundaryContext {
+                            current,
+                            previous,
+                            ambiguous: false,
+                            uncertain,
+                            ambiguous_predecessor,
+                        },
+                    )?);
                 }
                 previous = Some(current);
                 uncertain = false;
@@ -479,22 +546,34 @@ fn completed_indexed(index: &IntervalIndex, history: &[HistoryEvent]) -> Vec<Com
         }
     }
     result.sort_by_key(|i| i.history_index);
-    result
+    Ok(result)
 }
 fn add_reason(reasons: &mut Vec<IntervalReason>, reason: IntervalReason) {
     if !reasons.contains(&reason) {
         reasons.push(reason);
     }
 }
-fn build_interval(
-    index: &IntervalIndex,
-    history: &[HistoryEvent],
+/// Boundary identity and reconciliation flags from one normalized history stream.
+struct BoundaryContext {
     current: usize,
     previous: Option<usize>,
     ambiguous: bool,
     uncertain: bool,
     ambiguous_predecessor: bool,
-) -> CompletedInterval {
+}
+fn build_interval<E>(
+    earliest_token_timestamp: Option<i64>,
+    usage: &mut impl FnMut(i64, i64) -> Result<Vec<ModelIntervalUsage>, E>,
+    history: &[HistoryEvent],
+    boundary: BoundaryContext,
+) -> Result<CompletedInterval, E> {
+    let BoundaryContext {
+        current,
+        previous,
+        ambiguous,
+        uncertain,
+        ambiguous_predecessor,
+    } = boundary;
     let e = &history[current];
     let before = e.before.parse::<f64>().unwrap();
     let after = e.after.parse::<f64>().unwrap();
@@ -548,10 +627,14 @@ fn build_interval(
         if start >= e.observed_at_unix {
             add_reason(&mut reasons, IntervalReason::InvalidBoundaryTime);
         }
-        if index.times.first().is_none_or(|first| *first > start) {
+        if earliest_token_timestamp.is_none_or(|first| first > start) {
             add_reason(&mut reasons, IntervalReason::TokenCoverageStartsLate);
         }
-        index.usage(start, e.observed_at_unix)
+        if start < e.observed_at_unix {
+            usage(start, e.observed_at_unix)?
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -579,7 +662,7 @@ fn build_interval(
     }
     let comparable = reasons.is_empty();
     let percentage_points = before - after;
-    CompletedInterval {
+    Ok(CompletedInterval {
         history_index: current,
         history_event_key: history_event_key(e),
         previous_history_event_key: previous.map(|p| history_event_key(&history[p])),
@@ -604,5 +687,5 @@ fn build_interval(
         cost_per_point: comparable.then_some(known_usd / percentage_points),
         reasons,
         models,
-    }
+    })
 }

@@ -195,7 +195,7 @@ fn actual_legacy_rises_are_classified_from_endpoints_even_with_a_decrease_label(
     let raw = vec![
         row(3, 100, "0:primary", HistoryKind::QuotaDecrease, "0", "100"),
         row(3, 110, "0:primary", HistoryKind::QuotaDecrease, "100", "99"),
-        row(3, 120, "0:primary", HistoryKind::QuotaReset, "99", "100"),
+        row(3, 120, "0:primary", HistoryKind::QuotaReset, "97", "100"),
     ];
     let rows = checked(&raw);
     assert_eq!(rows[0].kind, HistoryKind::QuotaReset);

@@ -22,6 +22,7 @@ fn event(task: &str, time: i64, cost: Option<f64>) -> TokenEvent {
         output: 1,
         reasoning: 0,
         cost_usd: cost,
+        coverage_start_timestamp_ms: None,
         partial_flags: vec![],
     }
 }

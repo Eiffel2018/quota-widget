@@ -1,6 +1,6 @@
 [package]
 name = "quota-widget"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.88"
 description = "Read-only native Codex quota and local token usage widget"
@@ -12,6 +12,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
+flate2 = "=1.1.10"
+sha2 = "=0.10.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]

@@ -624,6 +624,7 @@ mod tests {
             output: 100,
             reasoning: 80,
             cost_usd: Some(0.4415),
+            coverage_start_timestamp_ms: None,
             partial_flags: vec![],
         }
     }

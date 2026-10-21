@@ -1,6 +1,15 @@
-# Quota Widget 0.3.4
+# Quota Widget 0.3.5
 
 原生 Rust + eframe 桌面小工具，重建自 0.2.1 的畫面、已恢復字型／圖示、格式與行為證據。本專案是新的可維護實作，不是聲稱找回遺失的原始碼。沒有 Electron、WebView、Node 或 Python 常駐服務。
+
+## 0.3.5 增量儲存與速度修正
+
+- 用量改存本機 SQLite（隨 EXE 靜態編譯，不需另外安裝）。原始證據按 Task 壓縮保留，新增資料只更新受影響的 Task、索引與區間快取，不再每次重寫整份 tokens.json。
+- 第一次開啟會驗證及轉換舊 JSON，顯示進度；原 tokens.json 保留原樣。轉換中斷可以續做，只有驗證成功才啟用新資料庫。第一次仍須完整讀取舊 JSON，之後啟動直接查索引。
+- 主視窗只接收近期 Task 的最新事件；每日明細每頁 500 行，總和仍涵蓋全日。增量調整當日／本%總和；Turn／Task 分組只重查受影響的群組。未知／部分小計繼續明示。
+- 同一額度週期內反覆 +1 百分點依使用者指定視為無變動：86→87→86 的即時讀數固定為 86，不重設累計或多計扣額；有可信到期／新週期證據的真正重設仍保留。亦修正鏡像來源假缺口及零變動 epoch 干擾；原始額度觀察不刪除。
+- 支援完整相容 JSON 匯出供備份／回退，詳見 docs/INCREMENTAL-STORAGE-CLI.md。舊 EXE 不認識 SQLite，請勿混用同一資料目錄。
+- 保留既有深色、香港時間、每個模型自訂價、Task 樹及每日／每%明細。
 
 ## 0.3.4 試用修正
 
@@ -35,7 +44,7 @@ Windows 請先關閉舊版再開新 EXE；不需要刪除設定或歷史。這�
 
 ## 啟動
 
-Windows：解壓後執行 quota-widget.exe，或 Start Demo.bat 試合成範例。
+Windows：解壓後執行 quota-widget.exe；合成範例可用 quota-widget.exe --demo。
 
 macOS：請看 MACOS-BUILD.md。若交付包沒有真正的 Mach-O arm64 執行檔，不能把原碼／建置腳本當成已建置 Mac App。
 
@@ -51,7 +60,7 @@ Linux：桌面需 X11／Wayland 及 OpenGL。執行 quota-widget。
 
 資料目錄：Windows %LOCALAPPDATA%/quota-widget；Mac ~/Library/Application Support/quota-widget；Linux $XDG_CONFIG_HOME/quota-widget 或 ~/.config/quota-widget。
 
-settings.json 保存偏好／價格；history.json 保存額度觀察事件；tokens.json 保存去重後用量、必要的模型／session 識別、明確 Task 名稱及上層關係、來源 offsets。名稱來自 metadata 或所選 sessions 同層 session_index.jsonl，不從對話正文猜測。沒有對話正文或憑證。匯出存到 exports/。請把含本機 session／來源路徑的資料視為私人資料。
+settings.json 保存偏好／價格；history.json 保存額度觀察事件；tokens.sqlite3 保存去重後用量、壓縮原始用量證據、必要的模型／session 識別、明確 Task 名稱及上層關係、來源 offsets。舊 tokens.json 原樣保留為轉換前備份；新的用量不再寫入它。資料庫開啟時可能有 -wal／-shm 側檔，請勿自行刪除；備份請先關閉程式或使用完整 export。名稱來自 metadata 或所選 sessions 同層 session_index.jsonl，不從對話正文猜測。沒有對話正文或憑證。匯出存到 exports/。請把含本機 session／來源路徑的資料視為私人資料。
 
 只有一個寫入者能持有該資料目錄的 OS 鎖；其他視窗改為唯讀。損壞的儲存檔不會以空資料覆寫。程式不自動刪除舊歷史；自行備份後可手動管理。Demo 不讀取或保存真實資料。
 
@@ -71,7 +80,7 @@ Windows GNU 交叉建置需官方 Rust x86_64-pc-windows-gnu target 及 MinGW-w6
 
     cargo build --release --locked --target x86_64-pc-windows-gnu
 
-此原碼版本與 Windows 包的驗證結果以 VALIDATION-0.3.4.md 為準；舊版 VALIDATION.md 僅作先前版本記錄。跨編譯不是 Windows 或 Mac 原生實測。未做 Authenticode／Apple notarization。不要停用安全防護或繞過系統警告。
+此原碼版本與 Windows 包的驗證結果以 VALIDATION-0.3.5.md 為準；舊版 VALIDATION.md 僅作先前版本記錄。跨編譯不是 Windows 或 Mac 原生實測。未做 Authenticode／Apple notarization。不要停用安全防護或繞過系統警告。
 
 ## CLI / agent 使用
 

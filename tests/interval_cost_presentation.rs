@@ -25,6 +25,7 @@ fn token(timestamp: i64, model: &str, cost_usd: Option<f64>) -> TokenEvent {
         output: 30,
         reasoning: 20,
         cost_usd,
+        coverage_start_timestamp_ms: None,
         partial_flags: Vec::new(),
     }
 }

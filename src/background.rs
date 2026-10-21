@@ -10,21 +10,25 @@ use crate::{
     intervals::{CompletedInterval, IntervalIndex},
     model::HistoryEvent,
     storage::{self, Settings},
-    tokens::{ImportReport, Pricing, TaskTurnUsage, TokenEvent, TokenStore},
+    tokens::{
+        ImportPhase, ImportProgress, ImportReport, Pricing, TaskTurnUsage, TokenEvent, TokenStore,
+    },
     usage_views,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{mpsc, Arc},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 /// The GUI sees display data only, never source cursors or retained raw records.
 /// Cloning the owning `Arc` is constant-time; construction happens on the worker.
 #[derive(Debug, Default)]
 pub struct Snapshot {
+    pub database: Option<crate::db_view::DatabaseView>,
     pub revision: u64,
     pub pricing: Pricing,
     /// Default usage surface: normalized events with automatic review excluded.
@@ -56,6 +60,7 @@ impl Snapshot {
             !excluded_tasks.contains(child) && !excluded_tasks.contains(parent)
         });
         Self {
+            database: None,
             revision: store.revision(),
             pricing: store.pricing().cloned().unwrap_or_default(),
             usage_index: usage_views::UsageIndex::new(&events),
@@ -78,6 +83,7 @@ impl Snapshot {
 
 #[derive(Debug)]
 pub enum Command {
+    View(crate::db_view::ViewRequest),
     Load {
         token_path: PathBuf,
         history_path: Option<PathBuf>,
@@ -108,8 +114,43 @@ pub enum Command {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    Load,
+    Import,
+    Reprice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressStage {
+    Loading,
+    Migrating,
+    Import(ImportPhase),
+    BuildingViews,
+    BuildingIntervals,
+    Saving,
+    Complete,
+}
+
+/// Small status messages only: progress never publishes provisional accounting
+/// or clones the growing token/history data. Counts describe this operation.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    pub operation: Operation,
+    pub stage: ProgressStage,
+    pub elapsed: Duration,
+    pub files_done: usize,
+    pub files_total: usize,
+    pub lines_read: usize,
+    pub observations: usize,
+    pub events: usize,
+}
+
 #[derive(Debug)]
 pub enum Event {
+    /// Opt-in status stream for interactive clients; existing display data stays
+    /// valid throughout every stage. Complete follows any authorized writes.
+    Progress(Progress),
     Loaded {
         snapshot: Arc<Snapshot>,
         normalized_history: Arc<Vec<HistoryEvent>>,
@@ -117,6 +158,8 @@ pub enum Event {
         error: Option<String>,
     },
     Updated {
+        /// Display-ready, not a durability acknowledgement. Persistence follows
+        /// this event; SaveFailed reports failure and shutdown flushes the FIFO.
         /// None on a no-op poll, so old snapshots and view caches stay valid.
         snapshot: Option<Arc<Snapshot>>,
         normalized_history: Option<Arc<Vec<HistoryEvent>>>,
@@ -146,10 +189,31 @@ pub struct Worker {
     join: Option<JoinHandle<()>>,
 }
 impl Worker {
-    pub fn spawn() -> Self {
+    pub fn spawn_database_with_progress(write_authorized: bool) -> Self {
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
-        let join = thread::spawn(move || run(commands, events));
+        let join =
+            thread::spawn(move || crate::database_worker::run(commands, events, write_authorized));
+        Self {
+            tx: Some(tx),
+            rx,
+            join: Some(join),
+        }
+    }
+    pub fn spawn() -> Self {
+        Self::spawn_with_sink(false, |store, path| store.save(path))
+    }
+    /// Include lightweight stage/count events in addition to display snapshots.
+    pub fn spawn_with_progress() -> Self {
+        Self::spawn_with_sink(true, |store, path| store.save(path))
+    }
+    fn spawn_with_sink(
+        emit_progress: bool,
+        save_tokens: impl FnMut(&TokenStore, &Path) -> std::io::Result<()> + Send + 'static,
+    ) -> Self {
+        let (tx, commands) = mpsc::channel();
+        let (events, rx) = mpsc::channel();
+        let join = thread::spawn(move || run(commands, events, emit_progress, save_tokens));
         Self {
             tx: Some(tx),
             rx,
@@ -210,6 +274,47 @@ fn send_save_error(events: &mpsc::Sender<Event>, path: PathBuf, error: std::io::
         path,
         error: error.to_string(),
     });
+}
+
+struct ProgressReporter<'a> {
+    enabled: bool,
+    sender: &'a mpsc::Sender<Event>,
+    started: Instant,
+    progress: Progress,
+}
+impl<'a> ProgressReporter<'a> {
+    fn new(enabled: bool, sender: &'a mpsc::Sender<Event>, operation: Operation) -> Self {
+        Self {
+            enabled,
+            sender,
+            started: Instant::now(),
+            progress: Progress {
+                operation,
+                stage: ProgressStage::Loading,
+                elapsed: Duration::ZERO,
+                files_done: 0,
+                files_total: 0,
+                lines_read: 0,
+                observations: 0,
+                events: 0,
+            },
+        }
+    }
+    fn stage(&mut self, stage: ProgressStage) {
+        self.progress.stage = stage;
+        self.progress.elapsed = self.started.elapsed();
+        if self.enabled {
+            let _ = self.sender.send(Event::Progress(self.progress.clone()));
+        }
+    }
+    fn import(&mut self, progress: ImportProgress) {
+        self.progress.files_done = progress.files_done;
+        self.progress.files_total = progress.files_total;
+        self.progress.lines_read = progress.lines_read;
+        self.progress.observations = progress.observations;
+        self.progress.events = progress.events;
+        self.stage(ProgressStage::Import(progress.phase));
+    }
 }
 
 /// A failed/corrupt load must never turn an empty replacement store into an
@@ -422,7 +527,12 @@ impl State {
             Err(error) => send_save_error(events, path, error),
         }
     }
-    fn save_if_changed(&mut self, path: Option<PathBuf>, events: &mpsc::Sender<Event>) {
+    fn save_if_changed(
+        &mut self,
+        path: Option<PathBuf>,
+        events: &mpsc::Sender<Event>,
+        save_tokens: &mut dyn FnMut(&TokenStore, &Path) -> std::io::Result<()>,
+    ) {
         let Some(path) = path else { return };
         if self.token_writes_blocked || self.history_writes_blocked {
             return;
@@ -435,14 +545,19 @@ impl State {
         {
             return;
         }
-        match self.store.save(&path) {
+        match save_tokens(&self.store, &path) {
             Ok(()) => self.saved_revision = Some((path, revision)),
             Err(error) => send_save_error(events, path, error),
         }
     }
 }
 
-fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
+fn run(
+    commands: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Event>,
+    emit_progress: bool,
+    mut save_tokens: impl FnMut(&TokenStore, &Path) -> std::io::Result<()>,
+) {
     let mut state = State::new();
     // A second worker-side guard against callers enqueueing unchanged settings.
     // No serialization occurs in send().
@@ -455,6 +570,8 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                 history_path,
                 pricing,
             } => {
+                let mut progress = ProgressReporter::new(emit_progress, &events, Operation::Load);
+                progress.stage(ProgressStage::Loading);
                 // A new load is a replacement, including failed loads. Never
                 // carry old account data forward after switching data paths.
                 state.store = TokenStore::default();
@@ -462,13 +579,14 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                 state.interval_inputs = None;
                 state.interval_index = None;
                 state.saved_interval_revision = None;
-                let existed = token_path.is_file();
                 let error = match TokenStore::load(&token_path) {
                     Ok(store) => {
                         state.store = store;
                         state.token_writes_blocked = false;
-                        state.saved_revision =
-                            existed.then(|| (token_path, state.store.revision()));
+                        state.saved_revision = state
+                            .store
+                            .persisted_revision_at_load()
+                            .map(|revision| (token_path, revision));
                         None
                     }
                     Err(error) => {
@@ -502,21 +620,27 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                         }
                     }
                 });
+                progress.progress.events = state.store.events().len();
+                progress.stage(ProgressStage::BuildingViews);
                 let imported = history::replay(state.store.quota_observations());
                 state.merge_history(imported);
                 let normalized_history = state.normalized_history();
                 state.store.reprice(&pricing);
                 let snapshot = state.publish_snapshot();
-                let intervals = state.intervals_if_changed();
                 let _ = events.send(Event::Loaded {
                     snapshot,
                     normalized_history,
                     history_error,
                     error,
                 });
-                if let Some(intervals) = intervals {
+                // Make cached records usable before calculating derived quota
+                // intervals, which can be expensive on a large history.
+                progress.progress.events = state.store.events().len();
+                progress.stage(ProgressStage::BuildingIntervals);
+                if let Some(intervals) = state.intervals_if_changed() {
                     let _ = events.send(Event::IntervalsUpdated { intervals });
                 }
+                progress.stage(ProgressStage::Complete);
             }
             Command::Import {
                 root,
@@ -525,15 +649,19 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                 save_path,
                 history_save_path,
             } => {
+                let mut progress = ProgressReporter::new(emit_progress, &events, Operation::Import);
                 let previous_quota_count = state.store.quota_observations().len();
-                let (report, error) =
-                    match state
-                        .store
-                        .import_dir_with_metadata(&root, metadata.as_deref(), &pricing)
-                    {
-                        Ok(report) => (Some(report), None),
-                        Err(error) => (None, Some(error.to_string())),
-                    };
+                let (report, error) = match state.store.import_dir_with_metadata_progress(
+                    &root,
+                    metadata.as_deref(),
+                    &pricing,
+                    &mut |update| progress.import(update),
+                ) {
+                    Ok(report) => (Some(report), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                progress.progress.events = state.store.events().len();
+                progress.stage(ProgressStage::BuildingViews);
                 let snapshot = state.snapshot_if_changed();
                 let quota_changed = state.store.quota_observations().len() != previous_quota_count;
                 let normalized_history = if quota_changed {
@@ -544,38 +672,52 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                 } else {
                     None
                 };
-                let intervals = state.intervals_if_changed();
-                state.save_if_changed(save_path.clone(), &events);
-                state.save_history_if_changed(history_save_path.clone(), &events);
-                state.save_intervals_if_changed(
-                    history_save_path.as_deref().or(save_path.as_deref()),
-                    &events,
-                );
                 let _ = events.send(Event::Updated {
                     snapshot,
                     normalized_history,
                     report,
                     error,
                 });
+                progress.stage(ProgressStage::BuildingIntervals);
+                let intervals = state.intervals_if_changed();
+                if save_path.is_some() || history_save_path.is_some() {
+                    progress.stage(ProgressStage::Saving);
+                }
+                state.save_if_changed(save_path.clone(), &events, &mut save_tokens);
+                state.save_history_if_changed(history_save_path.clone(), &events);
+                state.save_intervals_if_changed(
+                    history_save_path.as_deref().or(save_path.as_deref()),
+                    &events,
+                );
                 if let Some(intervals) = intervals {
                     let _ = events.send(Event::IntervalsUpdated { intervals });
                 }
+                progress.stage(ProgressStage::Complete);
             }
             Command::Reprice { pricing, save_path } => {
+                let mut progress =
+                    ProgressReporter::new(emit_progress, &events, Operation::Reprice);
+                progress.progress.events = state.store.events().len();
+                progress.stage(ProgressStage::BuildingViews);
                 state.store.reprice(&pricing);
                 let snapshot = state.snapshot_if_changed();
-                let intervals = state.intervals_if_changed();
-                state.save_if_changed(save_path.clone(), &events);
-                state.save_intervals_if_changed(save_path.as_deref(), &events);
                 let _ = events.send(Event::Updated {
                     snapshot,
                     normalized_history: None,
                     report: None,
                     error: None,
                 });
+                progress.stage(ProgressStage::BuildingIntervals);
+                let intervals = state.intervals_if_changed();
+                if save_path.is_some() {
+                    progress.stage(ProgressStage::Saving);
+                }
+                state.save_if_changed(save_path.clone(), &events, &mut save_tokens);
+                state.save_intervals_if_changed(save_path.as_deref(), &events);
                 if let Some(intervals) = intervals {
                     let _ = events.send(Event::IntervalsUpdated { intervals });
                 }
+                progress.stage(ProgressStage::Complete);
             }
             Command::MergeHistory {
                 events: incoming,
@@ -612,6 +754,7 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                     Err(error) => send_save_error(&events, path, error),
                 }
             }
+            Command::View(_) => {}
             Command::Shutdown => break,
         }
     }
@@ -625,7 +768,7 @@ mod tests {
     fn next(worker: &Worker) -> Event {
         loop {
             let event = worker.rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            if !matches!(event, Event::IntervalsUpdated { .. }) {
+            if !matches!(event, Event::IntervalsUpdated { .. } | Event::Progress(_)) {
                 return event;
             }
         }
@@ -668,6 +811,18 @@ mod tests {
             Event::Updated { error: None, .. } => {}
             other => panic!("unexpected import result: {other:?}"),
         }
+        // Updated means display-ready. An empty FIFO command is a barrier for
+        // the preceding save without changing data or ending the worker.
+        worker
+            .send(Command::MergeHistory {
+                events: vec![],
+                save_path: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            next(&worker),
+            Event::HistoryUpdated { normalized: None }
+        ));
         assert!(path.is_file());
         // If the idle poll tried a write it would recreate this file. Removing
         // only synthetic output avoids relying on filesystem clock precision.
@@ -939,5 +1094,271 @@ mod tests {
         state.collect_retired_snapshots();
         assert!(state.retired_interval_snapshots.is_empty());
         assert_eq!(Arc::strong_count(&current), 2);
+    }
+
+    fn synthetic_import(root: &Path, save_path: Option<PathBuf>) -> Command {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("response.jsonl"),
+            concat!(
+                "{\"type\":\"token_usage_record\",\"timestamp\":1791158400,\"payload\":{",
+                "\"thread_id\":\"synthetic-thread\",\"response_id\":\"synthetic-response\",",
+                "\"usage\":{\"input_tokens\":1000,\"output_tokens\":10}}}\n"
+            ),
+        )
+        .unwrap();
+        Command::Import {
+            root: root.to_owned(),
+            metadata: None,
+            pricing: Pricing::default(),
+            save_path,
+            history_save_path: None,
+        }
+    }
+
+    #[test]
+    fn repaired_load_persists_once_on_authorized_unchanged_import() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("logs");
+        let path = temp.path().join("tokens.json");
+        // Build a synthetic EOF cursor, then remove only its derived cache.
+        let _ = synthetic_import(&root, None);
+        let pricing = Pricing::default();
+        let mut original = TokenStore::default();
+        original.import_dir(&root, &pricing).unwrap();
+        assert_eq!(original.events().len(), 1);
+        let mut payload = serde_json::to_value(&original).unwrap();
+        payload["events"] = serde_json::json!([]);
+        let original_bytes = serde_json::to_vec(&payload).unwrap();
+        fs::write(&path, &original_bytes).unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+
+        // Read-only recovery preserves the original. The next authorized scan
+        // persists the repair once; a healthy restart needs no further write.
+        for (save_path, expected_writes) in
+            [(None, 0), (Some(path.clone()), 1), (Some(path.clone()), 1)]
+        {
+            let count = Arc::clone(&writes);
+            let mut worker = Worker::spawn_with_sink(false, move |store, path| {
+                count.fetch_add(1, Ordering::SeqCst);
+                store.save(path)
+            });
+            worker
+                .send(Command::Load {
+                    token_path: path.clone(),
+                    history_path: None,
+                    pricing: pricing.clone(),
+                })
+                .unwrap();
+            for _ in 0..2 {
+                worker
+                    .send(Command::Import {
+                        root: root.clone(),
+                        metadata: None,
+                        pricing: pricing.clone(),
+                        save_path: save_path.clone(),
+                        history_save_path: None,
+                    })
+                    .unwrap();
+            }
+            worker.shutdown().unwrap();
+            match next(&worker) {
+                Event::Loaded {
+                    snapshot,
+                    error: None,
+                    ..
+                } => assert_eq!(snapshot.events.len(), 1),
+                other => panic!("unexpected repaired load: {other:?}"),
+            }
+            for _ in 0..2 {
+                match next(&worker) {
+                    Event::Updated {
+                        report: Some(report),
+                        error: None,
+                        ..
+                    } => {
+                        assert_eq!(report.lines_read, 0);
+                        assert_eq!(report.files_unchanged, 1);
+                    }
+                    other => panic!("unexpected unchanged import: {other:?}"),
+                }
+            }
+            assert_eq!(writes.load(Ordering::SeqCst), expected_writes);
+            if save_path.is_none() {
+                assert_eq!(fs::read(&path).unwrap(), original_bytes);
+            } else {
+                let saved: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["events"].as_array().unwrap().len(), 1);
+                assert!(saved.get("persisted_revision_at_load").is_none());
+                assert_eq!(saved["revision"], original.revision() + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn display_snapshot_precedes_slow_save_and_shutdown_flushes_queued_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let token_path = temp.path().join("state/tokens.json");
+        let settings_path = temp.path().join("state/settings.json");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut worker = Worker::spawn_with_sink(false, move |store, path| {
+            entered_tx.send(()).unwrap();
+            // A deterministic slow sink, not an unreliable large-file timing test.
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            store.save(path)
+        });
+        worker
+            .send(synthetic_import(
+                &temp.path().join("logs"),
+                Some(token_path.clone()),
+            ))
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        match worker.try_recv().unwrap() {
+            Event::Updated {
+                snapshot: Some(snapshot),
+                report: Some(report),
+                error: None,
+                ..
+            } => {
+                assert_eq!(snapshot.events.len(), 1);
+                assert_eq!(report.events_added, 1);
+            }
+            other => panic!("display was not published before save: {other:?}"),
+        }
+        assert!(!token_path.exists());
+        worker
+            .send(Command::SaveSettings {
+                path: settings_path.clone(),
+                settings: Settings {
+                    dark: false,
+                    ..Settings::default()
+                },
+            })
+            .unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let joining = thread::spawn(move || {
+            worker.shutdown().unwrap();
+            closed_tx.send(()).unwrap();
+        });
+        assert!(matches!(
+            closed_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        closed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        joining.join().unwrap();
+        assert_eq!(TokenStore::load(token_path).unwrap().events().len(), 1);
+        assert!(!storage::load_json::<Settings>(&settings_path).unwrap().dark);
+    }
+
+    #[test]
+    fn save_failure_is_separate_and_follows_successful_display_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tokens.json");
+        let mut worker = Worker::spawn_with_sink(false, |_, _| {
+            Err(std::io::Error::other("synthetic disk unavailable"))
+        });
+        worker
+            .send(synthetic_import(
+                &temp.path().join("logs"),
+                Some(path.clone()),
+            ))
+            .unwrap();
+        assert!(matches!(
+            next(&worker),
+            Event::Updated {
+                snapshot: Some(_),
+                report: Some(_),
+                error: None,
+                ..
+            }
+        ));
+        match next(&worker) {
+            Event::SaveFailed {
+                path: failed,
+                error,
+            } => {
+                assert_eq!(failed, path);
+                assert!(error.contains("synthetic disk unavailable"));
+            }
+            other => panic!("missing separate save error: {other:?}"),
+        }
+        worker.shutdown().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cached_load_is_published_before_interval_stage_and_queued_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tokens.json");
+        let cached = TokenStore::demo(1_791_158_400);
+        let expected = Snapshot::from_store(&cached).events.len();
+        cached.save(&path).unwrap();
+        let mut worker = Worker::spawn_with_progress();
+        worker
+            .send(Command::Load {
+                token_path: path,
+                history_path: None,
+                pricing: Pricing::demo(),
+            })
+            .unwrap();
+        worker
+            .send(synthetic_import(&temp.path().join("logs"), None))
+            .unwrap();
+        worker.shutdown().unwrap();
+        let events: Vec<_> = worker.rx.try_iter().collect();
+        let loaded = events
+            .iter()
+            .position(|e| matches!(e, Event::Loaded { .. }))
+            .unwrap();
+        match &events[loaded] {
+            Event::Loaded {
+                snapshot,
+                error: None,
+                ..
+            } => assert_eq!(snapshot.events.len(), expected),
+            other => panic!("failed synthetic cache load: {other:?}"),
+        }
+        let interval_stage = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Event::Progress(Progress {
+                        operation: Operation::Load,
+                        stage: ProgressStage::BuildingIntervals,
+                        ..
+                    })
+                )
+            })
+            .unwrap();
+        let scan = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Event::Progress(Progress {
+                        operation: Operation::Import,
+                        ..
+                    })
+                )
+            })
+            .unwrap();
+        assert!(loaded < interval_stage && interval_stage < scan);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Progress(Progress {
+                operation: Operation::Import,
+                stage: ProgressStage::Complete,
+                files_done: 1,
+                lines_read: 1,
+                ..
+            })
+        )));
     }
 }

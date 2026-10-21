@@ -28,6 +28,7 @@ fn event(index: usize, tasks: usize) -> TokenEvent {
         output: 400,
         reasoning: 100,
         cost_usd: Some(0.01),
+        coverage_start_timestamp_ms: None,
         partial_flags: vec![],
     }
 }
@@ -209,7 +210,8 @@ fn stale_concurrent_snapshots_never_create_repeated_cycles_or_erase_raw_evidence
             .iter()
             .filter(|e| e.reconciliation == Some(HistoryReconciliation::UncertainRecovery))
             .count(),
-        1
+        0,
+        "same-cycle one-point rebounds are omitted from presentation"
     );
     assert_eq!(serde_json::to_string(&raw).unwrap(), raw_before);
     assert_eq!(serde_json::to_string(&observations).unwrap(), original);
@@ -245,7 +247,7 @@ fn imported_rollover_and_live_recovery_remain_real_boundaries() {
         ]
     );
     let mut live = QuotaModel::new("synthetic-live");
-    for (offset, remaining) in [(0, 2.), (10, 3.), (20, 2.)] {
+    for (offset, remaining) in [(0, 2.), (10, 4.), (20, 2.)] {
         live.ingest_json(&quota_payload(remaining, BASE + 10_000), BASE + offset)
             .unwrap();
     }
@@ -419,7 +421,7 @@ fn explicit_task_names_survive_restart_without_guessing_from_conversation_text()
 }
 
 #[test]
-fn uncertain_recovery_never_restarts_task_or_history_accounting() {
+fn ignored_one_point_recovery_never_restarts_task_or_history_accounting() {
     let reset = BASE + 10_000;
     let observations = vec![
         observation(BASE, 3., "a", reset),
@@ -442,7 +444,10 @@ fn uncertain_recovery_never_restarts_task_or_history_accounting() {
         (attributed.0.unwrap() - 0.03).abs() < 1e-12,
         "stale rise must not discard priced events since the last real drop"
     );
-    assert!(attributed.1, "uncertain coverage must still be disclosed");
+    assert!(
+        !attributed.1,
+        "an omitted one-point rebound does not introduce uncertainty"
+    );
     let boundary = visible
         .iter()
         .filter(|e| {

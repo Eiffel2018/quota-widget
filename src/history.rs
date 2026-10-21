@@ -4,8 +4,9 @@
 //! sessions can repeatedly report older values. Never feed those interleaved
 //! snapshots to the live predictor or call every historical rise a replenishment.
 use crate::model::{
-    decimal_text, historical_windows, percent_text, HistoricalWindow, HistoryEvent,
-    HistoryEvidence, HistoryKind, HistoryReconciliation, QuotaModel, CONTINUITY_GAP_SECONDS,
+    decimal_text, historical_windows, ignored_one_point_rebound, percent_text,
+    quota_deadline_rollover, HistoricalWindow, HistoryEvent, HistoryEvidence, HistoryKind,
+    HistoryReconciliation, QuotaModel, CONTINUITY_GAP_SECONDS,
 };
 use crate::tokens::ImportedQuotaObservation;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,6 +14,14 @@ use std::collections::{BTreeMap, BTreeSet};
 const EPSILON: f64 = 0.000001;
 const RESET_JITTER_SECONDS: i64 = 90;
 type Window = (Option<String>, String, String, String);
+type ObservationScope = (Option<String>, String, String);
+
+fn observer(o: &ImportedQuotaObservation) -> Option<(bool, &str)> {
+    o.origin_session
+        .as_deref()
+        .map(|id| (true, id))
+        .or_else(|| o.source_id.as_deref().map(|id| (false, id)))
+}
 
 fn window(e: &HistoryEvent) -> Window {
     (
@@ -128,10 +137,19 @@ pub fn replay(observations: &[ImportedQuotaObservation]) -> Vec<HistoryEvent> {
         observation_ms(a)
             .cmp(&observation_ms(b))
             .then_with(|| a.origin_session.cmp(&b.origin_session))
-            .then_with(|| a.source_id.cmp(&b.source_id))
             .then_with(|| a.payload.to_string().cmp(&b.payload.to_string()))
+            .then_with(|| a.source_id.cmp(&b.source_id))
     });
-    let mut previous: BTreeMap<(Option<String>, String, String), PriorObservation<'_>> =
+    // A copied log is the same observation only with the same logical observer,
+    // exact log timestamp and payload. Sorting picks stable source provenance;
+    // the caller retains every original payload independently of this replay.
+    ordered.dedup_by(|a, b| {
+        observation_ms(a) == observation_ms(b)
+            && observer(a) == observer(b)
+            && a.payload == b.payload
+    });
+    let mut previous: BTreeMap<ObservationScope, PriorObservation<'_>> = BTreeMap::new();
+    let mut observer_previous: BTreeMap<(ObservationScope, (bool, String)), PriorObservation<'_>> =
         BTreeMap::new();
     let mut result = Vec::new();
     // Credits retain the live model's exact decimal arithmetic.
@@ -186,6 +204,29 @@ pub fn replay(observations: &[ImportedQuotaObservation]) -> Vec<HistoryEvent> {
                         epoch = epoch.saturating_add(1);
                     }
                     let same_instant = observation_ms(o) == observation_ms(old.observation);
+                    // A session is an observer, not an account. If this observer
+                    // independently recorded the same preceding value/cycle,
+                    // preserve that real baseline instead of calling mirrored
+                    // logs an observation gap merely because another observer
+                    // happened to write the cached snapshot most recently.
+                    let own_baseline = observer(o)
+                        .and_then(|(logical, id)| {
+                            observer_previous.get(&(key.clone(), (logical, id.to_owned())))
+                        })
+                        .filter(|own| {
+                            own.window.remaining == old.window.remaining
+                                && own.window.duration == old.window.duration
+                                && match (own.window.reset_at, old.window.reset_at) {
+                                    (Some(a), Some(b)) => {
+                                        a.abs_diff(b) <= RESET_JITTER_SECONDS as u64
+                                    }
+                                    (None, None) => true,
+                                    _ => false,
+                                }
+                                && o.timestamp.saturating_sub(own.observation.timestamp)
+                                    <= CONTINUITY_GAP_SECONDS
+                        });
+                    let baseline = own_baseline.unwrap_or(old);
                     result.push(HistoryEvent {
                         session: "imported-local-observations-v2".into(),
                         observed_at_unix: o.timestamp,
@@ -196,21 +237,21 @@ pub fn replay(observations: &[ImportedQuotaObservation]) -> Vec<HistoryEvent> {
                         before: old.window.remaining.clone(),
                         after: snapshot.remaining.clone(),
                         delta: percent_text((after - before).abs()),
-                        partial: o.timestamp.saturating_sub(old.observation.timestamp)
+                        partial: o.timestamp.saturating_sub(baseline.observation.timestamp)
                             > CONTINUITY_GAP_SECONDS
-                            || old.observation.origin_session != o.origin_session
+                            || observer(baseline.observation) != observer(o)
                             || same_instant,
-                        before_observed_at_unix: Some(old.observation.timestamp),
+                        before_observed_at_unix: Some(baseline.observation.timestamp),
                         window_key: Some(snapshot.window_key.clone()),
                         evidence: Some(HistoryEvidence {
                             imported: true,
                             account_id: snapshot.account_id.clone(),
                             origin_session: o.origin_session.clone(),
-                            before_origin_session: old.observation.origin_session.clone(),
+                            before_origin_session: baseline.observation.origin_session.clone(),
                             source_id: o.source_id.clone(),
                             observed_at_ms: Some(observation_ms(o)),
-                            before_observed_at_ms: Some(observation_ms(old.observation)),
-                            before_reset_at: old.window.reset_at,
+                            before_observed_at_ms: Some(observation_ms(baseline.observation)),
+                            before_reset_at: baseline.window.reset_at,
                             reset_at: snapshot.reset_at,
                             window_duration_mins: snapshot.duration,
                         }),
@@ -221,14 +262,15 @@ pub fn replay(observations: &[ImportedQuotaObservation]) -> Vec<HistoryEvent> {
                     epoch = epoch.saturating_add(1);
                 }
             }
-            previous.insert(
-                key,
-                PriorObservation {
-                    window: snapshot,
-                    observation: o,
-                    epoch,
-                },
-            );
+            let prior = PriorObservation {
+                window: snapshot,
+                observation: o,
+                epoch,
+            };
+            if let Some((logical, id)) = observer(o) {
+                observer_previous.insert((key.clone(), (logical, id.to_owned())), prior.clone());
+            }
+            previous.insert(key, prior);
         }
     }
     result.sort_by_key(time_ms);
@@ -258,6 +300,10 @@ struct Timeline {
     last_visible: Option<usize>,
     seen_uncertain: BTreeSet<(String, String)>,
     seen_remaining: BTreeSet<String>,
+    pending_recovery: Option<(f64, i64)>,
+    // A live epoch/session is a real continuity boundary, unlike the tentative
+    // epochs produced while replaying cached imported observations.
+    direct_scope: Option<(String, u64)>,
     uncertain: bool,
 }
 fn rollover(e: &HistoryEvent, accepted_reset_at: Option<i64>) -> bool {
@@ -266,14 +312,11 @@ fn rollover(e: &HistoryEvent, accepted_reset_at: Option<i64>) -> bool {
         // immediate raw pair can lose the rollover evidence. Prefer the last
         // accepted timeline deadline. Conversely, an ignored old-cycle snapshot
         // must not make a cached current-cycle value look like a second reset.
-        accepted_reset_at
-            .or(p.before_reset_at)
-            .zip(p.reset_at)
-            .is_some_and(|(before, after)| {
-                before <= e.observed_at_unix
-                    && after > e.observed_at_unix
-                    && after.saturating_sub(before) > RESET_JITTER_SECONDS
-            })
+        quota_deadline_rollover(
+            accepted_reset_at.or(p.before_reset_at),
+            p.reset_at,
+            e.observed_at_unix,
+        )
     })
 }
 fn reset_for(e: &HistoryEvent) -> Option<i64> {
@@ -301,11 +344,18 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             window(e),
             e.before.clone(),
             e.after.clone(),
+            // Equal observations from overlapping imports must choose the same
+            // provenance regardless of file/import discovery order.
+            serde_json::to_string(e).expect("history values are serializable"),
         )
     });
     let mut timelines: BTreeMap<Window, Timeline> = BTreeMap::new();
     let mut result: Vec<HistoryEvent> = Vec::new();
     let mut legacy_cycles: BTreeMap<(String, String, String), u64> = BTreeMap::new();
+    let mut legacy_rebound_anchors: BTreeMap<(String, String, String), f64> = BTreeMap::new();
+    // A recorded zero-change reset cannot create a cost boundary indirectly by
+    // lending its bogus epoch number to the next nonzero live observation.
+    let mut zero_reset_epochs: BTreeMap<(Window, String, u64), u64> = BTreeMap::new();
     // Credits do not share a quota reset cycle. Preserve exact string precision.
     let mut credit_endpoints: BTreeMap<Window, String> = BTreeMap::new();
     for original in ordered {
@@ -316,6 +366,31 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             };
             event.kind = kind;
             if matches!(kind, HistoryKind::QuotaDecrease | HistoryKind::QuotaReset) {
+                let key = (
+                    event.session.clone(),
+                    event.source_key.clone(),
+                    event.window_label.clone(),
+                );
+                let (before, after) =
+                    quota_values(&event).expect("legacy direction validated quota endpoints");
+                let rebound_anchor = legacy_rebound_anchors.get(&key).copied();
+                let anchor = rebound_anchor.unwrap_or(before);
+                if ignored_one_point_rebound(anchor, after, None, None, event.observed_at_unix)
+                    && (kind == HistoryKind::QuotaReset || rebound_anchor.is_some())
+                {
+                    legacy_rebound_anchors.insert(key, anchor);
+                    continue;
+                }
+                if let Some(anchor) = rebound_anchor {
+                    if (after - anchor).abs() <= EPSILON {
+                        continue;
+                    }
+                    if after < anchor && before > anchor {
+                        event.before = percent_text(anchor);
+                        event.delta = percent_text(anchor - after);
+                    }
+                    legacy_rebound_anchors.remove(&key);
+                }
                 let cycle = legacy_cycles
                     .entry((
                         event.session.clone(),
@@ -359,6 +434,27 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             continue;
         }
         let Some((before, after)) = quota_values(&event) else {
+            if !imported(&event) && event.kind == HistoryKind::QuotaReset {
+                if let (Ok(before), Ok(after), Some(state)) = (
+                    event.before.parse::<f64>(),
+                    event.after.parse::<f64>(),
+                    timelines.get(&window(&event)),
+                ) {
+                    if (0.0..=100.0).contains(&before)
+                        && (after - before).abs() <= EPSILON
+                        && (after - state.remaining).abs() <= EPSILON
+                    {
+                        if let Some((session, epoch)) = &state.direct_scope {
+                            if session == &event.session {
+                                zero_reset_epochs.insert(
+                                    (window(&event), event.session.clone(), event.epoch),
+                                    *epoch,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         };
         if !matches!(
@@ -372,20 +468,95 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
         if (event.kind == HistoryKind::QuotaDecrease) != (after < before) {
             continue;
         }
+        let is_imported = imported(&event);
+        let accepted = timelines.get(&window(&event));
+        let accepted_remaining = accepted.map_or(before, |state| state.remaining);
+        let accepted_reset = accepted
+            .and_then(|state| state.reset_at)
+            .or_else(|| event.evidence.as_ref().and_then(|p| p.before_reset_at));
+        if event.kind == HistoryKind::QuotaReset
+            && ignored_one_point_rebound(
+                accepted_remaining,
+                after,
+                accepted_reset,
+                reset_for(&event),
+                event.observed_at_unix,
+            )
+        {
+            // Persisted events remain untouched. The derived timeline treats
+            // 86→87→86 as 86→86→86, with no uncertainty/cost reset of its own.
+            if !is_imported {
+                if let Some((session, epoch)) =
+                    accepted.and_then(|state| state.direct_scope.as_ref())
+                {
+                    if session == &event.session {
+                        zero_reset_epochs
+                            .insert((window(&event), event.session.clone(), event.epoch), *epoch);
+                    }
+                }
+            }
+            timelines.entry(window(&event)).or_insert_with(|| Timeline {
+                remaining: before,
+                last_at: event
+                    .before_observed_at_unix
+                    .unwrap_or(event.observed_at_unix),
+                cycle: 0,
+                reset_at: accepted_reset,
+                last_visible: None,
+                seen_uncertain: BTreeSet::new(),
+                seen_remaining: BTreeSet::from([percent_text(before)]),
+                pending_recovery: None,
+                direct_scope: (!is_imported).then(|| (event.session.clone(), event.epoch)),
+                uncertain: false,
+            });
+            continue;
+        }
+        let direct_epoch = zero_reset_epochs
+            .get(&(window(&event), event.session.clone(), event.epoch))
+            .copied()
+            .unwrap_or(event.epoch);
+        let direct_scope = (!is_imported).then(|| (event.session.clone(), direct_epoch));
+        let boundary = timelines.get(&window(&event)).is_some_and(|state| {
+            let changed_scope = direct_scope
+                .as_ref()
+                .zip(state.direct_scope.as_ref())
+                .is_some_and(|(new, old)| new != old);
+            let corroborated_import = state.last_visible.is_some_and(|index| {
+                let prior = &result[index];
+                imported(prior)
+                    && prior.kind == event.kind
+                    && prior.before == event.before
+                    && prior.after == event.after
+                    && event
+                        .observed_at_unix
+                        .saturating_sub(prior.observed_at_unix)
+                        <= CONTINUITY_GAP_SECONDS
+            });
+            // A new live epoch can be the direct observation of the very same
+            // rollover just reconstructed from logs, rather than another cycle.
+            changed_scope && !corroborated_import
+        });
+        if boundary {
+            timelines.remove(&window(&event));
+        }
         let state = timelines.entry(window(&event)).or_insert_with(|| Timeline {
             remaining: before,
             last_at: event
                 .before_observed_at_unix
                 .unwrap_or(event.observed_at_unix),
-            cycle: 0,
+            cycle: if is_imported { 0 } else { direct_epoch },
             reset_at: event.evidence.as_ref().and_then(|p| p.before_reset_at),
             last_visible: None,
             seen_uncertain: BTreeSet::new(),
             seen_remaining: BTreeSet::from([percent_text(before)]),
+            pending_recovery: None,
+            direct_scope: direct_scope.clone(),
             uncertain: false,
         });
+        if direct_scope.is_some() {
+            state.direct_scope = direct_scope;
+        }
         event.epoch = state.cycle;
-        let is_imported = imported(&event);
         // A late log of a previous, already-expired cycle cannot spend most of a
         // newly reset window again. Metadata jitter within a cycle is harmless.
         if is_imported
@@ -408,6 +579,7 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             }
             if !is_imported {
                 state.remaining = after;
+                state.pending_recovery = None;
                 state.last_at = original.observed_at_unix;
                 state.last_visible = None;
                 state.seen_remaining.insert(percent_text(after));
@@ -463,6 +635,7 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             event.reconciliation = Some(HistoryReconciliation::ConflictingObservation);
             event.partial = true;
             state.remaining = after;
+            state.pending_recovery = None;
             state.last_at = event.observed_at_unix;
             state.last_visible = None;
             state.seen_remaining.insert(percent_text(after));
@@ -489,6 +662,9 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             // missing metadata. Preserve its subsequent trajectory as partial,
             // while repeats of an already-seen old value remain replay echoes.
             if state.seen_remaining.insert(percent_text(after)) {
+                state
+                    .pending_recovery
+                    .get_or_insert((state.remaining, state.last_at));
                 state.remaining = after;
                 state.last_at = original.observed_at_unix;
                 state.last_visible = None;
@@ -496,10 +672,41 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             }
             continue;
         }
+        if is_imported && !real_reset {
+            if let Some((anchor, anchor_at)) = state.pending_recovery {
+                if after <= anchor + EPSILON {
+                    // An unsupported rise immediately returning to its own
+                    // previous anchor is an echo, not new spend. If the new
+                    // value is lower, charge only the drop below that anchor.
+                    // Do not globally deduplicate values from earlier cycles.
+                    state.remaining = anchor;
+                    state.last_at = anchor_at;
+                    state.pending_recovery = None;
+                    state.last_visible = None;
+                    if (after - anchor).abs() <= EPSILON {
+                        if state
+                            .seen_uncertain
+                            .insert((event.before.clone(), event.after.clone()))
+                        {
+                            event.partial = true;
+                            event.reconciliation = Some(HistoryReconciliation::UncertainRecovery);
+                            result.push(event);
+                        }
+                        state.uncertain = true;
+                        continue;
+                    }
+                }
+            }
+        }
         if real_reset {
-            state.cycle = state.cycle.saturating_add(1);
+            // The first event in a live scope may already carry its incremented
+            // epoch. Retain that identity without incrementing it a second time.
+            if is_imported || state.last_visible.is_some() || event.epoch == 0 {
+                state.cycle = state.cycle.saturating_add(1);
+            }
             state.seen_uncertain.clear();
             state.seen_remaining.clear();
+            state.pending_recovery = None;
             state.uncertain = false;
             event.epoch = state.cycle;
         } else if after < state.remaining - EPSILON {
@@ -516,6 +723,7 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             // This accepted endpoint is a new defensible anchor. A dispute in
             // an earlier interval must not poison every future interval forever.
             state.uncertain = false;
+            state.pending_recovery = None;
         } else {
             continue;
         }
@@ -553,20 +761,20 @@ mod tests {
     }
     #[test]
     fn duplicate_reset_can_merge_but_repeated_true_reset_is_retained() {
-        let reset = e(10, HistoryKind::QuotaReset, "99", "100");
-        let copy = e(15, HistoryKind::QuotaReset, "99", "100");
+        let reset = e(10, HistoryKind::QuotaReset, "98", "100");
+        let copy = e(15, HistoryKind::QuotaReset, "98", "100");
         let raw = merge(vec![reset.clone()], vec![copy]);
         assert_eq!(raw.len(), 2, "retain separate observation evidence");
         assert_eq!(normalized(&raw).len(), 1);
-        let drop = e(20, HistoryKind::QuotaDecrease, "100", "99");
-        let refill = e(30, HistoryKind::QuotaReset, "99", "100");
+        let drop = e(20, HistoryKind::QuotaDecrease, "100", "98");
+        let refill = e(30, HistoryKind::QuotaReset, "98", "100");
         assert_eq!(normalized(&merge(vec![reset, drop], vec![refill])).len(), 3);
     }
     #[test]
     fn same_transition_after_reset_is_not_erased() {
-        let first = e(10, HistoryKind::QuotaDecrease, "100", "99");
-        let reset = e(20, HistoryKind::QuotaReset, "99", "100");
-        let second = e(30, HistoryKind::QuotaDecrease, "100", "99");
+        let first = e(10, HistoryKind::QuotaDecrease, "100", "98");
+        let reset = e(20, HistoryKind::QuotaReset, "98", "100");
+        let second = e(30, HistoryKind::QuotaDecrease, "100", "98");
         assert_eq!(
             normalized(&merge(vec![first, reset], vec![second])).len(),
             3
@@ -574,8 +782,8 @@ mod tests {
     }
     #[test]
     fn log_and_live_duplicate_are_merged_only_in_presentation() {
-        let first = e(10, HistoryKind::QuotaDecrease, "100", "99");
-        let second = e(20, HistoryKind::QuotaDecrease, "100", "99");
+        let first = e(10, HistoryKind::QuotaDecrease, "100", "98");
+        let second = e(20, HistoryKind::QuotaDecrease, "100", "98");
         let raw = merge(vec![first], vec![second]);
         assert_eq!(raw.len(), 2);
         assert_eq!(normalized(&raw).len(), 1);

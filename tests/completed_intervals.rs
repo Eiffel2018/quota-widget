@@ -26,6 +26,7 @@ fn token(t: i64, model: &str, cost: Option<f64>) -> TokenEvent {
         output: 30,
         reasoning: 20,
         cost_usd: cost,
+        coverage_start_timestamp_ms: None,
         partial_flags: Vec::new(),
     }
 }
@@ -385,7 +386,10 @@ fn normalized_stale_replay_yields_only_actual_decrement_intervals() {
     assert_eq!(rows.iter().map(|r| r.percentage_points).sum::<f64>(), 3.);
     assert_eq!(rows[2].start, Some(120));
     near(rows[2].known_usd, 7.);
-    assert!(rows[2].partial);
+    assert!(
+        !rows[2].partial && rows[2].comparable,
+        "ignored +1 echoes do not introduce a new coverage gap"
+    );
     assert!(history[rows[2].history_index].reconciliation.is_none());
 }
 

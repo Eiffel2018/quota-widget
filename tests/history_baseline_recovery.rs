@@ -37,6 +37,7 @@ fn token(t: i64, cost: f64) -> TokenEvent {
         output: 0,
         reasoning: 0,
         cost_usd: Some(cost),
+        coverage_start_timestamp_ms: None,
         partial_flags: vec![],
     }
 }
@@ -199,7 +200,6 @@ fn pinned_two_preserves_disputed_drops_and_keeps_long_subtotal_noncomparable() {
             ("5", "4"),
             ("4", "3"),
             ("2", "1"),
-            ("1", "2"),
             ("1", "0")
         ]
     );
@@ -256,9 +256,10 @@ fn late_old_cycle_then_cached_full_snapshot_cannot_confirm_a_second_reset() {
         .collect();
     assert_eq!(resets.len(), 1);
     assert_eq!(resets[0].observed_at_unix, 130);
-    let echo = rows.iter().find(|e| e.observed_at_unix == 160).unwrap();
-    assert_eq!((echo.before.as_str(), echo.after.as_str()), ("0", "100"));
-    assert!(echo.reconciliation.is_some() && !is_confirmed_quota_change(echo));
+    assert!(
+        !rows.iter().any(|e| e.observed_at_unix == 160),
+        "canonical 99→100 is an ignored +1 echo of the accepted cycle"
+    );
     assert!(rows
         .iter()
         .filter(|e| e.observed_at_unix >= 130)
@@ -268,7 +269,7 @@ fn late_old_cycle_then_cached_full_snapshot_cannot_confirm_a_second_reset() {
     let next = intervals.iter().find(|e| e.end == 180).unwrap();
     assert_eq!(next.start, Some(140));
     assert_eq!(next.known_usd, 7.);
-    assert!(next.partial && !next.comparable && next.cost_per_point.is_none());
+    assert!(!next.partial && next.comparable && next.cost_per_point.is_some());
 }
 
 #[test]
@@ -365,7 +366,10 @@ fn repeated_two_three_two_echoes_never_recharge_a_percentage_point() {
     assert_eq!(intervals.len(), 3);
     assert_eq!(intervals[2].start, Some(120));
     assert_eq!(intervals[2].known_usd, 4.);
-    assert!(intervals[2].partial && !intervals[2].comparable);
+    assert!(
+        !intervals[2].partial && intervals[2].comparable,
+        "ignored same-cycle +1 observations do not poison coverage"
+    );
 }
 
 #[test]

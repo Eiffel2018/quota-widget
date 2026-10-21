@@ -5,14 +5,18 @@ use eframe::egui::{
 };
 use quota_widget::{
     accounting,
-    background::{Command as WorkCommand, Event as WorkEvent, Snapshot, Worker},
+    background::{
+        Command as WorkCommand, Event as WorkEvent, Operation, Progress as WorkProgress,
+        ProgressStage, Snapshot, Worker,
+    },
     bridge::{Bridge, BridgeCommand, BridgeEvent},
+    db_view::ViewRequest,
     display_time,
     interval_views::{self, IntervalPresentation},
     intervals::{self, CompletedInterval},
     model::{HistoryEvent, QuotaModel, WindowView},
     storage::{self, DataLock, Settings},
-    tokens::{ModelPrice, Pricing, TokenEvent, TokenStore},
+    tokens::{ImportPhase, ModelPrice, Pricing, TokenEvent, TokenStore},
     usage_views::{self, GroupBy},
 };
 use std::{
@@ -22,19 +26,137 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(PartialEq)]
+struct LiveSelectionKey {
+    source: String,
+    window: String,
+    label: String,
+    duration: Option<i64>,
+    reset_at: Option<i64>,
+    remaining_bits: Option<u64>,
+    epoch: u64,
+    account: Option<String>,
+}
+#[derive(PartialEq)]
+struct MainCacheKey {
+    token_generation: u64,
+    history_generation: u64,
+    bucket: String,
+    window: String,
+    minute: i64,
+    tree_generation: u64,
+    boundary_after: Option<i64>,
+    live_selection: Option<LiveSelectionKey>,
+}
 #[derive(Default)]
 struct MainCache {
-    key: Option<(u64, u64, String, String, i64, u64)>,
+    key: Option<MainCacheKey>,
     tree: Vec<usage_views::TaskTreeRow>,
     tasks: Vec<usage_views::TaskRow>,
     boundary: Option<HistoryEvent>,
     cost: accounting::ObservedCost,
+    loading: bool,
     recent_intervals: Vec<usize>,
     recent_tooltip: String,
 }
+/// Native window managers may apply a stale minimum height to the first
+/// resize request. Constraints are sent first; height converges separately,
+/// after geometry/input has gone quiet, with bounded exponential retries.
+#[derive(Default)]
+struct LayoutConvergence {
+    key: Option<(usize, u32, u32)>,
+    observed_size: Option<Vec2>,
+    quiet_since: Option<Instant>,
+    next_retry: Option<Instant>,
+    attempts: u8,
+    converged: bool,
+    pointer_was_down: bool,
+}
+#[derive(Default)]
+struct LayoutPlan {
+    minimum: Option<Vec2>,
+    size: Option<Vec2>,
+    repaint_after: Option<Duration>,
+}
+impl LayoutConvergence {
+    const QUIET: Duration = Duration::from_millis(150);
+    const MAX_ATTEMPTS: u8 = 6;
+    fn plan(
+        &mut self,
+        key: (usize, u32, u32),
+        actual: Vec2,
+        height: f32,
+        pointer_down: bool,
+        t: Instant,
+    ) -> LayoutPlan {
+        let mut plan = LayoutPlan::default();
+        if self.key != Some(key) {
+            self.key = Some(key);
+            self.attempts = 0;
+            self.next_retry = None;
+            self.converged = false;
+            self.quiet_since = Some(t);
+            plan.minimum = Some(Vec2::new(276., height));
+        }
+        if self
+            .observed_size
+            .is_none_or(|old| (old - actual).abs().max_elem() > 0.5)
+        {
+            self.observed_size = Some(actual);
+            self.quiet_since = Some(t);
+        }
+        if pointer_down {
+            self.quiet_since = Some(t);
+            if !self.pointer_was_down {
+                self.attempts = 0;
+                self.next_retry = None;
+            }
+        }
+        self.pointer_was_down = pointer_down;
+        if (actual.y - height).abs() <= 1.5 {
+            self.converged = true;
+            self.attempts = 0;
+            self.next_retry = None;
+            return plan;
+        }
+        if self.converged {
+            // A new external height-only resize may keep the exact same key.
+            self.converged = false;
+            self.attempts = 0;
+            self.next_retry = None;
+        }
+        if self.attempts >= Self::MAX_ATTEMPTS {
+            return plan;
+        }
+        let quiet_until = self.quiet_since.unwrap_or(t) + Self::QUIET;
+        let ready_at = self
+            .next_retry
+            .map_or(quiet_until, |retry| retry.max(quiet_until));
+        if pointer_down || t < ready_at {
+            plan.repaint_after = Some(
+                ready_at
+                    .saturating_duration_since(t)
+                    .max(Duration::from_millis(16)),
+            );
+            return plan;
+        }
+        // Preserve the current user-selected width, adjusting only the derived
+        // height. Never repeatedly resize in every repaint while dragging.
+        plan.size = Some(Vec2::new(actual.x, height));
+        self.attempts += 1;
+        let delay = Duration::from_millis(200 * (1_u64 << (self.attempts - 1).min(3)));
+        self.next_retry = Some(t + delay);
+        if self.attempts < Self::MAX_ATTEMPTS {
+            plan.repaint_after = Some(delay);
+        }
+        plan
+    }
+}
 #[derive(Default)]
 struct TokenCache {
-    key: Option<(u64, NaiveDate, GroupBy, bool)>,
+    key: Option<(u64, NaiveDate, GroupBy, bool, usize)>,
+    loading: bool,
+    group_count: usize,
     rows: Vec<usage_views::UsageGroup>,
     count: usize,
     input: u64,
@@ -58,6 +180,9 @@ struct WidgetApp {
     settings: Settings,
     dir: PathBuf,
     worker: Worker,
+    database_mode: bool,
+    requested_view: Option<ViewRequest>,
+    view_pending: bool,
     _lock: Option<DataLock>,
     persistent: bool,
     read_state: bool,
@@ -75,12 +200,13 @@ struct WidgetApp {
     history_generation: u64,
     expanded_tasks: BTreeSet<String>,
     tree_generation: u64,
+    boundary_after: Option<i64>,
     main_cache: MainCache,
     token_cache: TokenCache,
     history_cache: HistoryCache,
     dates_key: Option<(u64, u64, NaiveDate, u32)>,
     dates_cache: BTreeSet<NaiveDate>,
-    layout_key: Option<(usize, u32, u32)>,
+    layout: LayoutConvergence,
     bridge: Option<Bridge>,
     status: String,
     history_open: bool,
@@ -90,8 +216,16 @@ struct WidgetApp {
     date: NaiveDate,
     token_date: NaiveDate,
     token_group: GroupBy,
+    token_page: usize,
     show_excluded_records: bool,
     import_pending: bool,
+    load_pending: bool,
+    worker_failed: bool,
+    work_progress: Option<(WorkProgress, Instant)>,
+    last_import_elapsed: Option<Duration>,
+    load_error: Option<String>,
+    import_error: Option<String>,
+    import_warnings: Vec<String>,
     export_rx: Option<mpsc::Receiver<String>>,
     export_join: Option<std::thread::JoinHandle<()>>,
     last_import: Instant,
@@ -108,6 +242,69 @@ struct WidgetApp {
     last_minimized: bool,
     dirty: bool,
     demo_start: i64,
+}
+fn main_view_matches(
+    request: &ViewRequest,
+    boundary: Option<i64>,
+    fallback_start: i64,
+    t: i64,
+) -> bool {
+    request.boundary == boundary
+        && request.fallback_start == fallback_start
+        && request.now / 60 == t / 60
+}
+fn daily_view_matches(
+    request: &ViewRequest,
+    day: NaiveDate,
+    group: GroupBy,
+    excluded: bool,
+    page: usize,
+) -> bool {
+    display_time::day_bounds(day)
+        .is_some_and(|(start, end)| request.day_start == start && request.day_end == end)
+        && request.group == group
+        && request.excluded == excluded
+        && request.page == page
+        && request.page_size == 500
+}
+fn canonical_interval_cost(interval: Option<&CompletedInterval>) -> (Option<f64>, bool) {
+    interval.map_or((None, true), |row| {
+        (
+            (row.events > row.unknown_cost_events || row.unknown_cost_events == 0)
+                .then_some(row.known_usd),
+            row.partial,
+        )
+    })
+}
+fn progress_label(stage: ProgressStage) -> &'static str {
+    match stage {
+        ProgressStage::Loading => "正在載入已儲存紀錄",
+        ProgressStage::Migrating => "正在轉換舊資料",
+        ProgressStage::Import(ImportPhase::Discovering) => "正在列出來源檔案",
+        ProgressStage::Import(ImportPhase::Reading) => "正在掃描 Token",
+        ProgressStage::Import(ImportPhase::Reconciling) => "正在整理用量",
+        ProgressStage::Import(ImportPhase::Metadata) => "正在讀取 Task 名稱",
+        ProgressStage::BuildingViews => "正在建立顯示資料",
+        ProgressStage::BuildingIntervals => "正在計算扣額區間",
+        ProgressStage::Saving => "正在儲存本機紀錄",
+        ProgressStage::Complete => "本機資料處理完成",
+    }
+}
+fn migration_progress_label(progress: &WorkProgress) -> Option<String> {
+    if progress.stage == ProgressStage::Migrating && progress.files_total > 0 {
+        Some(format!(
+            "正在轉換舊資料：task {}/{}（原檔保留）",
+            progress.files_done, progress.files_total
+        ))
+    } else if progress.stage == ProgressStage::Migrating
+        || (progress.operation == Operation::Load && progress.stage == ProgressStage::Loading)
+    {
+        // Fingerprinting/parsing precedes a known task total; never claim 0/0
+        // completed tasks, or relabel task counters as session files.
+        Some("首次載入／驗證舊資料（原檔保留）".into())
+    } else {
+        None
+    }
 }
 fn interval_model_cost(model: &intervals::ModelIntervalUsage) -> String {
     if model.events > 0 && model.unknown_cost_events == model.events {
@@ -143,6 +340,63 @@ fn effort_label(group: &usage_views::UsageGroup) -> String {
     } else {
         values.join(" / ")
     }
+}
+/// Whether an actual priced request used the long-context multiplier. This
+/// describes exported response evidence, never the global toggle or a Turn sum.
+fn exported_long_context_applied(event: &serde_json::Value, pricing: &Pricing) -> Option<bool> {
+    let input = event.get("input")?.as_u64()?;
+    if event
+        .get("partial_flags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|flags| {
+            flags
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|flag| {
+                    matches!(
+                        flag,
+                        "input_count_unavailable"
+                            | "invalid_token_counts"
+                            | "cached_exceeded_input"
+                    )
+                })
+        })
+    {
+        return None;
+    }
+    if !pricing.apply_long_context {
+        return Some(false);
+    }
+    let model = event.get("model")?.as_str()?;
+    if !matches!(model, "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra") {
+        return Some(false);
+    }
+    let response_scoped = event.get("source_kind").and_then(serde_json::Value::as_str)
+        == Some("token_usage_record")
+        || event
+            .get("response_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty());
+    if !response_scoped {
+        return None;
+    }
+    if input <= 272_000 {
+        return Some(false);
+    }
+    // A request without an estimated price does not establish that any
+    // multiplier was actually applied. Keep that distinction explicit.
+    event.get("cost_usd")?.as_f64()?;
+    Some(true)
+}
+fn annotate_long_context_export(event: &mut serde_json::Value, pricing: &Pricing) {
+    let applied = exported_long_context_applied(event, pricing);
+    event["long_context_adjustment_enabled"] = serde_json::json!(pricing.apply_long_context);
+    event["long_context_adjustment_applied"] = serde_json::json!(applied);
+    // Keep the old boolean for consumers of schema version 1, with an explicit
+    // deprecation note so it cannot be confused with the per-request result.
+    event["long_context_adjustment"] = serde_json::json!(pricing.apply_long_context);
+    event["long_context_adjustment_legacy_semantics"] =
+        serde_json::json!("deprecated_alias_of_long_context_adjustment_enabled");
 }
 fn money(v: Option<f64>) -> String {
     v.map(|x| {
@@ -254,6 +508,43 @@ fn reset_event(e: &HistoryEvent) -> bool {
 fn unchanged(e: &HistoryEvent) -> bool {
     e.before == e.after || e.delta.parse::<f64>().map(|v| v == 0.).unwrap_or(false)
 }
+fn boundary_matches_live(
+    event: &HistoryEvent,
+    live: Option<&WindowView>,
+    account: Option<&str>,
+) -> bool {
+    let Some(live) = live else {
+        return true;
+    };
+    let evidence = event.evidence.as_ref();
+    if evidence
+        .and_then(|e| e.account_id.as_deref())
+        .zip(account)
+        .is_some_and(|(recorded, current)| recorded != current)
+    {
+        return false;
+    }
+    // Reject a demonstrably expired cycle, allowing the existing 90-second
+    // deadline jitter tolerance. Run-local epoch counters are not comparable.
+    !evidence
+        .and_then(|e| e.reset_at)
+        .zip(live.reset_at)
+        .is_some_and(|(old, current)| {
+            old <= live.observed_at
+                && current > live.observed_at
+                && current.saturating_sub(old) > 90
+        })
+}
+fn quota_endpoint_mismatch(boundary: Option<&HistoryEvent>, live: Option<&WindowView>) -> bool {
+    let endpoints = boundary
+        .and_then(|e| e.after.parse::<f64>().ok())
+        .zip(live.and_then(|v| v.remaining_percent));
+    // Match the live model's percentage tolerance; tiny numeric jitter is not
+    // evidence of a missing observation, and missing numbers prove nothing.
+    endpoints.is_some_and(|(recorded, current)| {
+        recorded.is_finite() && current.is_finite() && (recorded - current).abs() > 0.000001
+    })
+}
 
 pub fn launch(args: Vec<String>) -> eframe::Result<()> {
     let demo = args.iter().any(|s| s == "--demo");
@@ -344,6 +635,7 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
             cc.egui_ctx.set_fonts(fonts);
             let mut app = WidgetApp::new(settings, dir, persistent, demo, offline, args);
             app._lock = lock;
+            app.database_mode = app.read_state && !demo;
             if app._lock.is_none() {
                 app.persistent = false;
             }
@@ -351,11 +643,11 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
                 app.notice = note;
             }
             app.apply_theme(&cc.egui_ctx);
-            app.initialize();
             if corrupt_settings {
                 app.persistent = false;
                 app.notice = "設定檔無法讀取；已停用寫入，原檔保留。".into();
             }
+            app.initialize();
             Ok(Box::new(app))
         }),
     )
@@ -372,7 +664,10 @@ impl WidgetApp {
         Self {
             settings,
             dir,
-            worker: Worker::spawn(),
+            worker: Worker::spawn_with_progress(),
+            database_mode: false,
+            requested_view: None,
+            view_pending: false,
             _lock: None,
             persistent,
             read_state: persistent,
@@ -390,12 +685,13 @@ impl WidgetApp {
             history_generation: 0,
             expanded_tasks: BTreeSet::new(),
             tree_generation: 0,
+            boundary_after: None,
             main_cache: MainCache::default(),
             token_cache: TokenCache::default(),
             history_cache: HistoryCache::default(),
             dates_key: None,
             dates_cache: BTreeSet::new(),
-            layout_key: None,
+            layout: LayoutConvergence::default(),
             bridge: None,
             status: "OFFLINE".into(),
             history_selection: None,
@@ -405,8 +701,16 @@ impl WidgetApp {
             date: display_time::now_day(),
             token_date: display_time::now_day(),
             token_group: GroupBy::Response,
+            token_page: 0,
             show_excluded_records: false,
             import_pending: false,
+            load_pending: false,
+            worker_failed: false,
+            work_progress: None,
+            last_import_elapsed: None,
+            load_error: None,
+            import_error: None,
+            import_warnings: Vec::new(),
             export_rx: None,
             export_join: None,
             last_import: Instant::now() - Duration::from_secs(60),
@@ -438,19 +742,78 @@ impl WidgetApp {
             self.make_demo();
             return;
         }
+        if self.database_mode {
+            self.worker =
+                Worker::spawn_database_with_progress(self.persistent && self._lock.is_some());
+        }
         if self.read_state {
-            let _ = self.worker.send(WorkCommand::Load {
+            self.load_pending = self.send_work(WorkCommand::Load {
                 token_path: self.dir.join("tokens.json"),
                 history_path: Some(self.dir.join("history.json")),
                 pricing: self.settings.pricing.clone(),
             });
-            self.import_note = "正在背景載入歷史，畫面可繼續操作。".into();
         }
         if !self.offline {
             self.connect();
         }
         if self.settings.import_enabled {
             self.start_import();
+        }
+    }
+    fn included_count(&self) -> usize {
+        self.tokens
+            .database
+            .as_ref()
+            .map_or(self.tokens.events.len(), |view| view.total_included)
+    }
+    fn excluded_count(&self) -> usize {
+        self.tokens
+            .database
+            .as_ref()
+            .map_or(self.tokens.excluded_events.len(), |view| {
+                view.total_excluded
+            })
+    }
+    fn database_request(&self, boundary: Option<i64>, t: i64) -> Option<ViewRequest> {
+        let (day_start, day_end) = display_time::day_bounds(self.token_date)?;
+        Some(ViewRequest {
+            day_start,
+            day_end,
+            group: self.token_group,
+            excluded: self.show_excluded_records,
+            page: self.token_page,
+            page_size: 500,
+            boundary,
+            fallback_start: self.demo_start,
+            now: t,
+        })
+    }
+    fn request_database_view(&mut self, boundary: Option<i64>, t: i64) {
+        if self.tokens.database.is_none() {
+            return;
+        }
+        let Some(request) = self.database_request(boundary, t) else {
+            return;
+        };
+        if self
+            .requested_view
+            .as_ref()
+            .is_some_and(|sent| sent.same_selection(&request))
+        {
+            return;
+        }
+        if self.send_work(WorkCommand::View(request.clone())) {
+            self.requested_view = Some(request);
+            self.view_pending = true;
+        }
+    }
+    fn accept_database_view(&mut self) {
+        if self.tokens.database.as_ref().is_some_and(|view| {
+            self.requested_view
+                .as_ref()
+                .is_some_and(|request| request.same_selection(&view.request))
+        }) {
+            self.view_pending = false;
         }
     }
     fn save_path(&self, name: &str) -> Option<PathBuf> {
@@ -460,7 +823,7 @@ impl WidgetApp {
         if self.demo {
             return;
         }
-        let _ = self.worker.send(WorkCommand::Reprice {
+        self.send_work(WorkCommand::Reprice {
             pricing: self.settings.pricing.clone(),
             save_path: self.save_path("tokens.json"),
         });
@@ -478,6 +841,8 @@ impl WidgetApp {
     fn connect(&mut self) {
         self.bridge = None;
         self.quota.reset_continuity();
+        self.main_cache.key = None;
+        self.history_cache.key = None;
         self.bridge = Some(Bridge::spawn(
             (!self.settings.codex_path.trim().is_empty())
                 .then(|| PathBuf::from(self.settings.codex_path.trim())),
@@ -485,7 +850,15 @@ impl WidgetApp {
         self.status = "CONNECTING".into();
     }
     fn start_import(&mut self) {
-        if self.demo || self.import_pending || !self.settings.import_enabled {
+        if self.demo
+            || self.import_pending
+            || self.worker_failed
+            || !self.settings.import_enabled
+            || self
+                .work_progress
+                .as_ref()
+                .is_some_and(|(progress, _)| progress.operation == Operation::Import)
+        {
             return;
         }
         let root = PathBuf::from(self.settings.sessions_path.trim());
@@ -493,20 +866,185 @@ impl WidgetApp {
         let metadata = (root.file_name().is_some_and(|n| n == "sessions"))
             .then(|| root.parent().map(|p| p.join("session_index.jsonl")))
             .flatten();
-        if self
-            .worker
-            .send(WorkCommand::Import {
-                root,
-                metadata,
-                pricing: self.settings.pricing.clone(),
-                save_path: self.save_path("tokens.json"),
-                history_save_path: self.save_path("history.json"),
-            })
-            .is_ok()
-        {
+        if self.send_work(WorkCommand::Import {
+            root,
+            metadata,
+            pricing: self.settings.pricing.clone(),
+            save_path: self.save_path("tokens.json"),
+            history_save_path: self.save_path("history.json"),
+        }) {
             self.import_pending = true;
         }
         self.last_import = Instant::now();
+    }
+    fn send_work(&mut self, command: WorkCommand) -> bool {
+        if self.worker_failed || self.worker.send(command).is_err() {
+            self.worker_disconnected();
+            false
+        } else {
+            true
+        }
+    }
+    fn worker_disconnected(&mut self) {
+        self.worker_failed = true;
+        self.view_pending = false;
+        self.load_pending = false;
+        self.import_pending = false;
+        self.work_progress = None;
+        self.persistent = false;
+        // Do not expose a panic payload or imply that live quota stopped too.
+        self.import_error =
+            Some("本機歷史背景處理已中斷；請重新啟動程式。畫面保留已載入資料。".into());
+    }
+    fn account_changed(&mut self) {
+        self.quota.account_changed();
+        self.boundary_after = Some(now());
+        self.main_cache.key = None;
+        self.history_cache.key = None;
+        self.status = "帳戶已變更".into();
+    }
+    fn retain_import_warning(&mut self, warning: String) {
+        // Keep diagnostics across no-op polls, with bounded memory and no raw JSONL.
+        if self.import_warnings.len() < 20 && !self.import_warnings.contains(&warning) {
+            self.import_warnings.push(warning);
+        }
+    }
+    fn import_status_text(&self) -> String {
+        if self.worker_failed {
+            return self.import_error.clone().unwrap_or_default();
+        }
+        if let Some((progress, received)) = &self.work_progress {
+            if let Some(label) = migration_progress_label(progress) {
+                return format!(
+                    "{} · 已用 {} 秒。畫面保留已載入資料。",
+                    label,
+                    progress
+                        .elapsed
+                        .saturating_add(received.elapsed())
+                        .as_secs()
+                );
+            }
+            return format!(
+                "{}… 已用 {} 秒；{}/{} 檔、讀取 {} 行、{} 筆觀察、{} 筆整理用量。畫面保留已載入資料。",
+                progress_label(progress.stage),
+                progress.elapsed.saturating_add(received.elapsed()).as_secs(),
+                progress.files_done,
+                progress.files_total,
+                progress.lines_read,
+                progress.observations,
+                progress.events,
+            );
+        }
+        if self.load_pending {
+            return "正在載入已儲存的本機紀錄…".into();
+        }
+        if self.import_pending {
+            return "正在掃描所選本機 Token 來源…".into();
+        }
+        if let Some(error) = &self.import_error {
+            return format!("背景匯入失敗：{error}");
+        }
+        if !self.settings.import_enabled {
+            return format!("本機匯入已停用。{}", self.import_note);
+        }
+        if self.import_note.is_empty() {
+            "等待本機 Token 掃描。".into()
+        } else {
+            match self.last_import_elapsed {
+                Some(elapsed) => format!(
+                    "{} 本輪完成耗時 {:.1} 秒。",
+                    self.import_note,
+                    elapsed.as_secs_f64()
+                ),
+                None => self.import_note.clone(),
+            }
+        }
+    }
+    fn compact_progress_text(&self) -> Option<String> {
+        let (progress, received) = self.work_progress.as_ref()?;
+        let seconds = progress
+            .elapsed
+            .saturating_add(received.elapsed())
+            .as_secs();
+        if let Some(label) = migration_progress_label(progress) {
+            return Some(format!("{label} · {seconds} 秒"));
+        }
+        Some(if progress.files_total > 0 {
+            format!(
+                "{} · {}/{} 檔 · {} 秒",
+                progress_label(progress.stage),
+                progress.files_done,
+                progress.files_total,
+                seconds
+            )
+        } else {
+            format!("{} · {} 秒", progress_label(progress.stage), seconds)
+        })
+    }
+    fn empty_task_status(&self) -> String {
+        let status = if self.worker_failed {
+            "背景處理中斷 · 點此檢查"
+        } else if self.load_pending {
+            return self
+                .compact_progress_text()
+                .unwrap_or_else(|| "正在載入本機紀錄…".into());
+        } else if self.import_error.is_some() || self.load_error.is_some() {
+            "本機匯入有錯誤 · 點此檢查"
+        } else if !self.import_warnings.is_empty() {
+            "本機匯入有警告 · 點此檢查"
+        } else if let Some(progress) = self.compact_progress_text() {
+            return progress;
+        } else if self.import_pending {
+            "正在掃描本機 Token…"
+        } else if !self.settings.import_enabled && self.included_count() == 0 {
+            "本機匯入已停用 · 點此設定"
+        } else if self.included_count() == 0 && self.excluded_count() > 0 {
+            "只有排除用量 · 點此檢查"
+        } else if self.included_count() == 0 {
+            "尚未匯入用量 · 點此設定"
+        } else {
+            "近期範圍無用量 · 點此檢查"
+        };
+        status.into()
+    }
+    fn import_diagnostic_text(&self) -> String {
+        format!(
+            "{}\n來源：{}\n已載入 {} 筆用量；另有 {} 筆排除用量。\n{}\n主表依近期範圍顯示；Token 明細可切換日期。點擊開啟設定及匯入診斷。",
+            self.import_status_text(), self.settings.sessions_path,
+            self.included_count(), self.excluded_count(), self.notice
+        )
+    }
+    fn import_diagnostics_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(self.import_status_text());
+        if let Some(error) = &self.load_error {
+            ui.colored_label(ui.visuals().warn_fg_color, error);
+        }
+        if !self.import_warnings.is_empty() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "保留 {} 項匯入警告；未被後續空掃描清除。",
+                    self.import_warnings.len()
+                ),
+            );
+        }
+        ui.collapsing("匯入診斷／來源", |ui| {
+            ui.label(format!("用量來源：{}", self.settings.sessions_path));
+            ui.label(format!("儲存目錄：{}", self.dir.display()));
+            ui.label(format!(
+                "目前載入 {} 筆用量、{} 筆排除用量、{} 筆額度觀察。",
+                self.included_count(),
+                self.excluded_count(),
+                self.history.len()
+            ));
+            for warning in &self.import_warnings {
+                ui.colored_label(ui.visuals().warn_fg_color, warning);
+            }
+            if !self.import_warnings.is_empty() && ui.button("清除已讀警告").clicked() {
+                self.import_warnings.clear();
+            }
+            ui.small("警告最多保留 20 項；只顯示檔案及格式診斷，不顯示原始對話。");
+        });
     }
     fn pump(&mut self) {
         let messages: Vec<_> = self
@@ -523,7 +1061,7 @@ impl WidgetApp {
                         self.status = "LIVE".into();
                         if !self.quota.history.is_empty() {
                             let events = std::mem::take(&mut self.quota.history);
-                            let _ = self.worker.send(WorkCommand::MergeHistory {
+                            self.send_work(WorkCommand::MergeHistory {
                                 events,
                                 save_path: self.save_path("history.json"),
                             });
@@ -532,8 +1070,7 @@ impl WidgetApp {
                     Err(_) => self.status = "資料格式不支援".into(),
                 },
                 BridgeEvent::AccountChanged => {
-                    self.quota.reset_continuity();
-                    self.status = "帳戶已變更".into();
+                    self.account_changed();
                 }
                 BridgeEvent::Error(e) => {
                     self.status = "OFFLINE".into();
@@ -543,60 +1080,13 @@ impl WidgetApp {
                 BridgeEvent::Stopped => self.status = "OFFLINE".into(),
             }
         }
-        while let Ok(event) = self.worker.try_recv() {
-            match event {
-                WorkEvent::Loaded {
-                    snapshot,
-                    normalized_history,
-                    history_error,
-                    error,
-                } => {
-                    self.tokens = snapshot;
-                    self.token_generation += 1;
-                    self.history = normalized_history;
-                    self.history_generation += 1;
-                    if let Some(error) = error.or(history_error) {
-                        self.persistent = false;
-                        self.notice = format!("儲存檔無法讀取；已停用寫入並保留原檔。{error}");
-                    }
-                }
-                WorkEvent::Updated {
-                    snapshot,
-                    normalized_history,
-                    report,
-                    error,
-                } => {
-                    if let Some(snapshot) = snapshot {
-                        self.tokens = snapshot;
-                        self.token_generation += 1;
-                    }
-                    if let Some(history) = normalized_history {
-                        self.history = history;
-                        self.history_generation += 1;
-                    }
-                    if let Some(report) = report {
-                        self.import_pending = false;
-                        self.import_note = format!(
-                            "已掃描 {} 檔，本輪新增 {} 筆；格式問題 {}。",
-                            report.files_scanned, report.events_added, report.malformed_lines
-                        );
-                    }
-                    if let Some(error) = error {
-                        self.import_pending = false;
-                        self.import_note = format!("背景匯入：{error}");
-                    }
-                }
-                WorkEvent::HistoryUpdated { normalized } => {
-                    if let Some(history) = normalized {
-                        self.history = history;
-                        self.history_generation += 1;
-                    }
-                }
-                WorkEvent::IntervalsUpdated { intervals } => {
-                    self.set_intervals(intervals);
-                }
-                WorkEvent::SaveFailed { path: _, error } => {
-                    self.notice = format!("儲存失敗，畫面仍保留資料：{error}");
+        loop {
+            match self.worker.try_recv() {
+                Ok(event) => self.handle_worker_event(event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.worker_disconnected();
+                    break;
                 }
             }
         }
@@ -619,16 +1109,114 @@ impl WidgetApp {
             self.save_state();
         }
     }
+    fn handle_worker_event(&mut self, event: WorkEvent) {
+        match event {
+            WorkEvent::Progress(progress) => {
+                if self.worker_failed {
+                    return;
+                }
+                if progress.stage == ProgressStage::Complete {
+                    if progress.operation == Operation::Import {
+                        self.last_import_elapsed = Some(progress.elapsed);
+                    }
+                    self.work_progress = None;
+                } else {
+                    // Status only. In particular, scanning a selected directory
+                    // must not blank the cache or invalidate any rendered view.
+                    self.work_progress = Some((progress, Instant::now()));
+                }
+            }
+            WorkEvent::Loaded {
+                snapshot,
+                normalized_history,
+                history_error,
+                error,
+            } => {
+                self.load_pending = false;
+                self.tokens = snapshot;
+                self.accept_database_view();
+                self.token_generation += 1;
+                self.history = normalized_history;
+                self.history_generation += 1;
+                self.import_note = format!(
+                    "已載入 {} 筆用量、{} 筆額度觀察。",
+                    self.included_count(),
+                    self.history.len()
+                );
+                let errors: Vec<_> = error.into_iter().chain(history_error).collect();
+                self.load_error = (!errors.is_empty()).then(|| errors.join("；"));
+                if let Some(error) = &self.load_error {
+                    self.persistent = false;
+                    self.notice = format!("儲存檔無法讀取；已停用寫入並保留原檔。{error}");
+                }
+            }
+            WorkEvent::Updated {
+                snapshot,
+                normalized_history,
+                report,
+                error,
+            } => {
+                if let Some(snapshot) = snapshot {
+                    self.tokens = snapshot;
+                    self.accept_database_view();
+                    self.token_generation += 1;
+                }
+                if let Some(history) = normalized_history {
+                    self.history = history;
+                    self.history_generation += 1;
+                }
+                if let Some(report) = report {
+                    self.import_pending = false;
+                    self.import_error = None;
+                    if report.files_scanned == 0 {
+                        self.retain_import_warning(
+                            "所選來源未找到 JSONL 檔案；請檢查來源路徑及檔案存取狀態。".into(),
+                        );
+                    }
+                    if report.malformed_lines > 0 {
+                        self.retain_import_warning(format!(
+                            "曾略過 {} 行格式不支援或無效的用量記錄。",
+                            report.malformed_lines
+                        ));
+                    }
+                    for warning in report.warnings {
+                        self.retain_import_warning(warning);
+                    }
+                    self.import_note = format!(
+                            "已掃描 {} 檔（未變更 {}），讀取 {} 行，本輪新增 {} 筆；格式問題 {}，未完成行 {}。目前載入 {} 筆用量。",
+                            report.files_scanned, report.files_unchanged, report.lines_read,
+                            report.events_added, report.malformed_lines, report.partial_lines,
+                            self.included_count()
+                        );
+                }
+                if let Some(error) = error {
+                    self.view_pending = false;
+                    self.import_pending = false;
+                    self.retain_import_warning(format!("匯入曾失敗：{error}"));
+                    self.import_error = Some(error);
+                }
+            }
+            WorkEvent::HistoryUpdated { normalized } => {
+                if let Some(history) = normalized {
+                    self.history = history;
+                    self.history_generation += 1;
+                }
+            }
+            WorkEvent::IntervalsUpdated { intervals } => {
+                self.set_intervals(intervals);
+            }
+            WorkEvent::SaveFailed { path: _, error } => {
+                self.notice = format!("儲存失敗，畫面仍保留資料：{error}");
+            }
+        }
+    }
     fn save_state(&mut self) {
         if self.persistent
             && self.dirty
-            && self
-                .worker
-                .send(WorkCommand::SaveSettings {
-                    path: self.dir.join("settings.json"),
-                    settings: self.settings.clone(),
-                })
-                .is_ok()
+            && self.send_work(WorkCommand::SaveSettings {
+                path: self.dir.join("settings.json"),
+                settings: self.settings.clone(),
+            })
         {
             self.dirty = false;
         }
@@ -738,15 +1326,34 @@ impl WidgetApp {
     }
     fn refresh_main_cache(&mut self) {
         let t = now();
-        let key = (
-            self.token_generation,
-            self.history_generation,
-            self.settings.bucket.clone(),
-            self.settings.window.clone(),
-            t / 60,
-            self.tree_generation,
-        );
+        let live = self.selected();
+        let key = MainCacheKey {
+            token_generation: self.token_generation,
+            history_generation: self.history_generation,
+            bucket: self.settings.bucket.clone(),
+            window: self.settings.window.clone(),
+            minute: t / 60,
+            tree_generation: self.tree_generation,
+            boundary_after: self.boundary_after,
+            live_selection: live.as_ref().map(|v| LiveSelectionKey {
+                source: v.source_key.clone(),
+                window: v.window_key.clone(),
+                label: v.window_label.clone(),
+                duration: v.window_duration_mins,
+                reset_at: v.reset_at,
+                remaining_bits: v.remaining_percent.map(f64::to_bits),
+                epoch: v.epoch,
+                account: self.quota.account_id().map(str::to_owned),
+            }),
+        };
         if self.main_cache.key.as_ref() == Some(&key) {
+            self.request_database_view(
+                self.main_cache
+                    .boundary
+                    .as_ref()
+                    .map(|e| e.observed_at_unix),
+                t,
+            );
             return;
         }
         let all = self.matching_history();
@@ -781,17 +1388,61 @@ impl WidgetApp {
                     && !unchanged(e)
             })
             .max_by_key(|e| e.observed_at_unix)
+            // Reject the latest incompatible boundary; never fall back to an
+            // older metadata-less row that could revive the same wrong account.
+            .filter(|e| {
+                self.boundary_after
+                    .is_none_or(|after| e.observed_at_unix > after)
+                    && boundary_matches_live(e, live.as_ref(), self.quota.account_id())
+            })
             .cloned();
         let start = boundary.as_ref().map(|e| e.observed_at_unix);
-        let tasks =
-            self.tokens
-                .usage_index
-                .task_rows(self.tokens.events(), start, self.demo_start, t);
-        let mut cost = self
-            .tokens
-            .cost_index
-            .observed(start.unwrap_or(self.demo_start), t);
-        cost.partial |= start.is_none();
+        let quota_coverage_gap = quota_endpoint_mismatch(boundary.as_ref(), live.as_ref());
+        if quota_coverage_gap {
+            recent_tooltip.push_str("\n目前額度與上次記錄扣額的結束值不同，缺少中間額度觀察。累計僅為已記錄時段小計，不能當作完整的目前 1% 用度；沒有推算或補造扣額。所有 Task 本%累計均以 * 標示。");
+        }
+        self.request_database_view(start, t);
+        let (mut tasks, mut cost, loading) = if let Some(view) = &self.tokens.database {
+            let matches = main_view_matches(&view.request, start, self.demo_start, t);
+            let mut tasks = view.main_tasks.clone();
+            if !matches {
+                for task in &mut tasks {
+                    // Keep recent task identities visible during work, but do not
+                    // attach a previous boundary's totals to the new selection.
+                    task.interval_cost_usd = None;
+                    task.interval_events = 0;
+                    task.partial = true;
+                }
+            }
+            let cost = if matches {
+                view.main_cost
+            } else {
+                accounting::ObservedCost {
+                    partial: true,
+                    ..Default::default()
+                }
+            };
+            (tasks, cost, !matches)
+        } else {
+            (
+                self.tokens
+                    .usage_index
+                    .task_rows(self.tokens.events(), start, self.demo_start, t),
+                self.tokens
+                    .cost_index
+                    .observed(start.unwrap_or(self.demo_start), t),
+                false,
+            )
+        };
+        if quota_coverage_gap {
+            for task in &mut tasks {
+                task.partial = true;
+            }
+        }
+        if loading {
+            recent_tooltip.push_str("\n正在背景更新目前範圍；暫不顯示上一範圍的累計費用。");
+        }
+        cost.partial |= start.is_none() || quota_coverage_gap;
         let tree =
             usage_views::task_tree_rows(&tasks, &self.tokens.task_parents, &self.expanded_tasks);
         self.main_cache = MainCache {
@@ -800,6 +1451,7 @@ impl WidgetApp {
             tasks,
             boundary,
             cost,
+            loading,
             recent_intervals,
             recent_tooltip,
         };
@@ -923,11 +1575,16 @@ impl WidgetApp {
                 let sy = sx;
                 let visible=usage_views::visible_task_rows(self.main_cache.tree.len(),self.settings.task_visible_rows as usize);
                 let layout=(visible,self.settings.task_visible_rows,w.round() as u32);
-                if self.layout_key!=Some(layout) {
+                let suspended=ctx.input(|input| {
+                    let viewport=input.viewport();
+                    viewport.minimized.unwrap_or(false) || viewport.maximized.unwrap_or(false) || viewport.fullscreen.unwrap_or(false)
+                });
+                if !suspended {
                     let height=usage_views::widget_height(self.main_cache.tree.len(),self.settings.task_visible_rows as usize)*sx;
-                    ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(276.,height)));
-                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(w,height)));
-                    self.layout_key=Some(layout);
+                    let plan=self.layout.plan(layout,rect.size(),height,ctx.input(|input|input.pointer.any_down()),Instant::now());
+                    if let Some(minimum)=plan.minimum {ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(minimum));}
+                    if let Some(size)=plan.size {ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));}
+                    if let Some(delay)=plan.repaint_after {ctx.request_repaint_after(delay);}
                 }
                 let scale = sx.min(sy).clamp(0.85, 2.5);
                 let painter = ui.painter().clone();
@@ -1024,6 +1681,18 @@ impl WidgetApp {
                 {
                     self.tokens_open = true;
                 }
+                if let Some(progress) = self.compact_progress_text() {
+                    let progress_rect = Rect::from_min_max(pt(21., 39.), pt(289., 51.));
+                    painter.with_clip_rect(progress_rect).text(
+                        progress_rect.min, Align2::LEFT_TOP, progress,
+                        FontId::proportional(9. * scale), muted,
+                    );
+                    if ui.interact(progress_rect, ui.id().with("import-progress"), Sense::click())
+                        .on_hover_text(self.import_diagnostic_text()).clicked()
+                    {
+                        self.settings_open = true;
+                    }
+                }
                 let remain = view.as_ref().and_then(|v| v.remaining_percent);
                 let percent = remain
                     .map(|r| {
@@ -1113,7 +1782,11 @@ impl WidgetApp {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pt(21.,257.),pt(289.,table_bottom))),|ui| {
                     ui.spacing_mut().item_spacing=Vec2::ZERO;
                     egui::ScrollArea::vertical().id_salt("task-interval-rows").max_height(18.*visible as f32*sy).min_scrolled_height(0.).show_rows(ui,18.*sy,self.main_cache.tree.len().max(1),|ui,range| {
-                        if self.main_cache.tree.is_empty() {ui.label(RichText::new("尚無近期 Task 用量").size(10.*scale).color(muted));return;}
+                        if self.main_cache.tree.is_empty() {
+                            let response=ui.add(egui::Label::new(RichText::new(self.empty_task_status()).size(10.*scale).color(muted)).sense(Sense::click()));
+                            if response.on_hover_text(self.import_diagnostic_text()).clicked() {self.settings_open=true;}
+                            return;
+                        }
                         for i in range {
                             let row=&self.main_cache.tree[i];
                             let (r,response)=ui.allocate_exact_size(Vec2::new(268.*sx,18.*sy),Sense::hover());
@@ -1133,7 +1806,7 @@ impl WidgetApp {
                                     while ui.painter().layout_no_wrap(short.clone(),font.clone(),fg).size().x>rect.width()-2.*sx && short.chars().count()>2 {if short.ends_with('…'){short.pop();}short.pop();short.push('…');}
                                     ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).text(rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,short,font,fg);
                                     if ui.interact(rect,ui.id().with(("task-name",task_id)),Sense::click()).on_hover_ui(|ui|{ui.set_max_width(260.*scale);ui.add(egui::Label::new(RichText::new(&tooltip).size(10.5*scale)).wrap());}).clicked(){ctx.copy_text(task_id.clone());}
-                                    let values=if let Some(task)=task {[(84.,local_time(task.latest_timestamp)),(142.,money(task.latest_cost_usd)),(204.,format!("{}{}",money(task.interval_cost_usd),if task.partial {"*"}else{""}))]}else{[(84.,"—".into()),(142.,"—".into()),(204.,"$0.0000*".into())]};
+                                    let values=if let Some(task)=task {[(84.,local_time(task.latest_timestamp)),(142.,money(task.latest_cost_usd)),(204.,format!("{}{}",money(task.interval_cost_usd),if task.partial {"*"}else{""}))]}else{[(84.,"—".into()),(142.,"—".into()),(204.,if self.main_cache.loading {"$—*".into()}else{"$0.0000*".into()})]};
                                     for (x,text) in values {ui.painter().text(r.min+Vec2::new(x*sx,2.*sy),Align2::LEFT_TOP,text,FontId::proportional(9.5*scale),fg);}
                                 }
                                 usage_views::TaskTreeRow::ChildrenSummary {parent_id,depth,descendant_count,direct_child_count,known_cost_usd,partial,expanded}=>{
@@ -1144,14 +1817,14 @@ impl WidgetApp {
                                     let button_rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((200.-indent)*sx,18.*sy));
                                     ui.painter().text(button_rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,label,FontId::proportional(9.5*scale),accent);
                                     if ui.interact(button_rect,ui.id().with(("children-toggle",parent_id)),Sense::click()).on_hover_text(&help).clicked(){if *expanded {self.expanded_tasks.remove(parent_id);}else{self.expanded_tasks.insert(parent_id.clone());}self.tree_generation+=1;}
-                                    ui.painter().text(r.min+Vec2::new(204.*sx,2.*sy),Align2::LEFT_TOP,format!("{}{}",money(Some(*known_cost_usd)),if *partial {"*"}else{""}),FontId::proportional(9.5*scale),accent);
+                                    ui.painter().text(r.min+Vec2::new(204.*sx,2.*sy),Align2::LEFT_TOP,format!("{}{}",money((!self.main_cache.loading).then_some(*known_cost_usd)),if *partial {"*"}else{""}),FontId::proportional(9.5*scale),accent);
                                 }
                             }
                         }
                     });
                 });
-                let footer=if let Some(e)=&self.main_cache.boundary {
-                    format!("{} {} 分鐘／累計 {}{}",if reset_event(e){"距本次重設"}else{"距上次扣額"},(now()-e.observed_at_unix).max(0)/60,money(Some(self.main_cache.cost.known_usd)),if self.main_cache.cost.partial {" *"}else{""})
+                let footer=if self.main_cache.loading {"正在更新目前範圍／累計 $— *".into()} else if let Some(e)=&self.main_cache.boundary {
+                    format!("{} {} 分鐘／累計 {}{}",if reset_event(e){"距本次重設"}else{"距上次記錄扣額"},(now()-e.observed_at_unix).max(0)/60,money(Some(self.main_cache.cost.known_usd)),if self.main_cache.cost.partial {" *"}else{""})
                 } else {format!("自啟動 {} 分鐘／累計 {} *",(now()-self.demo_start).max(0)/60,money(Some(self.main_cache.cost.known_usd)))};
                 txt(21.,table_bottom+10.,footer,11.,muted);
                 let footer_response=ui.interact(Rect::from_min_max(pt(21.,table_bottom+9.),pt(289.,table_bottom+29.)),ui.id().with("cost-coverage"),Sense::click());
@@ -1220,6 +1893,12 @@ impl WidgetApp {
                 *date = display_time::now_day();
             }
         });
+        if *date > display_time::now_day() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "所選日期晚於今天；可按「今天」查看當日紀錄。",
+            );
+        }
     }
     fn days(&mut self) -> BTreeSet<NaiveDate> {
         let today = display_time::now_day();
@@ -1238,9 +1917,14 @@ impl WidgetApp {
                     self.dates_cache.insert(d);
                 }
             }
-            for e in self.tokens.events() {
-                if let Some(d) = local_day(e.timestamp) {
-                    self.dates_cache.insert(d);
+            if let Some(view) = &self.tokens.database {
+                self.dates_cache
+                    .extend(view.day_starts.iter().filter_map(|&start| local_day(start)));
+            } else {
+                for e in self.tokens.events() {
+                    if let Some(d) = local_day(e.timestamp) {
+                        self.dates_cache.insert(d);
+                    }
                 }
             }
             self.dates_key = Some(key);
@@ -1407,7 +2091,19 @@ impl WidgetApp {
         if self.history_cache.key.as_ref() != Some(&key) {
             let all = self.browsed_history();
             // One batch pass, instead of one full-history scan for every row.
-            let costs = accounting::history_costs(&self.tokens.cost_index, &all);
+            let costs = if self.tokens.database.is_some() {
+                all.iter()
+                    .map(|event| {
+                        canonical_interval_cost(
+                            self.interval_lookup
+                                .get(&intervals::history_event_key(event))
+                                .and_then(|&index| self.intervals.get(index)),
+                        )
+                    })
+                    .collect()
+            } else {
+                accounting::history_costs(&self.tokens.cost_index, &all)
+            };
             self.history_cache.rows = all
                 .into_iter()
                 .zip(costs)
@@ -1449,6 +2145,9 @@ impl WidgetApp {
             "可完整歸屬區間的加權成本：{} / 百分點",
             money(self.history_cache.weighted)
         ));
+        if let Some(message) = self.empty_history_diagnostic() {
+            ui.colored_label(ui.visuals().warn_fg_color, message);
+        }
         if self.history_intervals {
             self.completed_intervals_table(ui);
         } else if self.history_cache.rows.is_empty() {
@@ -1541,6 +2240,17 @@ impl WidgetApp {
         }
     }
 
+    fn empty_history_diagnostic(&self) -> Option<String> {
+        if !self.history_cache.rows.is_empty() || self.history.is_empty() {
+            return None;
+        }
+        let day_count = self
+            .history
+            .iter()
+            .filter(|e| local_day(e.observed_at_unix) == Some(self.date))
+            .count();
+        Some(format!("目前來源／日期沒有符合紀錄；已載入 {} 筆額度觀察，其中所選日期有 {} 筆（含其他來源）。請檢查上方「來源 / 額度視窗」、日期及「忽略相同百分比」。", self.history.len(), day_count))
+    }
     fn completed_intervals_table(&mut self, ui: &mut egui::Ui) {
         ui.small("每行是一個實際觀察到的扣額區間；重設不列作消耗。跨多百分點只顯示平均。* 保留不完整區間的已知小計，不能當作每%價格。滑鼠移到列可看限制。");
         if self.history_cache.interval_indices.is_empty() {
@@ -1642,7 +2352,92 @@ impl WidgetApp {
             });
     }
 
+    fn refresh_token_cache(&mut self) {
+        self.request_database_view(
+            self.main_cache
+                .boundary
+                .as_ref()
+                .map(|event| event.observed_at_unix),
+            now(),
+        );
+        let key = (
+            self.token_generation,
+            self.token_date,
+            self.token_group,
+            self.show_excluded_records,
+            self.token_page,
+        );
+        if self.token_cache.key == Some(key) {
+            return;
+        }
+        if let Some(view) = &self.tokens.database {
+            if daily_view_matches(
+                &view.request,
+                self.token_date,
+                self.token_group,
+                self.show_excluded_records,
+                self.token_page,
+            ) {
+                let summary = &view.daily.summary;
+                self.token_cache = TokenCache {
+                    key: Some(key),
+                    rows: view.daily.rows.clone(),
+                    group_count: view.daily.group_count,
+                    count: summary.event_count,
+                    input: summary.input,
+                    cached: summary.cached,
+                    output: summary.output,
+                    reasoning: summary.reasoning,
+                    missing: summary.unpriced_events,
+                    cost: summary.priced_cost_usd,
+                    loading: false,
+                };
+            } else {
+                // A newly selected day/group/page never displays the old page
+                // beneath its new label while the background query is pending.
+                self.token_cache = TokenCache {
+                    key: Some(key),
+                    loading: true,
+                    ..Default::default()
+                };
+            }
+            return;
+        }
+        let events: Vec<_> = if self.show_excluded_records {
+            &self.tokens.excluded_events[..]
+        } else {
+            self.tokens.events()
+        }
+        .iter()
+        .filter(|event| local_day(event.timestamp) == Some(self.token_date))
+        .collect();
+        let mut cache = TokenCache {
+            key: Some(key),
+            count: events.len(),
+            rows: usage_views::group_with_excluded(
+                &events,
+                self.token_group,
+                self.show_excluded_records,
+            ),
+            ..Default::default()
+        };
+        cache.group_count = cache.rows.len();
+        for event in events {
+            cache.input = cache.input.saturating_add(event.input);
+            cache.cached = cache.cached.saturating_add(event.cached);
+            cache.output = cache.output.saturating_add(event.output);
+            cache.reasoning = cache.reasoning.saturating_add(event.reasoning);
+            cache.missing += usize::from(event.cost_usd.is_none());
+            cache.cost += event.cost_usd.unwrap_or(0.);
+        }
+        self.token_cache = cache;
+    }
     fn token_ui(&mut self, ui: &mut egui::Ui) {
+        let old_selection = (
+            self.token_date,
+            self.token_group,
+            self.show_excluded_records,
+        );
         ui.heading("Token 明細 · 香港時間 UTC+08:00");
         ui.small("估算 USD 顯示已知小計；* 代表未完整覆蓋，不能當作完整費用。全部未能估價時顯示未知；推理強度與推理 Token 數分開。 ");
         if self.demo {
@@ -1693,46 +2488,86 @@ impl WidgetApp {
             );
             ui.small(format!(
                 "保留 {} 筆；不計入 Task／子代理數及費用",
-                self.tokens.excluded_events.len()
+                self.excluded_count()
             ));
         });
         ui.small("只依精確模型 codex-auto-review 排除，普通 Sol 審查工作仍計入；官方額度讀數不變，排除不代表免費。");
-        let key = (
-            self.token_generation,
-            self.token_date,
-            self.token_group,
-            self.show_excluded_records,
-        );
-        if self.token_cache.key != Some(key) {
-            let events: Vec<_> = if self.show_excluded_records {
-                &self.tokens.excluded_events[..]
-            } else {
-                self.tokens.events()
-            }
-            .iter()
-            .filter(|e| local_day(e.timestamp) == Some(self.token_date))
-            .collect();
-            let mut cache = TokenCache {
-                key: Some(key),
-                count: events.len(),
-                rows: usage_views::group_with_excluded(
-                    &events,
-                    self.token_group,
-                    self.show_excluded_records,
-                ),
-                ..TokenCache::default()
-            };
-            for e in events {
-                cache.input = cache.input.saturating_add(e.input);
-                cache.cached = cache.cached.saturating_add(e.cached);
-                cache.output = cache.output.saturating_add(e.output);
-                cache.reasoning = cache.reasoning.saturating_add(e.reasoning);
-                cache.missing += usize::from(e.cost_usd.is_none());
-                cache.cost += e.cost_usd.unwrap_or(0.);
-            }
-            self.token_cache = cache;
+        if old_selection
+            != (
+                self.token_date,
+                self.token_group,
+                self.show_excluded_records,
+            )
+        {
+            self.token_page = 0;
         }
+        self.refresh_token_cache();
+        if self.tokens.database.is_some() {
+            let pages = self.token_cache.group_count.div_ceil(500).max(1);
+            if !self.token_cache.loading && self.token_page >= pages {
+                self.token_page = pages - 1;
+                self.refresh_token_cache();
+            }
+            let mut page_changed = false;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.token_page > 0, egui::Button::new("上一頁"))
+                    .clicked()
+                {
+                    self.token_page -= 1;
+                    page_changed = true;
+                }
+                ui.label(if self.token_cache.loading {
+                    format!("第 {} 頁 · 正在載入…", self.token_page + 1)
+                } else {
+                    format!(
+                        "第 {} / {} 頁 · {} 組 · 每頁最多 500 列",
+                        self.token_page + 1,
+                        pages,
+                        self.token_cache.group_count
+                    )
+                });
+                if ui
+                    .add_enabled(
+                        !self.token_cache.loading && self.token_page + 1 < pages,
+                        egui::Button::new("下一頁"),
+                    )
+                    .clicked()
+                {
+                    self.token_page += 1;
+                    page_changed = true;
+                }
+            });
+            if page_changed {
+                self.refresh_token_cache();
+            }
+        }
+        self.import_diagnostics_ui(ui);
         let cache = &self.token_cache;
+        if cache.loading {
+            if self.view_pending {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("正在載入 {} 的明細…", self.token_date));
+                });
+            } else {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "所選明細尚未載入；請查看上方診斷。",
+                );
+                if ui
+                    .add_enabled(!self.worker_failed, egui::Button::new("重試載入"))
+                    .clicked()
+                {
+                    self.requested_view = None;
+                    self.refresh_token_cache();
+                }
+            }
+            return;
+        }
+        if self.tokens.database.is_some() {
+            ui.small("以下合計涵蓋所選整日；翻頁不會改變合計。");
+        }
         if self.show_excluded_records {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
@@ -1754,7 +2589,6 @@ impl WidgetApp {
                 String::new()
             }
         ));
-        ui.small(&self.import_note);
         ui.separator();
         let widths = [
             72., 150., 80., 115., 120., 45., 90., 90., 90., 80., 80., 110.,
@@ -1804,13 +2638,16 @@ impl WidgetApp {
     fn price_model_choices(&mut self) -> BTreeSet<String> {
         // The model picker must not rescan all history on every settings repaint.
         if self.price_models_generation != Some(self.token_generation) {
-            self.recorded_price_models = self
-                .tokens
-                .events
-                .iter()
-                .chain(&self.tokens.excluded_events)
-                .map(|event| event.model.clone())
-                .collect();
+            self.recorded_price_models = if let Some(view) = &self.tokens.database {
+                view.models.clone()
+            } else {
+                self.tokens
+                    .events
+                    .iter()
+                    .chain(&self.tokens.excluded_events)
+                    .map(|event| event.model.clone())
+                    .collect()
+            };
             self.price_models_generation = Some(self.token_generation);
         }
         let mut choices = self.recorded_price_models.clone();
@@ -1975,7 +2812,7 @@ impl WidgetApp {
             }
         });
         ui.small("預設30天瀏覽，保留更早歷史。精確 codex-auto-review 保留原始用量，但從預設 Task／子代理數／估算中排除；可在 Token 明細稽核。官方額度不變，不表示免費。");
-        ui.label(&self.import_note);
+        self.import_diagnostics_ui(ui);
         ui.separator();
         ui.strong("模型等價價格（USD / 1M tokens）");
         ui.label("全新設定採官方 Standard 費率假設；不是訂閱扣款。只有未記錄模型時假設 6.1 Sol；有名稱但無單價的模型保持未知。Sol／Luna／Astra 按每筆實際模型計價。");
@@ -2135,6 +2972,7 @@ impl WidgetApp {
         let audit_excluded = tokens && self.show_excluded_records;
         let snapshot = Arc::clone(&self.tokens);
         let history = Arc::clone(&self.history);
+        let canonical_intervals = Arc::clone(&self.intervals);
         let day = if tokens { self.token_date } else { self.date };
         let folder = self.dir.join("exports");
         let pricing = snapshot.pricing.clone();
@@ -2151,7 +2989,32 @@ impl WidgetApp {
             .name("quota-export".into())
             .spawn(move || {
                 let kind = if audit_excluded {"tokens-excluded"}else if tokens { "tokens" } else { "quota" };
-                let usage_events=if audit_excluded {&snapshot.excluded_events[..]}else{snapshot.events()};
+                // Export the entire selected day from a separate read-only
+                // connection. The GUI snapshot contains only a bounded page
+                // and latest-task tooltip events, never full export history.
+                let mut database_events = None;
+                let mut excluded_count = snapshot.excluded_events.iter().filter(|event| local_day(event.timestamp) == Some(day)).count();
+                if let Some(view) = &snapshot.database {
+                    let result = (|| -> Result<Vec<TokenEvent>, String> {
+                        let (start, end) = display_time::day_bounds(day).ok_or("所選日期無效")?;
+                        let db = quota_widget::token_db::TokenDb::open_readonly(&view.database_path).map_err(|error| error.to_string())?;
+                        db.query_events_all(Some(start), Some(end), true).map_err(|error| error.to_string())
+                    })();
+                    match result {
+                        Ok(mut events) => {
+                            excluded_count = events.iter().filter(|event| event.is_excluded_auto_review()).count();
+                            events.retain(|event| event.is_excluded_auto_review() == audit_excluded);
+                            database_events = Some(events);
+                        }
+                        Err(error) => {
+                            let _ = tx.send(format!("匯出失敗；未產生不完整檔案：{error}"));
+                            return;
+                        }
+                    }
+                }
+                let usage_events = database_events.as_deref().unwrap_or_else(|| {
+                    if audit_excluded { &snapshot.excluded_events[..] } else { snapshot.events() }
+                });
                 let filename = format!(
                     "{kind}-{day}-{}.{}",
                     Utc::now().with_timezone(&display_time::timezone()).format("%H%M%S%3f"),
@@ -2198,8 +3061,17 @@ impl WidgetApp {
                         .cloned()
                         .collect();
                     all.sort_by_key(|event| event.observed_at_unix);
-                    let costs = accounting::history_costs(&snapshot.cost_index, &all);
-                    completed_export = intervals::completed_intervals(snapshot.events(), &all).into_iter().filter(|interval|local_day(interval.end)==Some(day)).collect();
+                    let costs = if snapshot.database.is_some() {
+                        let selected_keys: BTreeSet<_> = all.iter().map(intervals::history_event_key).collect();
+                        completed_export = canonical_intervals.iter().filter(|interval| {
+                            local_day(interval.end) == Some(day) && selected_keys.contains(&interval.history_event_key)
+                        }).cloned().collect();
+                        let canonical: BTreeMap<_, _> = canonical_intervals.iter().map(|interval| (&interval.history_event_key, interval)).collect();
+                        all.iter().map(|event| canonical_interval_cost(canonical.get(&intervals::history_event_key(event)).copied())).collect()
+                    } else {
+                        completed_export = intervals::completed_intervals(snapshot.events(), &all).into_iter().filter(|interval|local_day(interval.end)==Some(day)).collect();
+                        accounting::history_costs(&snapshot.cost_index, &all)
+                    };
                     let interval_map: BTreeMap<_,_> = completed_export.iter().map(|interval|(interval.history_event_key.as_str(),interval)).collect();
                     all.iter()
                         .zip(costs)
@@ -2243,8 +3115,7 @@ impl WidgetApp {
                     event["excluded_from_default_totals"] = serde_json::json!(audit_excluded);
                     event["pricing_basis"] = serde_json::json!(pricing.tier_label);
                     event["pricing_verified_at"] = serde_json::json!(pricing.verified_at);
-                    event["long_context_adjustment"] =
-                        serde_json::json!(pricing.apply_long_context);
+                    annotate_long_context_export(event, &pricing);
                 }
                 let result = (|| -> std::io::Result<()> {
                     std::fs::create_dir_all(&folder)?;
@@ -2258,9 +3129,10 @@ impl WidgetApp {
                                 "kind": kind,
                                 "cost_basis": "estimated_model_equivalent_not_subscription_charge",
                                 "view_scope":if audit_excluded {"excluded_auto_review_audit"}else{"included_default"},
-                                "excluded_auto_review_records":snapshot.excluded_events.iter().filter(|e|local_day(e.timestamp)==Some(day)).count(),
+                                "excluded_auto_review_records":excluded_count,
                                 "exclusion_is_not_free_billing_claim":true,
                                 "pricing": pricing,
+                                "long_context_adjustment_enabled": pricing.apply_long_context,
                                 "events": events,
                                 "completed_intervals": if tokens {None}else{Some(&completed_export)},
                                 "turn_summaries": if tokens {
@@ -2304,6 +3176,9 @@ impl WidgetApp {
                                 "pricing_basis",
                                 "pricing_verified_at",
                                 "long_context_adjustment",
+                                "long_context_adjustment_enabled",
+                                "long_context_adjustment_applied",
+                                "long_context_adjustment_legacy_semantics",
                             ]
                         } else {
                             vec![
@@ -2337,6 +3212,9 @@ impl WidgetApp {
                                 "pricing_basis",
                                 "pricing_verified_at",
                                 "long_context_adjustment",
+                                "long_context_adjustment_enabled",
+                                "long_context_adjustment_applied",
+                                "long_context_adjustment_legacy_semantics",
                             ]
                         }
                         .into_iter()
@@ -2452,7 +3330,17 @@ impl eframe::App for WidgetApp {
         }
         self.widget(ctx);
         self.detail_windows(ctx);
-        ctx.request_repaint_after(Duration::from_secs(1));
+        ctx.request_repaint_after(
+            if self.load_pending
+                || self.import_pending
+                || self.view_pending
+                || self.work_progress.is_some()
+            {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(1)
+            },
+        );
     }
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         [0., 0., 0., 0.]
@@ -3129,5 +4017,1340 @@ mod widget_revision_tests {
             }
         }
         assert_eq!(duration(3600), "01:00:00");
+    }
+}
+
+#[cfg(test)]
+mod import_diagnostics_tests {
+    use super::*;
+    use quota_widget::tokens::ImportReport;
+
+    fn app(directory: &std::path::Path) -> WidgetApp {
+        WidgetApp::new(
+            Settings {
+                import_enabled: false,
+                sessions_path: directory.join("synthetic-logs").display().to_string(),
+                ..Settings::default()
+            },
+            directory.to_owned(),
+            false,
+            false,
+            true,
+            vec![],
+        )
+    }
+    fn loaded(error: Option<&str>, history_error: Option<&str>) -> WorkEvent {
+        WorkEvent::Loaded {
+            snapshot: Arc::new(Snapshot::default()),
+            normalized_history: Arc::new(vec![]),
+            error: error.map(str::to_owned),
+            history_error: history_error.map(str::to_owned),
+        }
+    }
+    fn updated(report: Option<ImportReport>, error: Option<&str>) -> WorkEvent {
+        WorkEvent::Updated {
+            snapshot: None,
+            normalized_history: None,
+            report,
+            error: error.map(str::to_owned),
+        }
+    }
+    fn progress(stage: ProgressStage) -> WorkEvent {
+        WorkEvent::Progress(WorkProgress {
+            operation: Operation::Import,
+            stage,
+            elapsed: Duration::from_secs(12),
+            files_done: 17,
+            files_total: 30,
+            lines_read: 1234,
+            observations: 567,
+            events: 100,
+        })
+    }
+    #[test]
+    fn progress_keeps_cached_records_and_render_cache_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.tokens = Arc::new(Snapshot::from_store(&TokenStore::demo(now())));
+        app.history = Arc::new(vec![history("synthetic-source", now(), None, None)]);
+        app.refresh_main_cache();
+        app.token_cache.key = Some((
+            app.token_generation,
+            app.token_date,
+            GroupBy::Response,
+            false,
+            0,
+        ));
+        let tokens = Arc::clone(&app.tokens);
+        let history = Arc::clone(&app.history);
+        let intervals = Arc::clone(&app.intervals);
+        let token_key = app.token_cache.key;
+        let generations = (app.token_generation, app.history_generation);
+        app.status = "LIVE".into();
+        for stage in [
+            ProgressStage::Loading,
+            ProgressStage::Import(ImportPhase::Discovering),
+            ProgressStage::Import(ImportPhase::Reading),
+            ProgressStage::Import(ImportPhase::Reconciling),
+            ProgressStage::Import(ImportPhase::Metadata),
+            ProgressStage::BuildingViews,
+            ProgressStage::BuildingIntervals,
+            ProgressStage::Saving,
+        ] {
+            app.handle_worker_event(progress(stage));
+            assert!(Arc::ptr_eq(&tokens, &app.tokens));
+            assert!(Arc::ptr_eq(&history, &app.history));
+            assert!(Arc::ptr_eq(&intervals, &app.intervals));
+            assert_eq!((app.token_generation, app.history_generation), generations);
+            assert_eq!(app.token_cache.key, token_key);
+            assert!(app.main_cache.key.is_some());
+            assert_eq!(app.status, "LIVE");
+            assert!(app.compact_progress_text().unwrap().contains("17/30"));
+            assert!(app.import_status_text().contains("1234 行"));
+            assert!(app.import_status_text().contains("567 筆觀察"));
+            assert!(app.import_status_text().contains("12 秒"));
+        }
+        app.handle_worker_event(progress(ProgressStage::Complete));
+        assert!(app.work_progress.is_none());
+        assert_eq!(app.last_import_elapsed, Some(Duration::from_secs(12)));
+        assert!(Arc::ptr_eq(&tokens, &app.tokens));
+    }
+    #[test]
+    fn migration_progress_labels_tasks_and_preserves_cached_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.tokens = Arc::new(Snapshot::from_store(&TokenStore::demo(now())));
+        app.refresh_main_cache();
+        let snapshot = Arc::clone(&app.tokens);
+        let generations = (app.token_generation, app.history_generation);
+        app.load_pending = true;
+        app.handle_worker_event(WorkEvent::Progress(WorkProgress {
+            operation: Operation::Load,
+            stage: ProgressStage::Migrating,
+            elapsed: Duration::from_secs(17),
+            files_done: 42,
+            files_total: 150,
+            lines_read: 0,
+            observations: 0,
+            events: 0,
+        }));
+        for text in [
+            app.import_status_text(),
+            app.compact_progress_text().unwrap(),
+            app.empty_task_status(),
+        ] {
+            assert!(
+                text.contains("正在轉換舊資料：task 42/150（原檔保留）"),
+                "{text}"
+            );
+            assert!(text.contains("17 秒"), "{text}");
+            assert!(!text.contains("150 檔"), "{text}");
+            assert!(!text.contains("讀取 0 行"), "{text}");
+        }
+        assert!(Arc::ptr_eq(&snapshot, &app.tokens));
+        assert_eq!((app.token_generation, app.history_generation), generations);
+        assert!(app.main_cache.key.is_some());
+    }
+    #[test]
+    fn migration_validation_with_unknown_total_does_not_claim_zero_of_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        for stage in [ProgressStage::Loading, ProgressStage::Migrating] {
+            app.handle_worker_event(WorkEvent::Progress(WorkProgress {
+                operation: Operation::Load,
+                stage,
+                elapsed: Duration::from_secs(3),
+                files_done: 0,
+                files_total: 0,
+                lines_read: 0,
+                observations: 0,
+                events: 0,
+            }));
+            for text in [
+                app.import_status_text(),
+                app.compact_progress_text().unwrap(),
+            ] {
+                assert!(text.contains("首次載入／驗證舊資料"), "{text}");
+                assert!(text.contains("原檔保留"), "{text}");
+                assert!(text.contains("3 秒"), "{text}");
+                assert!(!text.contains("0/0"), "{text}");
+            }
+        }
+        app.handle_worker_event(progress(ProgressStage::Import(ImportPhase::Reading)));
+        assert!(app.compact_progress_text().unwrap().contains("17/30 檔"));
+        assert!(app.import_status_text().contains("1234 行"));
+    }
+    #[test]
+    fn displayed_import_remains_usable_when_later_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.import_pending = true;
+        let snapshot = Arc::new(Snapshot::from_store(&TokenStore::demo(now())));
+        app.handle_worker_event(WorkEvent::Updated {
+            snapshot: Some(Arc::clone(&snapshot)),
+            normalized_history: None,
+            report: Some(ImportReport {
+                files_scanned: 1,
+                ..ImportReport::default()
+            }),
+            error: None,
+        });
+        app.handle_worker_event(progress(ProgressStage::Saving));
+        assert!(!app.import_pending);
+        assert!(app.import_status_text().contains("正在儲存"));
+        app.handle_worker_event(WorkEvent::SaveFailed {
+            path: dir.path().join("tokens.json"),
+            error: "synthetic disk unavailable".into(),
+        });
+        app.handle_worker_event(progress(ProgressStage::Complete));
+        assert!(Arc::ptr_eq(&snapshot, &app.tokens));
+        assert!(app.import_error.is_none());
+        assert!(!app.worker_failed);
+        assert!(app.notice.contains("儲存失敗"));
+        assert!(app.notice.contains("synthetic disk unavailable"));
+    }
+    #[test]
+    fn interrupted_progress_cannot_leave_perpetual_busy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.handle_worker_event(progress(ProgressStage::Saving));
+        app.worker_disconnected();
+        assert!(app.work_progress.is_none());
+        assert!(app.import_status_text().contains("中斷"));
+        // Even stale progress cannot overwrite the terminal failure status.
+        app.handle_worker_event(progress(ProgressStage::Import(ImportPhase::Reading)));
+        assert!(app.work_progress.is_none());
+        assert!(app.import_status_text().contains("中斷"));
+    }
+    fn history(
+        source: &str,
+        timestamp: i64,
+        account: Option<&str>,
+        reset: Option<i64>,
+    ) -> HistoryEvent {
+        serde_json::from_value(serde_json::json!({
+            "session":"synthetic-run", "observed_at_unix":timestamp, "source_key":source,
+            "epoch":0,"kind":"QuotaDecrease","window_label":"每週額度","window_key":"primary",
+            "before":"99","after":"98","delta":"1",
+            "evidence":{"account_id":account,"before_reset_at":reset,"reset_at":reset,"window_duration_mins":10080}
+        })).unwrap()
+    }
+    fn live(app: &mut WidgetApp, account: Option<&str>, timestamp: i64, reset: i64) {
+        let mut value = serde_json::json!({"rateLimits":{"primary":{"usedPercent":13,"windowDurationMins":10080,"resetsAt":reset}}});
+        if let Some(account) = account {
+            value["accountId"] = serde_json::json!(account);
+        }
+        app.quota.ingest_json(&value, timestamp).unwrap();
+    }
+    #[test]
+    fn completed_load_replaces_loading_status_when_import_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.read_state = true;
+        app.initialize();
+        assert!(app.load_pending);
+        assert!(app.import_status_text().contains("正在載入"));
+        for _ in 0..200 {
+            app.pump();
+            if !app.load_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!app.load_pending);
+        assert_eq!(app.token_generation, 1);
+        assert!(app.import_status_text().contains("已載入 0 筆"));
+        assert!(!app.import_status_text().contains("正在載入"));
+    }
+    #[test]
+    fn completed_load_distinguishes_queued_scan_and_preserves_both_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.load_pending = true;
+        app.import_pending = true;
+        app.handle_worker_event(loaded(
+            Some("tokens.json: bad cache"),
+            Some("history.json: bad history"),
+        ));
+        assert!(!app.load_pending);
+        assert!(app.import_pending);
+        assert!(app.import_status_text().contains("正在掃描"));
+        let error = app.load_error.as_ref().unwrap();
+        assert!(error.contains("tokens.json"));
+        assert!(error.contains("history.json"));
+        assert!(app.empty_task_status().contains("錯誤"));
+    }
+    #[test]
+    fn warnings_and_malformed_counts_survive_unchanged_polls_and_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.handle_worker_event(updated(
+            Some(ImportReport {
+                files_scanned: 2,
+                malformed_lines: 1,
+                warnings: vec!["Could not read synthetic file".into()],
+                ..ImportReport::default()
+            }),
+            None,
+        ));
+        let original = app.import_warnings.clone();
+        app.handle_worker_event(updated(
+            Some(ImportReport {
+                files_scanned: 2,
+                files_unchanged: 2,
+                ..ImportReport::default()
+            }),
+            None,
+        ));
+        assert_eq!(app.import_warnings, original);
+        assert!(app.empty_task_status().contains("警告"));
+        for i in 0..100 {
+            app.retain_import_warning(format!("synthetic warning {i}"));
+        }
+        assert_eq!(app.import_warnings.len(), 20);
+    }
+    #[test]
+    fn empty_source_and_import_failure_produce_actionable_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.import_pending = true;
+        app.handle_worker_event(updated(None, Some("synthetic path unavailable")));
+        assert!(!app.import_pending);
+        assert!(app.import_status_text().contains("失敗"));
+        assert!(app.empty_task_status().contains("錯誤"));
+        app.handle_worker_event(updated(Some(ImportReport::default()), None));
+        assert!(app.import_error.is_none());
+        assert!(app
+            .import_warnings
+            .iter()
+            .any(|w| w.contains("未找到 JSONL")));
+        assert!(app.import_warnings.iter().any(|w| w.contains("曾失敗")));
+        assert!(app.import_diagnostic_text().contains("synthetic-logs"));
+    }
+    #[test]
+    fn disconnected_worker_clears_pending_flags_without_clearing_loaded_data_or_live_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.tokens = Arc::new(Snapshot::from_store(&TokenStore::demo(now())));
+        let count = app.tokens.events.len();
+        app.status = "LIVE".into();
+        app.load_pending = true;
+        app.import_pending = true;
+        app.persistent = true;
+        app.worker.shutdown().unwrap();
+        app.pump();
+        assert!(app.worker_failed);
+        assert!(!app.load_pending);
+        assert!(!app.import_pending);
+        assert!(!app.persistent);
+        assert_eq!(app.tokens.events.len(), count);
+        assert_eq!(app.status, "LIVE");
+        assert!(app.import_status_text().contains("中斷"));
+        assert!(app.empty_task_status().contains("中斷"));
+    }
+    #[test]
+    fn failed_load_or_import_send_cannot_leave_perpetual_pending_state() {
+        for loading in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app(dir.path());
+            app.settings.import_enabled = true;
+            app.read_state = loading;
+            app.worker.shutdown().unwrap();
+            if loading {
+                app.initialize();
+            } else {
+                app.start_import();
+            }
+            assert!(app.worker_failed);
+            assert!(!app.load_pending);
+            assert!(!app.import_pending);
+        }
+    }
+    #[test]
+    fn empty_task_diagnostics_distinguish_missing_filtered_and_excluded_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.settings.import_enabled = true;
+        assert!(app.empty_task_status().contains("尚未匯入"));
+        app.tokens = Arc::new(Snapshot::from_store(&TokenStore::demo(now() - 86400)));
+        app.refresh_main_cache();
+        assert!(app.main_cache.tasks.is_empty());
+        assert!(app.empty_task_status().contains("近期範圍"));
+        let snapshot = Snapshot {
+            excluded_events: app.tokens.events.clone(),
+            ..Snapshot::default()
+        };
+        app.tokens = Arc::new(snapshot);
+        assert!(app.empty_task_status().contains("排除用量"));
+    }
+    #[test]
+    fn first_live_selection_invalidates_unrelated_fallback_within_same_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        let t = now();
+        app.history = Arc::new(vec![history(
+            "legacy-source",
+            t - 321 * 60,
+            None,
+            Some(t + 86400),
+        )]);
+        app.refresh_main_cache();
+        assert!(app.main_cache.boundary.is_some());
+        live(&mut app, Some("current-account"), t, t + 86400);
+        app.main_cache.key.as_mut().unwrap().minute = now() / 60;
+        app.refresh_main_cache();
+        assert!(app.main_cache.boundary.is_none());
+        assert_eq!(app.history.len(), 1);
+    }
+    #[test]
+    fn known_account_or_expired_cycle_conflicts_do_not_revive_older_unknown_boundaries() {
+        let t = now();
+        for (old_account, old_reset, new_account, new_reset) in [
+            (
+                Some("account-A"),
+                Some(t + 86400),
+                Some("account-B"),
+                t + 86400,
+            ),
+            (
+                Some("same-account"),
+                Some(t - 3600),
+                Some("same-account"),
+                t + 7 * 86400,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app(dir.path());
+            app.history = Arc::new(vec![
+                history("codex", t - 40000, None, None),
+                history("codex", t - 321 * 60, old_account, old_reset),
+            ]);
+            live(&mut app, new_account, t, new_reset);
+            app.refresh_main_cache();
+            assert!(app.main_cache.boundary.is_none());
+            assert_eq!(app.history.len(), 2);
+            assert_eq!(
+                app.matching_history().len(),
+                2,
+                "historical browsing is unchanged"
+            );
+        }
+    }
+    #[test]
+    fn compatible_unknown_and_small_jitter_boundaries_remain_available() {
+        let t = now();
+        for (account, old_reset, new_reset) in [
+            (Some("same-account"), Some(t + 86400), t + 86400),
+            (Some("same-account"), Some(t - 30), t + 30),
+            (None, None, t + 86400),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app(dir.path());
+            app.history = Arc::new(vec![history("codex", t - 600, account, old_reset)]);
+            live(&mut app, Some("same-account"), t, new_reset);
+            app.refresh_main_cache();
+            assert!(app.main_cache.boundary.is_some());
+        }
+    }
+    #[test]
+    fn explicit_account_change_blocks_previous_boundary_until_a_new_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        let t = now();
+        app.history = Arc::new(vec![history(
+            "codex",
+            t - 600,
+            Some("old-account"),
+            Some(t + 86400),
+        )]);
+        live(&mut app, Some("old-account"), t, t + 86400);
+        app.refresh_main_cache();
+        assert!(app.main_cache.boundary.is_some());
+        app.account_changed();
+        assert_eq!(app.quota.account_id(), None);
+        live(&mut app, None, t + 1, t + 86400);
+        app.refresh_main_cache();
+        assert!(app.main_cache.boundary.is_none());
+        // Put the synthetic floor in the past so a genuinely later observation
+        // can be tested without altering the clock or waiting in this test.
+        app.boundary_after = Some(t - 2);
+        Arc::make_mut(&mut app.history).push(history("codex", t - 1, None, Some(t + 86400)));
+        app.history_generation += 1;
+        app.refresh_main_cache();
+        assert_eq!(
+            app.main_cache.boundary.as_ref().unwrap().observed_at_unix,
+            t - 1
+        );
+        assert_eq!(app.history.len(), 2);
+    }
+    #[test]
+    fn history_mismatch_diagnostics_count_loaded_data_without_remapping_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        let t = now();
+        app.history = Arc::new(vec![history("legacy-source", t, None, None)]);
+        app.date = local_day(t).unwrap();
+        live(&mut app, None, t, t + 86400);
+        assert!(app.matching_history().is_empty());
+        let message = app.empty_history_diagnostic().unwrap();
+        assert!(message.contains("已載入 1 筆"));
+        assert!(message.contains("所選日期有 1 筆"));
+        assert!(message.contains("來源 / 額度視窗"));
+        assert_eq!(app.history[0].source_key, "legacy-source");
+    }
+    #[test]
+    fn diagnostics_and_future_date_render_headlessly_without_changing_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.token_date = display_time::now_day().succ_opt().unwrap();
+        let selected_day = app.token_date;
+        app.import_error = Some("synthetic failure".into());
+        app.retain_import_warning("synthetic warning".into());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.token_ui(ui));
+        });
+        assert_eq!(app.token_date, selected_day);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.widget(ctx));
+        assert!(app.main_cache.tree.is_empty());
+        assert!(app.empty_task_status().contains("錯誤"));
+    }
+    #[test]
+    fn endpoint_mismatch_marks_only_coverage_partial_and_invalidates_live_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        let t = now();
+        let boundary = history("codex", t - 600, Some("same-account"), Some(t + 86400));
+        app.history = Arc::new(vec![boundary]);
+        let token = |id: &str, time, cost| TokenEvent {
+            id: id.into(),
+            timestamp: time,
+            coverage_start_timestamp_ms: None,
+            model: "synthetic".into(),
+            model_assumed: false,
+            reasoning_effort: None,
+            session: "synthetic-task".into(),
+            response_id: Some(id.into()),
+            turn_id: None,
+            source_kind: Some("token_usage_record".into()),
+            input: 1,
+            cached: 0,
+            uncached: 1,
+            output: 1,
+            reasoning: 0,
+            cost_usd: Some(cost),
+            partial_flags: vec![],
+        };
+        let events = vec![token("before", t - 700, 2.), token("after", t - 500, 3.)];
+        app.tokens = Arc::new(Snapshot {
+            usage_index: usage_views::UsageIndex::new(&events),
+            cost_index: accounting::CostIndex::new(&events),
+            events,
+            ..Snapshot::default()
+        });
+        app.quota.ingest_json(&serde_json::json!({"accountId":"same-account","rateLimits":{"primary":{"usedPercent":2,"windowDurationMins":10080,"resetsAt":t+86400}}}),t-1).unwrap();
+        app.refresh_main_cache();
+        assert_eq!(app.main_cache.cost.known_usd, 3.);
+        assert!(!app.main_cache.cost.partial);
+        assert_eq!(app.main_cache.tasks.len(), 1);
+        assert!(!app.main_cache.tasks[0].partial);
+        assert_eq!(app.main_cache.tasks[0].interval_cost_usd, Some(3.));
+        live(&mut app, Some("same-account"), t, t + 86400);
+        app.main_cache.key.as_mut().unwrap().minute = now() / 60;
+        app.refresh_main_cache();
+        assert_eq!(app.main_cache.cost.known_usd, 3.);
+        assert!(app.main_cache.cost.partial);
+        assert_eq!(app.main_cache.tasks[0].interval_cost_usd, Some(3.));
+        assert!(app.main_cache.tasks[0].partial);
+        assert!(app.main_cache.recent_tooltip.contains("缺少中間額度觀察"));
+        assert!(app
+            .main_cache
+            .recent_tooltip
+            .contains("不能當作完整的目前 1%"));
+        assert_eq!(
+            app.history.len(),
+            1,
+            "no intermediate history was fabricated"
+        );
+        assert_eq!(app.history[0].after, "98");
+    }
+    #[test]
+    fn endpoint_coverage_check_preserves_numeric_jitter_and_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        let t = now();
+        live(&mut app, None, t, t + 86400);
+        let mut view = app.selected().unwrap();
+        let mut event = history("codex", t - 600, None, None);
+        for (end, current, expected) in [
+            ("98", Some(98.), false),
+            ("98", Some(98.0000005), false),
+            ("98", Some(87.), true),
+            ("unknown", Some(87.), false),
+            ("NaN", Some(87.), false),
+            ("98", Some(f64::INFINITY), false),
+            ("98", None, false),
+        ] {
+            event.after = end.into();
+            view.remaining_percent = current;
+            assert_eq!(quota_endpoint_mismatch(Some(&event), Some(&view)), expected);
+        }
+        assert!(!quota_endpoint_mismatch(None, Some(&view)));
+        assert!(!quota_endpoint_mismatch(Some(&event), None));
+    }
+}
+
+#[cfg(test)]
+mod database_display_tests {
+    use super::*;
+    use quota_widget::{
+        db_view::{DailyView, DatabaseView},
+        tokens::TokenSummary,
+    };
+
+    fn app() -> WidgetApp {
+        let mut app = WidgetApp::new(
+            Settings {
+                import_enabled: false,
+                ..Default::default()
+            },
+            PathBuf::new(),
+            false,
+            false,
+            true,
+            vec![],
+        );
+        let t = now();
+        let latest = TokenStore::demo(t).events()[0].clone();
+        let rows = usage_views::group_with_excluded(&[&latest], GroupBy::Response, false);
+        let request = app.database_request(None, t).unwrap();
+        app.tokens = Arc::new(Snapshot {
+            database: Some(DatabaseView {
+                request,
+                database_path: PathBuf::from("synthetic.sqlite3"),
+                total_included: 50_000,
+                total_excluded: 23,
+                day_starts: BTreeSet::from([display_time::day_bounds(
+                    NaiveDate::from_ymd_opt(2001, 1, 2).unwrap(),
+                )
+                .unwrap()
+                .0]),
+                models: BTreeSet::from([
+                    "historical-only-model".into(),
+                    "codex-auto-review".into(),
+                ]),
+                main_tasks: vec![usage_views::TaskRow {
+                    task_id: latest.session.clone(),
+                    latest_event_index: 0,
+                    latest_timestamp: latest.timestamp,
+                    latest_cost_usd: Some(4.),
+                    interval_cost_usd: Some(12.),
+                    interval_events: 9,
+                    partial: false,
+                }],
+                main_cost: accounting::ObservedCost {
+                    known_usd: 12.,
+                    events: 9,
+                    ..Default::default()
+                },
+                daily: DailyView {
+                    rows,
+                    group_count: 1_001,
+                    summary: TokenSummary {
+                        event_count: 1_001,
+                        input: 123_456,
+                        cached: 100_000,
+                        output: 456,
+                        reasoning: 78,
+                        unpriced_events: 2,
+                        priced_cost_usd: 87.5,
+                        ..Default::default()
+                    },
+                },
+            }),
+            events: vec![latest],
+            ..Default::default()
+        });
+        app
+    }
+
+    #[test]
+    fn main_database_totals_do_not_use_tooltip_event_index() {
+        let mut app = app();
+        app.refresh_main_cache();
+        assert_eq!(app.main_cache.cost.known_usd, 12.);
+        assert_eq!(app.main_cache.tasks[0].interval_cost_usd, Some(12.));
+        assert!(!app.main_cache.loading);
+        assert_eq!(app.tokens.cost_index.observed(0, now()).events, 0);
+        assert_eq!(app.included_count(), 50_000);
+        assert_eq!(app.excluded_count(), 23);
+        assert_eq!(app.tokens.events.len(), 1);
+        let tip = app.task_tooltip(&app.main_cache.tasks[0]);
+        for field in [
+            "最新 Response:",
+            "Input:",
+            "Cached:",
+            "Uncached:",
+            "Output:",
+            "Reasoning:",
+            "香港時間:",
+        ] {
+            assert!(tip.contains(field), "missing {field}: {tip}");
+        }
+    }
+
+    #[test]
+    fn stale_boundary_never_relabels_old_cost_as_current() {
+        let mut app = app();
+        Arc::get_mut(&mut app.tokens)
+            .unwrap()
+            .database
+            .as_mut()
+            .unwrap()
+            .request
+            .boundary = Some(1);
+        app.refresh_main_cache();
+        assert!(app.main_cache.loading);
+        assert!(app.main_cache.cost.partial);
+        assert_eq!(app.main_cache.cost.known_usd, 0.);
+        assert_eq!(
+            app.main_cache.tasks.len(),
+            1,
+            "recent task identity stays visible"
+        );
+        assert_eq!(app.main_cache.tasks[0].interval_cost_usd, None);
+        assert_eq!(app.main_cache.tasks[0].latest_cost_usd, Some(4.));
+        assert!(app.main_cache.tasks[0].partial);
+        assert!(app.main_cache.recent_tooltip.contains("正在背景更新"));
+    }
+
+    #[test]
+    fn daily_page_uses_whole_day_summary_and_hides_stale_selection() {
+        let mut app = app();
+        app.refresh_token_cache();
+        assert!(!app.token_cache.loading);
+        assert_eq!(app.token_cache.rows.len(), 1);
+        assert_eq!(app.token_cache.count, 1_001);
+        assert_eq!(app.token_cache.group_count, 1_001);
+        assert_eq!(app.token_cache.input, 123_456);
+        assert_eq!(app.token_cache.cost, 87.5);
+        app.token_page = 1;
+        app.refresh_token_cache();
+        assert!(app.token_cache.loading);
+        assert!(app.token_cache.rows.is_empty());
+        assert_eq!(app.requested_view.as_ref().unwrap().page, 1);
+        Arc::get_mut(&mut app.tokens)
+            .unwrap()
+            .database
+            .as_mut()
+            .unwrap()
+            .request
+            .page = 1;
+        app.token_generation += 1;
+        app.accept_database_view();
+        app.refresh_token_cache();
+        assert!(!app.view_pending);
+        assert!(!app.token_cache.loading);
+        assert_eq!(app.token_cache.count, 1_001);
+        assert_eq!(app.token_cache.cost, 87.5);
+        app.token_date = app.token_date.pred_opt().unwrap();
+        app.refresh_token_cache();
+        assert!(app.token_cache.loading);
+        assert!(app.token_cache.rows.is_empty());
+    }
+
+    #[test]
+    fn database_requests_dedupe_and_track_all_selectors() {
+        let mut app = app();
+        let t = now() / 60 * 60;
+        app.request_database_view(None, t);
+        app.request_database_view(None, t + 1);
+        assert_eq!(app.requested_view.as_ref().unwrap().now, t);
+        app.token_group = GroupBy::Turn;
+        app.request_database_view(None, t + 1);
+        assert_eq!(app.requested_view.as_ref().unwrap().group, GroupBy::Turn);
+        app.show_excluded_records = true;
+        app.token_page = 2;
+        app.request_database_view(Some(123), t + 60);
+        let request = app.requested_view.as_ref().unwrap();
+        assert!(request.excluded);
+        assert_eq!(request.page, 2);
+        assert_eq!(request.page_size, 500);
+        assert_eq!(request.boundary, Some(123));
+        assert_eq!(request.now, t + 60);
+    }
+
+    #[test]
+    fn database_metadata_supplies_historical_days_and_models() {
+        let mut app = app();
+        let day = NaiveDate::from_ymd_opt(2001, 1, 2).unwrap();
+        assert!(app.days().contains(&day));
+        let choices = app.price_model_choices();
+        assert!(choices.contains("historical-only-model"));
+        assert!(choices.contains("codex-auto-review"));
+        assert!(app.import_diagnostic_text().contains("50000"));
+        assert!(app.import_diagnostic_text().contains("23"));
+    }
+
+    #[test]
+    fn main_scope_ignores_daily_page_but_requires_boundary_fallback_and_minute() {
+        let app = app();
+        let mut request = app.database_request(Some(100), 300).unwrap();
+        request.page = 9;
+        request.group = GroupBy::Task;
+        assert!(main_view_matches(&request, Some(100), app.demo_start, 359));
+        assert!(!main_view_matches(&request, Some(101), app.demo_start, 359));
+        assert!(!main_view_matches(
+            &request,
+            Some(100),
+            app.demo_start + 1,
+            359
+        ));
+        assert!(!main_view_matches(&request, Some(100), app.demo_start, 360));
+    }
+
+    #[test]
+    fn canonical_history_cost_keeps_partial_priced_subtotal() {
+        let event: HistoryEvent = serde_json::from_value(serde_json::json!({
+            "session":"synthetic", "observed_at_unix":1792252800,
+            "before_observed_at_unix":1792249200, "source_key":"codex",
+            "window_label":"week", "window_key":"primary", "epoch":0,
+            "kind":"QuotaDecrease", "before":"2", "after":"1", "delta":"1"
+        }))
+        .unwrap();
+        let mut interval = intervals::completed_intervals(&[], &[event]).remove(0);
+        interval.known_usd = 1937.2468;
+        interval.events = 2;
+        interval.unknown_cost_events = 1;
+        interval.partial = true;
+        assert_eq!(
+            canonical_interval_cost(Some(&interval)),
+            (Some(1937.2468), true)
+        );
+        interval.unknown_cost_events = 2;
+        assert_eq!(canonical_interval_cost(Some(&interval)), (None, true));
+        assert_eq!(canonical_interval_cost(None), (None, true));
+    }
+    #[test]
+    fn database_exports_read_whole_day_and_use_canonical_interval_subtotals() {
+        let temp = tempfile::tempdir().unwrap();
+        let day = display_time::now_day();
+        let (start, end) = display_time::day_bounds(day).unwrap();
+        let mut records = String::new();
+        for i in 0..603 {
+            let timestamp = if i == 601 {
+                start - 1
+            } else if i == 602 {
+                end
+            } else {
+                start + 100 + i
+            };
+            let model = if i == 600 {
+                "codex-auto-review"
+            } else {
+                "gpt-6-luna"
+            };
+            records.push_str(
+                &serde_json::json!({
+                    "timestamp":timestamp, "type":"token_usage_record",
+                    "payload":{"thread_id":"synthetic-export", "turn_id":format!("t-{i}"),
+                    "response_id":format!("r-{i}"), "model":model,
+                    "usage":{"input_tokens":1000, "cached_input_tokens":900,
+                    "output_tokens":100, "reasoning_output_tokens":50}}
+                })
+                .to_string(),
+            );
+            records.push('\n');
+        }
+        std::fs::write(temp.path().join("synthetic.jsonl"), records).unwrap();
+        let mut store = TokenStore::default();
+        store
+            .import_dir(temp.path(), &Pricing::official_standard())
+            .unwrap();
+        let legacy = temp.path().join("tokens.json");
+        store.save(&legacy).unwrap();
+        let database_path = {
+            let db = quota_widget::token_db::TokenDb::open_or_migrate(&legacy, true, &mut |_| {})
+                .unwrap()
+                .unwrap();
+            db.path().to_owned()
+        };
+        let mut app = app();
+        app.dir = temp.path().to_owned();
+        app.read_state = true;
+        app.token_date = day;
+        app.date = day;
+        Arc::get_mut(&mut app.tokens)
+            .unwrap()
+            .database
+            .as_mut()
+            .unwrap()
+            .database_path = database_path;
+        // The loaded GUI contains only one tooltip event; exports must not use it.
+        assert_eq!(app.tokens.events.len(), 1);
+        for audit in [false, true] {
+            app.show_excluded_records = audit;
+            app.export_day(true, true);
+            app.export_join.take().unwrap().join().unwrap();
+            assert!(app
+                .export_rx
+                .take()
+                .unwrap()
+                .recv()
+                .unwrap()
+                .starts_with("已匯出"));
+        }
+        let event: HistoryEvent = serde_json::from_value(serde_json::json!({
+            "session":"synthetic", "observed_at_unix":start + 1000,
+            "before_observed_at_unix":start + 1, "source_key":"codex",
+            "window_label":"week", "window_key":"primary", "epoch":0,
+            "kind":"QuotaDecrease", "before":"2", "after":"1", "delta":"1"
+        }))
+        .unwrap();
+        let mut interval =
+            intervals::completed_intervals(&[], std::slice::from_ref(&event)).remove(0);
+        interval.known_usd = 1937.2468;
+        interval.events = 2;
+        interval.unknown_cost_events = 1;
+        interval.partial = true;
+        app.history = Arc::new(vec![event]);
+        app.history_selection = Some(("codex".into(), Some("primary".into()), "week".into()));
+        app.set_intervals(Arc::new(vec![interval]));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
+        });
+        assert_eq!(app.history_cache.rows[0].1, Some(1937.2468));
+        assert!(app.history_cache.rows[0].2);
+        app.export_day(false, true);
+        app.export_join.take().unwrap().join().unwrap();
+        assert!(app
+            .export_rx
+            .take()
+            .unwrap()
+            .recv()
+            .unwrap()
+            .starts_with("已匯出"));
+        let mut files = 0;
+        for entry in std::fs::read_dir(temp.path().join("exports")).unwrap() {
+            let value: serde_json::Value = storage::load_json(&entry.unwrap().path()).unwrap();
+            assert_eq!(value["excluded_auto_review_records"], 1);
+            assert_eq!(value["date"], day.to_string());
+            match value["kind"].as_str().unwrap() {
+                "tokens" => {
+                    assert_eq!(value["events"].as_array().unwrap().len(), 600);
+                    assert!(value["events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|event| event["model"] != "codex-auto-review"));
+                }
+                "tokens-excluded" => {
+                    assert_eq!(value["events"].as_array().unwrap().len(), 1);
+                    assert_eq!(value["events"][0]["model"], "codex-auto-review");
+                }
+                "quota" => {
+                    assert_eq!(value["events"][0]["estimated_cost_usd"], 1937.2468);
+                    assert_eq!(value["events"][0]["partial"], true);
+                    assert_eq!(value["completed_intervals"][0]["known_usd"], 1937.2468);
+                }
+                kind => panic!("Unexpected export {kind}"),
+            }
+            files += 1;
+        }
+        assert_eq!(files, 3);
+    }
+    #[test]
+    fn initialized_persistent_gui_uses_database_after_lock_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let make = || {
+            WidgetApp::new(
+                Settings {
+                    import_enabled: false,
+                    ..Default::default()
+                },
+                temp.path().to_owned(),
+                true,
+                false,
+                true,
+                vec![],
+            )
+        };
+        let mut writer = make();
+        writer._lock = Some(DataLock::acquire(temp.path()).unwrap());
+        writer.database_mode = true;
+        writer.initialize();
+        for _ in 0..400 {
+            writer.pump();
+            if !writer.load_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!writer.load_pending, "database load did not complete");
+        assert!(
+            writer.tokens.database.is_some(),
+            "{}",
+            writer.import_status_text()
+        );
+        assert!(writer.persistent);
+        assert!(
+            writer.bridge.is_none(),
+            "offline synthetic test must not connect"
+        );
+        let mut reader = make();
+        reader.persistent = false;
+        reader.database_mode = true;
+        reader.initialize();
+        for _ in 0..400 {
+            reader.pump();
+            if !reader.load_pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!reader.load_pending);
+        assert!(
+            reader.tokens.database.is_some(),
+            "{}",
+            reader.import_status_text()
+        );
+        assert!(!reader.persistent);
+        assert!(reader._lock.is_none());
+        assert!(reader.bridge.is_none());
+    }
+    #[test]
+    fn long_context_export_labels_thresholds_without_changing_costs() {
+        let pricing = Pricing::official_standard();
+        for (input, expected) in [(271_999, false), (272_000, false), (272_001, true)] {
+            let cost = pricing.cost("gpt-6.1-sol", input - 200_000, 200_000, 100);
+            let mut value = serde_json::json!({
+                "model":"gpt-6.1-sol", "input":input, "cached":200_000,
+                "uncached":input - 200_000, "output":100,
+                "source_kind":"token_usage_record", "response_id":"r", "cost_usd":cost,
+                "partial_flags":[], "turn_input":999_999
+            });
+            let original_cost = value["cost_usd"].clone();
+            annotate_long_context_export(&mut value, &pricing);
+            assert_eq!(value["long_context_adjustment_enabled"], true);
+            assert_eq!(value["long_context_adjustment_applied"], expected);
+            assert_eq!(
+                value["long_context_adjustment"], true,
+                "legacy field stays a configuration alias"
+            );
+            assert_eq!(
+                value["long_context_adjustment_legacy_semantics"],
+                "deprecated_alias_of_long_context_adjustment_enabled"
+            );
+            assert_eq!(value["cost_usd"], original_cost);
+            let mut disabled = pricing.clone();
+            disabled.apply_long_context = false;
+            assert_eq!(
+                exported_long_context_applied(&value, &disabled),
+                Some(false)
+            );
+        }
+        let mut unknown = serde_json::json!({
+            "model":"gpt-6.1-sol", "input":300_000, "source_kind":"token_usage_record",
+            "cost_usd":null, "partial_flags":["input_count_unavailable"]
+        });
+        annotate_long_context_export(&mut unknown, &pricing);
+        assert!(unknown["long_context_adjustment_applied"].is_null());
+        assert!(unknown["cost_usd"].is_null());
+        let mut missing = unknown.clone();
+        missing.as_object_mut().unwrap().remove("input");
+        assert_eq!(exported_long_context_applied(&missing, &pricing), None);
+        let legacy = serde_json::json!({"model":"gpt-6.1-sol", "input":500_000, "source_kind":"token_count", "cost_usd":2.0});
+        assert_eq!(exported_long_context_applied(&legacy, &pricing), None);
+        let unsupported = serde_json::json!({"model":"codex-auto-review", "input":500_000, "source_kind":"token_usage_record", "cost_usd":null});
+        assert_eq!(
+            exported_long_context_applied(&unsupported, &pricing),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn actual_json_export_separates_enabled_and_applied_long_context_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let pricing = Pricing::official_standard();
+        let t = now();
+        let mut events = Vec::new();
+        for (index, input) in [271_999, 272_000, 272_001, 0].into_iter().enumerate() {
+            events.push(TokenEvent {
+                id: format!("r-{index}"),
+                timestamp: t,
+                coverage_start_timestamp_ms: None,
+                model: "gpt-6.1-sol".into(),
+                model_assumed: false,
+                reasoning_effort: None,
+                session: "synthetic-export".into(),
+                response_id: Some(format!("r-{index}")),
+                turn_id: Some("same-turn".into()),
+                source_kind: Some("token_usage_record".into()),
+                input,
+                cached: 0,
+                uncached: input,
+                output: 100,
+                reasoning: 50,
+                cost_usd: if index == 3 {
+                    None
+                } else {
+                    pricing.cost("gpt-6.1-sol", input, 0, 100)
+                },
+                partial_flags: if index == 3 {
+                    vec!["input_count_unavailable".into()]
+                } else {
+                    vec![]
+                },
+            });
+        }
+        let original_costs: Vec<_> = events.iter().map(|event| event.cost_usd).collect();
+        let mut app = WidgetApp::new(
+            Settings::default(),
+            temp.path().to_owned(),
+            true,
+            false,
+            true,
+            vec![],
+        );
+        app.token_date = local_day(t).unwrap();
+        app.tokens = Arc::new(Snapshot {
+            events,
+            pricing,
+            ..Default::default()
+        });
+        app.export_day(true, true);
+        app.export_join.take().unwrap().join().unwrap();
+        assert!(app
+            .export_rx
+            .take()
+            .unwrap()
+            .recv()
+            .unwrap()
+            .starts_with("已匯出"));
+        let path = std::fs::read_dir(temp.path().join("exports"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let value: serde_json::Value = storage::load_json(&path).unwrap();
+        assert_eq!(value["long_context_adjustment_enabled"], true);
+        for (index, applied) in [Some(false), Some(false), Some(true), None]
+            .into_iter()
+            .enumerate()
+        {
+            let event = &value["events"][index];
+            assert_eq!(
+                event["long_context_adjustment_applied"],
+                serde_json::json!(applied)
+            );
+            assert_eq!(event["long_context_adjustment_enabled"], true);
+            assert_eq!(event["cost_usd"], serde_json::json!(original_costs[index]));
+        }
+    }
+    #[test]
+    fn same_layout_key_retries_height_after_native_minimum_clamp() {
+        let mut layout = LayoutConvergence::default();
+        let t = Instant::now();
+        let old = (4, 10, 1188);
+        let new = (4, 10, 430);
+        layout.plan(old, Vec2::new(1188., 812.), 1400., false, t);
+        let first = layout.plan(
+            new,
+            Vec2::new(430., 812.),
+            510.,
+            false,
+            t + Duration::from_secs(1),
+        );
+        assert_eq!(first.minimum, Some(Vec2::new(276., 510.)));
+        assert!(
+            first.size.is_none(),
+            "apply the new minimum before resizing"
+        );
+        let second = layout.plan(
+            new,
+            Vec2::new(430., 812.),
+            510.,
+            false,
+            t + Duration::from_millis(1151),
+        );
+        assert!(
+            second.minimum.is_none(),
+            "same key does not resend the constraint"
+        );
+        assert_eq!(second.size, Some(Vec2::new(430., 510.)));
+        let early = layout.plan(
+            new,
+            Vec2::new(430., 812.),
+            510.,
+            false,
+            t + Duration::from_millis(1200),
+        );
+        assert!(early.size.is_none(), "backoff prevents resize storms");
+        let retry = layout.plan(
+            new,
+            Vec2::new(430., 812.),
+            510.,
+            false,
+            t + Duration::from_millis(1352),
+        );
+        assert_eq!(
+            retry.size,
+            Some(Vec2::new(430., 510.)),
+            "retry despite unchanged rows/width key"
+        );
+        let settled = layout.plan(
+            new,
+            Vec2::new(430., 510.),
+            510.,
+            false,
+            t + Duration::from_millis(1400),
+        );
+        assert!(settled.size.is_none());
+        assert!(settled.repaint_after.is_none());
+    }
+    #[test]
+    fn layout_waits_for_user_drag_and_changing_geometry_to_settle() {
+        let mut layout = LayoutConvergence::default();
+        let t = Instant::now();
+        let key = (4, 10, 430);
+        for millis in [0, 500, 1000] {
+            assert!(layout
+                .plan(
+                    key,
+                    Vec2::new(430., 812.),
+                    510.,
+                    true,
+                    t + Duration::from_millis(millis)
+                )
+                .size
+                .is_none());
+        }
+        assert!(layout
+            .plan(
+                key,
+                Vec2::new(430., 812.),
+                510.,
+                false,
+                t + Duration::from_millis(1100)
+            )
+            .size
+            .is_none());
+        assert_eq!(
+            layout
+                .plan(
+                    key,
+                    Vec2::new(430., 812.),
+                    510.,
+                    false,
+                    t + Duration::from_millis(1151)
+                )
+                .size,
+            Some(Vec2::new(430., 510.))
+        );
+        // Native keyboard/edge resizing can omit pointer events. Geometry alone
+        // must postpone corrective requests until the resize stops.
+        for (millis, height) in [(1200, 800.), (1300, 790.), (1400, 780.)] {
+            assert!(layout
+                .plan(
+                    key,
+                    Vec2::new(430., height),
+                    510.,
+                    false,
+                    t + Duration::from_millis(millis)
+                )
+                .size
+                .is_none());
+        }
+        assert_eq!(
+            layout
+                .plan(
+                    key,
+                    Vec2::new(430., 780.),
+                    510.,
+                    false,
+                    t + Duration::from_millis(1551)
+                )
+                .size,
+            Some(Vec2::new(430., 510.))
+        );
+    }
+    #[test]
+    fn layout_retries_are_bounded_and_new_user_size_restarts_convergence() {
+        let mut layout = LayoutConvergence::default();
+        let t = Instant::now();
+        let key = (4, 10, 430);
+        layout.plan(key, Vec2::new(430., 812.), 510., false, t);
+        for attempt in 0..LayoutConvergence::MAX_ATTEMPTS {
+            assert!(layout
+                .plan(
+                    key,
+                    Vec2::new(430., 812.),
+                    510.,
+                    false,
+                    t + Duration::from_secs(1 + u64::from(attempt) * 2)
+                )
+                .size
+                .is_some());
+        }
+        let exhausted = layout.plan(
+            key,
+            Vec2::new(430., 812.),
+            510.,
+            false,
+            t + Duration::from_secs(100),
+        );
+        assert!(exhausted.size.is_none());
+        assert!(exhausted.repaint_after.is_none());
+        let new = (4, 10, 450);
+        assert!(layout
+            .plan(
+                new,
+                Vec2::new(450., 812.),
+                530.,
+                false,
+                t + Duration::from_secs(101)
+            )
+            .minimum
+            .is_some());
+        assert_eq!(
+            layout
+                .plan(
+                    new,
+                    Vec2::new(450., 812.),
+                    530.,
+                    false,
+                    t + Duration::from_secs(102)
+                )
+                .size,
+            Some(Vec2::new(450., 530.))
+        );
+        layout.plan(
+            new,
+            Vec2::new(450., 530.),
+            530.,
+            false,
+            t + Duration::from_secs(103),
+        );
+        layout.plan(
+            new,
+            Vec2::new(450., 700.),
+            530.,
+            false,
+            t + Duration::from_secs(104),
+        );
+        assert_eq!(
+            layout
+                .plan(
+                    new,
+                    Vec2::new(450., 700.),
+                    530.,
+                    false,
+                    t + Duration::from_secs(105)
+                )
+                .size,
+            Some(Vec2::new(450., 530.))
+        );
     }
 }

@@ -1,7 +1,8 @@
 //! Account-rate-limit normalization and continuous-observation state.
 //!
 //! Metadata changes are not replenishments. Only an observed, nonzero increase
-//! in remaining quota emits `QuotaReset`; source/window boundaries only reset
+//! in remaining quota emits `QuotaReset`, except the user's exact one-point
+//! same-cycle rebound policy; source/window boundaries only reset
 //! the estimator. Persisted history is never used to seed live rate estimates.
 use crate::prediction::{self, DropSample, Prediction, PredictionContext};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,25 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CONTINUITY_GAP_SECONDS: i64 = 90;
 pub const MAX_DROP_SAMPLES: usize = 120;
 const PERCENT_EPSILON: f64 = 0.000001;
+
+pub(crate) fn quota_deadline_rollover(before: Option<i64>, after: Option<i64>, at: i64) -> bool {
+    before.zip(after).is_some_and(|(before, after)| {
+        before <= at && after > at && after.saturating_sub(before) > 90
+    })
+}
+
+/// User policy: a same-cycle exact +1pp cached rebound is canonicalized to the
+/// last accepted value. Fractional/larger rises and proven new cycles are kept.
+pub(crate) fn ignored_one_point_rebound(
+    before: f64,
+    after: f64,
+    before_reset: Option<i64>,
+    reset: Option<i64>,
+    at: i64,
+) -> bool {
+    (after - before - 1.0).abs() <= PERCENT_EPSILON
+        && !quota_deadline_rollover(before_reset, reset, at)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HistoryKind {
@@ -199,6 +219,9 @@ struct WindowState {
     used_percent: Option<f64>,
     duration: Option<i64>,
     reset_at: Option<i64>,
+    // Retain rollover evidence if an unchanged poll publishes the next deadline
+    // before the corresponding quota rise is observed.
+    reset_evidence_at: Option<i64>,
     observed_at: i64,
     epoch: u64,
     valid: bool,
@@ -246,6 +269,20 @@ impl Default for QuotaModel {
 }
 
 impl QuotaModel {
+    /// Identity supplied by the official live payload, when available. Used to
+    /// reject incompatible historical boundaries; never inferred from a source
+    /// slot, task ID, or reset timestamp.
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
+    }
+
+    /// An explicit account-change notification invalidates the prior identity,
+    /// even if subsequent quota payloads omit the optional account ID.
+    pub fn account_changed(&mut self) {
+        self.account_id = None;
+        self.reset_continuity();
+    }
+
     pub fn new(session: impl Into<String>) -> Self {
         Self {
             session: session.into(),
@@ -341,6 +378,17 @@ impl QuotaModel {
                     used_percent: incoming.used_percent,
                     duration,
                     reset_at: incoming.reset_at,
+                    reset_evidence_at: old
+                        .as_ref()
+                        .filter(|old| {
+                            old.available
+                                && old.baseline_ready
+                                && (old.duration.is_none()
+                                    || duration.is_none()
+                                    || old.duration == duration)
+                        })
+                        .and_then(|old| old.reset_evidence_at.or(old.reset_at))
+                        .or(incoming.reset_at),
                     observed_at,
                     epoch: old.as_ref().map_or(0, |old| old.epoch),
                     valid: incoming.valid,
@@ -362,7 +410,52 @@ impl QuotaModel {
                         && gap <= CONTINUITY_GAP_SECONDS
                         && compatible_duration;
                     let both = old.used_percent.zip(state.used_percent);
-                    if continuous && gap == 0 {
+                    let ignored_rebound = old.available
+                        && old.baseline_ready
+                        && old.valid
+                        && state.valid
+                        && compatible_duration
+                        && both.is_some_and(|(before, after)| {
+                            ignored_one_point_rebound(
+                                100.0 - before,
+                                100.0 - after,
+                                old.reset_evidence_at.or(old.reset_at),
+                                state.reset_at,
+                                observed_at,
+                            )
+                        });
+                    if ignored_rebound {
+                        // Keep the raw reported endpoints for audit, but never
+                        // expose this row as a confirmed reset/accounting boundary.
+                        if let Some(endpoints) = both {
+                            let mut evidence = quota_event(
+                                &self.session,
+                                &state,
+                                HistoryKind::QuotaReset,
+                                endpoints,
+                                old.observed_at,
+                                old.reset_at,
+                                !continuous,
+                            );
+                            evidence.reconciliation =
+                                Some(HistoryReconciliation::UncertainRecovery);
+                            self.history.push(evidence);
+                        }
+                        state.used_percent = old.used_percent;
+                        state.reset_at = old.reset_at.or(state.reset_at);
+                        state.reset_due = state.reset_at.is_some_and(|reset| reset <= observed_at);
+                        if continuous {
+                            state.drops = old.drops;
+                        } else if gap > CONTINUITY_GAP_SECONDS {
+                            // A real coverage gap still invalidates the estimator;
+                            // it is not evidence of quota replenishment.
+                            state.epoch = state.epoch.saturating_add(1);
+                        }
+                        report.warnings.push(format!(
+                            "ignored_same_cycle_one_point_rebound:{}/{}",
+                            state.source_key, state.window_key
+                        ));
+                    } else if continuous && gap == 0 {
                         if both.is_some_and(|(before, after)| {
                             (after - before).abs() <= PERCENT_EPSILON
                         }) {
@@ -379,6 +472,7 @@ impl QuotaModel {
                         if let Some((before_used, after_used)) = both {
                             let change = after_used - before_used;
                             if change < -PERCENT_EPSILON {
+                                state.reset_evidence_at = state.reset_at;
                                 state.epoch = state.epoch.saturating_add(1);
                                 state.drops.clear();
                                 self.history.push(quota_event(
@@ -387,7 +481,7 @@ impl QuotaModel {
                                     HistoryKind::QuotaReset,
                                     (before_used, after_used),
                                     old.observed_at,
-                                    old.reset_at,
+                                    old.reset_evidence_at.or(old.reset_at),
                                     false,
                                 ));
                             } else if old.reset_due || state.reset_due {
@@ -446,13 +540,20 @@ impl QuotaModel {
                                     } else {
                                         HistoryKind::QuotaReset
                                     };
+                                    if kind == HistoryKind::QuotaReset {
+                                        state.reset_evidence_at = state.reset_at;
+                                    }
                                     self.history.push(quota_event(
                                         &self.session,
                                         &state,
                                         kind,
                                         (before_used, after_used),
                                         old.observed_at,
-                                        old.reset_at,
+                                        if kind == HistoryKind::QuotaReset {
+                                            old.reset_evidence_at.or(old.reset_at)
+                                        } else {
+                                            old.reset_at
+                                        },
                                         true,
                                     ));
                                 }

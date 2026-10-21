@@ -113,6 +113,7 @@ fn event(timestamp: i64, cost: Option<f64>) -> TokenEvent {
         output: 3,
         reasoning: 1,
         cost_usd: cost,
+        coverage_start_timestamp_ms: None,
         partial_flags: Vec::new(),
     }
 }
@@ -235,7 +236,16 @@ fn cli_counts_equal_distinct_requests_once_and_does_not_persist_conversation_tex
         assert_eq!(row["model_assumed"], true);
         assert!((row["cost_usd"].as_f64().unwrap() - 0.000035).abs() < 1e-12);
     }
-    for contents in [result.to_string(), fs::read_to_string(state).unwrap()] {
+    let persisted = quota_widget::token_db::TokenDb::open_readonly(
+        &quota_widget::token_db::TokenDb::database_path(&state),
+    )
+    .unwrap()
+    .export_store()
+    .unwrap();
+    for contents in [
+        result.to_string(),
+        serde_json::to_string(&persisted).unwrap(),
+    ] {
         assert!(!contents.contains("SYNTHETIC_CONVERSATION_MUST_NOT_BE_STORED"));
     }
 }
