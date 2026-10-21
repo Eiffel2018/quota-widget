@@ -2084,7 +2084,7 @@ impl WidgetApp {
                 ViewportId::from_hash_of("quota-history"),
                 ViewportBuilder::default()
                     .with_title("Quota Widget · 扣額紀錄")
-                    .with_inner_size([1160., 650.])
+                    .with_inner_size([900., 650.])
                     .with_min_inner_size([560., 400.]),
                 |ctx, _| {
                     if ctx.input(|i| i.viewport().close_requested()) {
@@ -2408,9 +2408,10 @@ impl WidgetApp {
                         interval.percentage_points
                     ));
                     ui.strong(format!(
-                        "區間 Token 小計 {}{}",
-                        money(Some(interval.known_usd)),
-                        if interval.partial { " *" } else { "" }
+                        "區間 Token 小計 {}",
+                        self.interval_presentations
+                            [self.interval_lookup[&interval.history_event_key]]
+                            .observed_total
                     ));
                     if let Some(&index) = self.interval_lookup.get(&interval.history_event_key) {
                         let view = &self.interval_presentations[index];
@@ -2497,24 +2498,20 @@ impl WidgetApp {
             return;
         }
         let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
-        const X: [f32; 9] = [0., 90., 260., 430., 525., 675., 840., 1030., 1200.];
-        const WIDTH: [f32; 9] = [80., 160., 160., 85., 140., 155., 180., 160., 80.];
+        const X: [f32; 5] = [0., 90., 260., 430., 525.];
+        const WIDTH: [f32; 5] = [80., 160., 160., 85., 140.];
         egui::ScrollArea::horizontal()
             .id_salt("interval-table-horizontal")
             .show(ui, |ui| {
-                ui.set_min_width(1280. * scale);
+                ui.set_min_width(675. * scale);
                 let (header, _) =
-                    ui.allocate_exact_size(Vec2::new(1280. * scale, 26. * scale), Sense::hover());
+                    ui.allocate_exact_size(Vec2::new(675. * scale, 26. * scale), Sense::hover());
                 for (i, title) in [
                     "額度變化",
                     "開始（香港）",
                     "結束（香港）",
                     "歷時",
-                    "扣額統一估算 USD",
-                    "統一 USD / 百分點",
-                    "估算狀態",
-                    "區間 Token 小計 USD",
-                    "模型",
+                    "估算 USD",
                 ]
                 .iter()
                 .enumerate()
@@ -2540,19 +2537,22 @@ impl WidgetApp {
                                 let interval = &self.intervals[index];
                                 let view = &self.interval_presentations[index];
                                 let (rect, response) = ui.allocate_exact_size(
-                                    Vec2::new(1280. * scale, 42. * scale),
-                                    Sense::hover(),
+                                    Vec2::new(675. * scale, 42. * scale),
+                                    Sense::click(),
                                 );
-                                response.on_hover_text(&view.tooltip);
+                                if response
+                                    .on_hover_text(format!("{}\n點擊查看詳情", view.tooltip))
+                                    .clicked()
+                                {
+                                    self.selected_interval =
+                                        Some(interval.history_event_key.clone());
+                                }
                                 let cells = [
                                     &view.change,
                                     &view.start,
                                     &view.end,
                                     &view.duration,
                                     &view.total,
-                                    &view.per_point,
-                                    &view.status,
-                                    &view.observed_total,
                                 ];
                                 for (i, text) in cells.iter().enumerate() {
                                     ui.put(
@@ -2571,19 +2571,6 @@ impl WidgetApp {
                                         .truncate(),
                                     )
                                     .on_hover_text(&view.tooltip);
-                                }
-                                if ui
-                                    .put(
-                                        Rect::from_min_size(
-                                            rect.min + Vec2::new(X[8] * scale, 2.),
-                                            Vec2::new(76. * scale, 26. * scale),
-                                        ),
-                                        egui::Button::new("模型分項"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.selected_interval =
-                                        Some(interval.history_event_key.clone());
                                 }
                                 ui.painter().hline(
                                     rect.x_range(),

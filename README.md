@@ -1,9 +1,14 @@
-# Quota Widget 0.3.10
+# Quota Widget 0.3.11
 
-修正釘選工作列後圖示消失：Windows EXE 內嵌 16–256 像素的原有圖示，
-固定部署位置亦提供 `quota-widget.ico` 供捷徑使用。
+新扣額紀錄可沿用有效的歷史每百分點估值；只讀視窗在原持有者關閉後會自動恢復匯入。
+扣額表格縮成五欄，點擊紀錄可查看 Token、模型及估算詳情。
 
-[更新說明](docs/RELEASE-0.3.10.md) · [Windows 驗證](VALIDATION-0.3.10.md)
+[更新說明](docs/RELEASE-0.3.11.md) · [Windows 驗證](VALIDATION-0.3.11.md)
+
+## 0.3.10
+
+修正 Windows 工作列釘選圖示，提供固定 EXE 及圖示路徑。
+[更新說明](docs/RELEASE-0.3.10.md)
 
 ## 0.3.9
 
