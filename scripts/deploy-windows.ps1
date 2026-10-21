@@ -8,6 +8,10 @@ $quotaDestination = [IO.Path]::GetFullPath($DestinationDirectory)
 $quotaExecutable = Join-Path $quotaDestination 'quota-widget.exe'
 if ($quotaSource -eq $quotaExecutable) { throw 'Source and installed executable must differ.' }
 New-Item -ItemType Directory -Path $quotaDestination -Force | Out-Null
+$quotaIcon = Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\icon.ico'
+if (Test-Path -LiteralPath $quotaIcon) {
+    Copy-Item -LiteralPath $quotaIcon -Destination (Join-Path $quotaDestination 'quota-widget.ico') -Force
+}
 $quotaIncoming = Join-Path $quotaDestination 'quota-widget.next.exe'
 $quotaPrevious = Join-Path $quotaDestination 'quota-widget.previous.exe'
 $quotaHash = (Get-FileHash -LiteralPath $quotaSource -Algorithm SHA256).Hash

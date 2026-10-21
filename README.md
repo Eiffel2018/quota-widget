@@ -1,4 +1,9 @@
-# Quota Widget 0.3.9
+# Quota Widget 0.3.10
+
+修正釘選工作列後圖示消失：Windows EXE 內嵌 16–256 像素的原有圖示，
+固定部署位置亦提供 `quota-widget.ico` 供捷徑使用。
+
+## 0.3.9
 
 同一連續額度區間共用一致的每百分點估值，原始 Token 小計另列保留。
 資料覆蓋不完整時標示下限；支援 Windows ImDisk RAM Drive。
