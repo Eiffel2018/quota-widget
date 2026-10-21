@@ -31,6 +31,42 @@ impl HistoryKind {
     }
 }
 
+/// Provenance is evidence about an observation, never a server-issued sequence.
+/// JSONL timestamps identify when a cached value was logged, not when fetched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HistoryEvidence {
+    #[serde(default)]
+    pub imported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_origin_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_observed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_reset_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_duration_mins: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryReconciliation {
+    /// Cached log snapshots disagree. This is not a confirmed replenishment or
+    /// a usable accounting boundary; original evidence remains in raw history.
+    UncertainRecovery,
+    /// Independent observations in one instant have no defensible ordering.
+    ConflictingObservation,
+}
+
 /// Compatible with the recovered version-1 history event shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistoryEvent {
@@ -51,6 +87,11 @@ pub struct HistoryEvent {
     pub before_observed_at_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<HistoryEvidence>,
+    /// Set on a derived presentation only, never required to load old history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<HistoryReconciliation>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,9 +350,9 @@ impl QuotaModel {
                                     &self.session,
                                     &state,
                                     HistoryKind::QuotaReset,
-                                    before_used,
-                                    after_used,
+                                    (before_used, after_used),
                                     old.observed_at,
+                                    old.reset_at,
                                     false,
                                 ));
                             } else if old.reset_due || state.reset_due {
@@ -325,9 +366,9 @@ impl QuotaModel {
                                         &self.session,
                                         &state,
                                         HistoryKind::QuotaDecrease,
-                                        before_used,
-                                        after_used,
+                                        (before_used, after_used),
                                         old.observed_at,
+                                        old.reset_at,
                                         true,
                                     ));
                                 }
@@ -336,9 +377,9 @@ impl QuotaModel {
                                     &self.session,
                                     &state,
                                     HistoryKind::QuotaDecrease,
-                                    before_used,
-                                    after_used,
+                                    (before_used, after_used),
                                     old.observed_at,
+                                    old.reset_at,
                                     false,
                                 ));
                                 state.drops.push(DropSample {
@@ -374,9 +415,9 @@ impl QuotaModel {
                                         &self.session,
                                         &state,
                                         kind,
-                                        before_used,
-                                        after_used,
+                                        (before_used, after_used),
                                         old.observed_at,
+                                        old.reset_at,
                                         true,
                                     ));
                                 }
@@ -484,6 +525,11 @@ impl QuotaModel {
                 state.available = false;
                 state.baseline_ready = false;
                 state.drops.clear();
+            }
+        }
+        for event in &mut self.history[history_before..] {
+            if let Some(evidence) = &mut event.evidence {
+                evidence.account_id = self.account_id.clone();
             }
         }
         report.events_added = self.history.len().saturating_sub(history_before);
@@ -611,11 +657,12 @@ fn quota_event(
     session: &str,
     state: &WindowState,
     kind: HistoryKind,
-    before_used: f64,
-    after_used: f64,
+    endpoints: (f64, f64),
     before_observed_at: i64,
+    before_reset_at: Option<i64>,
     partial: bool,
 ) -> HistoryEvent {
+    let (before_used, after_used) = endpoints;
     HistoryEvent {
         session: session.into(),
         observed_at_unix: state.observed_at,
@@ -629,6 +676,13 @@ fn quota_event(
         partial,
         before_observed_at_unix: Some(before_observed_at),
         window_key: Some(state.window_key.clone()),
+        evidence: Some(HistoryEvidence {
+            before_reset_at,
+            reset_at: state.reset_at,
+            window_duration_mins: state.duration,
+            ..HistoryEvidence::default()
+        }),
+        reconciliation: None,
     }
 }
 fn credit_event(
@@ -654,9 +708,11 @@ fn credit_event(
         partial,
         before_observed_at_unix: Some(before_observed_at),
         window_key: Some("credits".into()),
+        evidence: Some(HistoryEvidence::default()),
+        reconciliation: None,
     }
 }
-fn percent_text(value: f64) -> String {
+pub(crate) fn percent_text(value: f64) -> String {
     let value = if value.abs() < PERCENT_EPSILON {
         0.0
     } else {
@@ -675,6 +731,41 @@ fn window_label(key: &str, duration: Option<i64>) -> String {
         Some(minutes) => format!("{minutes} 分鐘"),
         None => if key == "primary" { "主要" } else { "次要" }.into(),
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HistoricalWindow {
+    pub account_id: Option<String>,
+    pub source_key: String,
+    pub window_key: String,
+    pub window_label: String,
+    pub remaining: String,
+    pub duration: Option<i64>,
+    pub reset_at: Option<i64>,
+}
+
+pub(crate) fn historical_windows(payload: &Value) -> Result<Vec<HistoricalWindow>, String> {
+    let observation = parse_observation(payload)?;
+    let mut result = Vec::new();
+    for source in observation.sources {
+        for window in source.windows {
+            if !window.valid {
+                continue;
+            }
+            if let Some(used) = window.used_percent {
+                result.push(HistoricalWindow {
+                    account_id: observation.account_id.clone(),
+                    source_key: source.key.clone(),
+                    window_label: window_label(&window.key, window.duration),
+                    window_key: window.key,
+                    remaining: percent_text(100.0 - used),
+                    duration: window.duration,
+                    reset_at: window.reset_at,
+                });
+            }
+        }
+    }
+    Ok(result)
 }
 
 struct Observation {
@@ -861,6 +952,10 @@ fn number(value: &Value) -> Option<f64> {
         _ => None,
     }
     .filter(|number| number.is_finite())
+}
+
+pub(crate) fn decimal_text(text: &str) -> Option<String> {
+    Decimal::parse(text).map(|value| value.text())
 }
 
 /// Small bounded nonnegative decimal implementation for exact credit history.

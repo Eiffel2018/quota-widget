@@ -1,6 +1,6 @@
 [package]
 name = "quota-widget"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Read-only native Codex quota and local token usage widget"

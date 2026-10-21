@@ -7,7 +7,7 @@
 use chrono::{DateTime, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,13 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_ASSUMED_MODEL: &str = "gpt-6.1-sol";
 pub const DEFAULT_BROWSE_DAYS: i64 = 30;
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
-const STORE_VERSION: u32 = 2;
+const STORE_VERSION: u32 = 3;
+// Independent of the storage schema: rebuild derived model attribution once when
+// opening old caches, without dropping raw observations or trusting old offsets.
+const NORMALIZATION_VERSION: u32 = 1;
+const AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+const AUTO_REVIEW_EXCLUDED: &str = "excluded_recorded_codex_auto_review";
+const UNATTRIBUTED_MODEL: &str = "unattributed-model";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelPrice {
@@ -113,6 +119,14 @@ impl Pricing {
                 output_per_million: 0.50,
             },
         );
+        p.rates.insert(
+            "gpt-6-astra".into(),
+            ModelPrice {
+                uncached_input_per_million: 10.0,
+                cached_input_per_million: 1.0,
+                output_per_million: 50.0,
+            },
+        );
         p
     }
     pub fn official_fast() -> Self {
@@ -139,7 +153,7 @@ impl Pricing {
             return None;
         }
         let long = self.apply_long_context
-            && matches!(model, "gpt-6.1-sol" | "gpt-6-luna")
+            && matches!(model, "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra")
             && uncached.saturating_add(cached) > 272_000;
         let input_multiplier = if long { 2.0 } else { 1.0 };
         let output_multiplier = if long { 1.5 } else { 1.0 };
@@ -185,7 +199,16 @@ impl TokenEvent {
         self.input.saturating_add(self.output)
     }
     pub fn is_partial(&self) -> bool {
-        !self.partial_flags.is_empty()
+        self.partial_flags
+            .iter()
+            .any(|flag| flag != AUTO_REVIEW_EXCLUDED)
+    }
+    /// Derived from the exact recorded model BEFORE model overrides. This audit
+    /// marker survives saved caches and repricing; task names never classify usage.
+    pub fn is_excluded_auto_review(&self) -> bool {
+        self.partial_flags
+            .iter()
+            .any(|flag| flag == AUTO_REVIEW_EXCLUDED)
     }
 }
 
@@ -195,10 +218,31 @@ pub struct ImportedQuotaObservation {
     pub timestamp: i64,
     /// The actual `rate_limits` object, without a synthetic wrapper or modifications.
     pub payload: Value,
+    /// Logical thread that logged the snapshot, not a claim of account ownership.
+    #[serde(default)]
+    pub origin_session: Option<String>,
+    /// Stable hash of the explicitly selected source path; never a raw path.
+    #[serde(default)]
+    pub source_id: Option<String>,
+    /// Log-write timestamp precision. This is NOT the quota provider's fetch time.
+    #[serde(default)]
+    pub timestamp_ms: Option<i64>,
+}
+/// Latest turn counters for a task tooltip. `None` means unavailable, never zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskTurnUsage {
+    pub turn_id: Option<String>,
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub recorded_snapshot: bool,
+    pub partial: bool,
+    pub timestamp: Option<i64>,
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ImportReport {
     pub files_scanned: usize,
+    /// Metadata-only fast path; no file was opened, hashed, or JSON-parsed.
+    pub files_unchanged: usize,
     pub lines_read: usize,
     pub events_added: usize,
     pub duplicate_observations: usize,
@@ -278,7 +322,7 @@ impl Counts {
         self
     }
 }
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct SourceCursor {
     offset: u64,
@@ -290,9 +334,18 @@ struct SourceCursor {
     session: Option<String>,
     turn_id: Option<String>,
     model: Option<String>,
+    model_timestamp_ms: Option<i64>,
+    model_turn_id: Option<String>,
     observed_len: u64,
     modified_ns: Option<u64>,
     file_identity: Option<String>,
+    /// Unix ctime catches same-size rewrites even if mtime is deliberately restored.
+    changed_ns: Option<i128>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RawTurnCounts {
+    input: Option<u64>,
+    output: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UsageObservation {
@@ -311,10 +364,17 @@ struct UsageObservation {
     /// Cumulative snapshots are overlap evidence, never additive events.
     #[serde(default)]
     turn_total: Option<Counts>,
+    /// Preserve missing raw turn fields separately from normalized arithmetic.
+    #[serde(default)]
+    raw_turn_counts: Option<RawTurnCounts>,
     #[serde(default)]
     thread_total: Option<Counts>,
     model: Option<String>,
     source_model: Option<String>,
+    #[serde(default)]
+    source_model_timestamp_ms: Option<i64>,
+    #[serde(default)]
+    source_model_turn_id: Option<String>,
     total: Option<Counts>,
     last: Option<Counts>,
     flags: Vec<String>,
@@ -328,27 +388,154 @@ struct ModelContext {
     model: String,
 }
 
+/// Recorded attribution is independent of whichever pricing override is selected.
+/// Per-turn evidence wins over a later unrelated turn's file cursor. Captured
+/// source timestamps preserve same-millisecond ordering without trusting file order.
+struct RecordedModels<'a> {
+    sessions: BTreeMap<&'a str, Vec<&'a ModelContext>>,
+    turns: BTreeMap<(&'a str, &'a str), Vec<&'a ModelContext>>,
+}
+impl<'a> RecordedModels<'a> {
+    fn new(contexts: &'a [ModelContext]) -> Self {
+        let mut result = Self {
+            sessions: BTreeMap::new(),
+            turns: BTreeMap::new(),
+        };
+        for context in contexts {
+            result
+                .sessions
+                .entry(&context.session)
+                .or_default()
+                .push(context);
+            if let Some(turn) = context.turn_id.as_deref() {
+                result
+                    .turns
+                    .entry((&context.session, turn))
+                    .or_default()
+                    .push(context);
+            }
+        }
+        result
+    }
+    fn recorded<'b>(&'b self, row: &'b UsageObservation) -> Option<&'b str> {
+        if let Some(model) = row.model.as_deref() {
+            return Some(model);
+        }
+        fn latest<'a>(rows: &[&'a ModelContext], timestamp_ms: i64) -> Option<&'a ModelContext> {
+            rows.partition_point(|context| context.timestamp_ms <= timestamp_ms)
+                .checked_sub(1)
+                .map(|index| rows[index])
+        }
+        let turn_context = row
+            .turn_id
+            .as_deref()
+            .and_then(|turn| self.turns.get(&(row.session.as_str(), turn)))
+            .and_then(|rows| latest(rows, row.timestamp_ms));
+        let source_matches_turn =
+            row.source_model_turn_id.is_none() || row.source_model_turn_id == row.turn_id;
+        if let Some(context) = turn_context {
+            // Explicit turn context is stronger than a cursor belonging to some
+            // other turn. For ties, source order identifies the actual request.
+            if source_matches_turn
+                && row.source_model.is_some()
+                && (row
+                    .source_model_timestamp_ms
+                    .is_some_and(|time| time >= context.timestamp_ms)
+                    || (row.source_model_timestamp_ms.is_none()
+                        && row.source_model.as_deref() == Some(context.model.as_str())))
+            {
+                return row.source_model.as_deref();
+            }
+            return Some(&context.model);
+        }
+        let context = self
+            .sessions
+            .get(row.session.as_str())
+            .and_then(|rows| latest(rows, row.timestamp_ms));
+        if source_matches_turn {
+            if let Some(source) = row.source_model.as_deref() {
+                if context.is_none_or(|context| {
+                    row.source_model_timestamp_ms
+                        .is_none_or(|time| time >= context.timestamp_ms)
+                }) {
+                    return Some(source);
+                }
+            }
+        }
+        context.map(|context| context.model.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecordedTaskName {
+    name: String,
+    timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RecordedTaskParent {
+    /// None preserves explicitly conflicting evidence without inventing an edge.
+    parent: Option<String>,
+    timestamp_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TokenStore {
     version: u32,
+    #[serde(default)]
+    normalization_version: u32,
+    recorded_task_models: BTreeMap<String, BTreeSet<String>>,
     sources: BTreeMap<String, SourceCursor>,
     observations: Vec<UsageObservation>,
     contexts: Vec<ModelContext>,
     events: Vec<TokenEvent>,
     quota: Vec<ImportedQuotaObservation>,
     last_pricing: Option<Pricing>,
+    revision: u64,
+    recorded_names: BTreeMap<String, RecordedTaskName>,
+    recorded_parents: BTreeMap<String, RecordedTaskParent>,
+    metadata_path: Option<String>,
+    metadata_cursor: SourceCursor,
+    metadata_names: BTreeMap<String, String>,
+    // Rebuild once, lazily, after deserialization. Never clone all history each poll.
+    #[serde(skip)]
+    indexes_ready: bool,
+    #[serde(skip)]
+    known_observations: HashMap<String, usize>,
+    #[serde(skip)]
+    known_quota: BTreeSet<String>,
+    #[serde(skip)]
+    legacy_quota: BTreeMap<String, usize>,
+    #[serde(skip)]
+    mixed_schema_warning: bool,
+    #[serde(skip)]
+    usage_dirty: bool,
 }
 impl Default for TokenStore {
     fn default() -> Self {
         Self {
             version: STORE_VERSION,
+            normalization_version: NORMALIZATION_VERSION,
+            recorded_task_models: BTreeMap::new(),
             sources: BTreeMap::new(),
             observations: Vec::new(),
             contexts: Vec::new(),
             events: Vec::new(),
             quota: Vec::new(),
             last_pricing: None,
+            revision: 0,
+            recorded_names: BTreeMap::new(),
+            recorded_parents: BTreeMap::new(),
+            metadata_path: None,
+            metadata_cursor: SourceCursor::default(),
+            metadata_names: BTreeMap::new(),
+            indexes_ready: false,
+            known_observations: HashMap::new(),
+            known_quota: BTreeSet::new(),
+            legacy_quota: BTreeMap::new(),
+            mixed_schema_warning: false,
+            usage_dirty: false,
         }
     }
 }
@@ -358,16 +545,40 @@ impl TokenStore {
             Ok(file) => {
                 let mut store: Self =
                     serde_json::from_reader(BufReader::new(file)).map_err(invalid_data)?;
-                if store.version == 1 {
-                    // v1 cursors may be beyond records that the old parser ignored.
+                if matches!(store.version, 1 | 2) {
+                    // v1 skipped response records; v2 skipped official names and
+                    // quota provenance. Replay selected roots once, retaining history.
                     // Replay only the explicit import roots on the next import;
                     // keep all historical observations, contexts, events and quotas.
                     store.sources.clear();
+                    // Older stores collapsed absent optional counters to zero.
+                    // Until selected source replay enriches them, do not claim
+                    // those cached/reasoning counts or exact prices are known.
+                    for row in &mut store.observations {
+                        flag(&mut row.flags, "cached_count_unavailable");
+                        flag(&mut row.flags, "reasoning_count_unavailable");
+                    }
+                    for event in &mut store.events {
+                        flag(&mut event.partial_flags, "cached_count_unavailable");
+                        flag(&mut event.partial_flags, "reasoning_count_unavailable");
+                        event.cost_usd = None;
+                    }
                     store.version = STORE_VERSION;
-                    store.last_pricing = None;
+                    // Keep the user's explicit rates/override; only derived usage
+                    // is stale and needs a replay/recalculation.
+                    store.usage_dirty = true;
+                    store.revision = store.revision.saturating_add(1);
                 } else if store.version != STORE_VERSION {
                     return Err(invalid_data("Unsupported token-store version"));
                 }
+                if store.normalization_version < NORMALIZATION_VERSION {
+                    // Replay only user-selected roots on the next import. Existing
+                    // observations are sufficient to repair most old model caches now.
+                    store.sources.clear();
+                    let pricing = store.last_pricing.clone().unwrap_or_default();
+                    store.reconcile(&pricing);
+                }
+                store.refresh_mixed_schema_warning();
                 Ok(store)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
@@ -412,24 +623,58 @@ impl TokenStore {
         .into_iter()
         .enumerate()
         {
+            let session = format!(
+                "task-{}: DEMO synthetic usage",
+                if index == 1 { "B" } else { "A" }
+            );
+            store
+                .recorded_names
+                .entry(session.clone())
+                .or_insert_with(|| RecordedTaskName {
+                    name: if index == 1 {
+                        "DEMO：檢查額度紀錄"
+                    } else {
+                        "DEMO：修復匯入效能"
+                    }
+                    .into(),
+                    timestamp_ms: Some(now.saturating_mul(1000)),
+                });
+            let turn_total = if index == 2 {
+                Counts {
+                    input: 30_600,
+                    cached: 22_300,
+                    output: 4_160,
+                    reasoning: 1_960,
+                }
+            } else {
+                Counts {
+                    input,
+                    cached,
+                    output,
+                    reasoning,
+                }
+            };
             store.observations.push(UsageObservation {
                 identity: format!("demo-synthetic-{index}"),
                 timestamp_ms: now
                     .saturating_sub((3 - index) as i64 * 120)
                     .saturating_mul(1000),
                 sequence: index as u64,
-                session: format!(
-                    "task-{}: DEMO synthetic usage",
-                    if index == 1 { "B" } else { "A" }
-                ),
+                session,
                 request_id: Some(format!("demo-request-{index}")),
                 response_id: Some(format!("demo-response-{index}")),
-                turn_id: Some(format!("demo-turn-{}", index / 2)),
+                turn_id: Some(format!("demo-turn-{}", if index == 1 { "b" } else { "a" })),
                 source_kind: Some("token_usage_record".into()),
-                turn_total: None,
+                turn_total: Some(turn_total),
+                raw_turn_counts: Some(RawTurnCounts {
+                    input: Some(turn_total.input),
+                    output: Some(turn_total.output),
+                }),
                 thread_total: None,
                 model: Some(model.into()),
                 source_model: None,
+                source_model_timestamp_ms: None,
+                source_model_turn_id: None,
                 total: None,
                 last: Some(Counts {
                     input,
@@ -440,9 +685,192 @@ impl TokenStore {
                 flags: vec!["demo_synthetic_not_prices".into()],
             });
         }
+        store.recorded_parents.insert(
+            "task-B: DEMO synthetic usage".into(),
+            RecordedTaskParent {
+                parent: Some("task-A: DEMO synthetic usage".into()),
+                timestamp_ms: Some(now.saturating_mul(1000)),
+            },
+        );
         let pricing = Pricing::demo();
         store.reconcile(&pricing);
         store
+    }
+    /// Monotonic persisted revision for data/cursor/name/price cache invalidation.
+    /// Pricing assumption used to produce the current immutable event snapshot.
+    pub fn pricing(&self) -> Option<&Pricing> {
+        self.last_pricing.as_ref()
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    /// Explicit official metadata only. Never inferred from a prompt, cwd or ID.
+    pub fn task_name(&self, task: &str) -> Option<&str> {
+        self.metadata_names
+            .get(task)
+            .map(String::as_str)
+            .or_else(|| self.recorded_names.get(task).map(|row| row.name.as_str()))
+    }
+    /// An owned metadata snapshot for background-worker/UI handoff.
+    pub fn task_names(&self) -> BTreeMap<String, String> {
+        let mut names: BTreeMap<_, _> = self
+            .recorded_names
+            .iter()
+            .map(|(id, row)| (id.clone(), row.name.clone()))
+            .collect();
+        names.extend(self.metadata_names.clone());
+        names
+    }
+    /// Authoritative immediate parent relationships from official thread metadata.
+    /// Parent IDs may lack imported usage; root/session IDs and fork IDs never
+    /// imply a parent edge. Graph consumers must handle recorded cycles safely.
+    pub fn task_parents(&self) -> BTreeMap<String, String> {
+        self.recorded_parents
+            .iter()
+            .filter_map(|(task, row)| {
+                row.parent
+                    .as_ref()
+                    .map(|parent| (task.clone(), parent.clone()))
+            })
+            .collect()
+    }
+
+    /// Latest event's matching turn, using official cumulative turn metadata when
+    /// available. A sum of retained response events is explicitly only partial.
+    pub fn task_turn_usage(&self) -> BTreeMap<String, TaskTurnUsage> {
+        self.task_turn_usage_filtered(false)
+    }
+    /// Same tooltip semantics, using only responses included in the default view.
+    pub fn included_task_turn_usage(&self) -> BTreeMap<String, TaskTurnUsage> {
+        self.task_turn_usage_filtered(true)
+    }
+    /// Review-only tasks may be hidden, including metadata-only review tasks.
+    /// Any included event or contradictory recorded model evidence keeps the task.
+    pub fn excluded_auto_review_tasks(&self) -> BTreeSet<String> {
+        let mut models = self.recorded_task_models.clone();
+        for context in &self.contexts {
+            models
+                .entry(context.session.clone())
+                .or_default()
+                .insert(context.model.clone());
+        }
+        let mut excluded: BTreeSet<String> = models
+            .iter()
+            .filter(|(_, models)| models.len() == 1 && models.contains(AUTO_REVIEW_MODEL))
+            .map(|(task, _)| task.clone())
+            .collect();
+        let mut included = BTreeSet::new();
+        for event in &self.events {
+            if event.is_excluded_auto_review() {
+                excluded.insert(event.session.clone());
+            } else {
+                included.insert(event.session.clone());
+            }
+        }
+        excluded.retain(|task| !included.contains(task));
+        excluded
+    }
+    fn task_turn_usage_filtered(&self, exclude_review: bool) -> BTreeMap<String, TaskTurnUsage> {
+        let included = |event: &&TokenEvent| !exclude_review || !event.is_excluded_auto_review();
+        let excluded_turns: BTreeSet<(&str, &str)> = if exclude_review {
+            self.events
+                .iter()
+                .filter(|event| event.is_excluded_auto_review())
+                .filter_map(|event| {
+                    event
+                        .turn_id
+                        .as_deref()
+                        .map(|turn| (event.session.as_str(), turn))
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut latest: BTreeMap<&str, &TokenEvent> = BTreeMap::new();
+        for event in self.events.iter().filter(included) {
+            latest.insert(&event.session, event);
+        }
+        let mut sums: BTreeMap<(&str, &str), (u64, u64, bool, bool)> = BTreeMap::new();
+        for event in self.events.iter().filter(included) {
+            if let Some(turn) = event.turn_id.as_deref() {
+                let counts = sums
+                    .entry((&event.session, turn))
+                    .or_insert((0, 0, true, true));
+                counts.0 = counts.0.saturating_add(event.input);
+                counts.1 = counts.1.saturating_add(event.output);
+                counts.2 &= !event
+                    .partial_flags
+                    .iter()
+                    .any(|f| f == "input_count_unavailable");
+                counts.3 &= !event
+                    .partial_flags
+                    .iter()
+                    .any(|f| f == "output_count_unavailable");
+            }
+        }
+        let mut snapshots: BTreeMap<(&str, &str), &UsageObservation> = BTreeMap::new();
+        for row in &self.observations {
+            if let Some(turn) = row
+                .turn_id
+                .as_deref()
+                .filter(|_| row.turn_total.is_some() || row.raw_turn_counts.is_some())
+            {
+                snapshots
+                    .entry((&row.session, turn))
+                    .and_modify(|old| {
+                        if (row.timestamp_ms, &row.identity) > (old.timestamp_ms, &old.identity) {
+                            *old = row;
+                        }
+                    })
+                    .or_insert(row);
+            }
+        }
+        latest
+            .into_iter()
+            .map(|(task, event)| {
+                let mut usage = TaskTurnUsage {
+                    turn_id: event.turn_id.clone(),
+                    input: None,
+                    output: None,
+                    recorded_snapshot: false,
+                    partial: true,
+                    timestamp: None,
+                };
+                if let Some(turn) = event.turn_id.as_deref() {
+                    let contains_excluded = excluded_turns.contains(&(task, turn));
+                    if let Some(snapshot) =
+                        snapshots.get(&(task, turn)).filter(|_| !contains_excluded)
+                    {
+                        usage.recorded_snapshot = true;
+                        usage.timestamp = Some(snapshot.timestamp_ms.div_euclid(1000));
+                        // Old observations do not retain per-field validity. If any
+                        // snapshot field was invalid, do not silently show missing=0.
+                        if let Some(raw) = &snapshot.raw_turn_counts {
+                            usage.input = raw.input;
+                            usage.output = raw.output;
+                            usage.partial = raw.input.is_none() || raw.output.is_none();
+                        } else if !snapshot
+                            .flags
+                            .iter()
+                            .any(|flag| flag == "invalid_usage_snapshot")
+                        {
+                            if let Some(counts) = snapshot.turn_total {
+                                usage.input = Some(counts.input);
+                                usage.output = Some(counts.output);
+                                usage.partial = false;
+                            }
+                        }
+                    } else if let Some((input, output, input_known, output_known)) =
+                        sums.get(&(task, turn))
+                    {
+                        usage.input = input_known.then_some(*input);
+                        usage.output = output_known.then_some(*output);
+                        usage.timestamp = Some(event.timestamp);
+                    }
+                }
+                (task.to_owned(), usage)
+            })
+            .collect()
     }
     pub fn events(&self) -> &[TokenEvent] {
         &self.events
@@ -468,7 +896,11 @@ impl TokenStore {
     }
     pub fn summary(&self, from: Option<i64>, to: Option<i64>, pricing: &Pricing) -> TokenSummary {
         let mut result = TokenSummary::default();
-        for event in self.select_events(from, to) {
+        for event in self
+            .select_events(from, to)
+            .into_iter()
+            .filter(|event| !event.is_excluded_auto_review())
+        {
             result.event_count += 1;
             result.input = result.input.saturating_add(event.input);
             result.cached = result.cached.saturating_add(event.cached);
@@ -484,12 +916,13 @@ impl TokenStore {
         }
         result.total_tokens = result.input.saturating_add(result.output);
         let coverage_incomplete = self.select_events(from, to).iter().any(|e| {
-            e.partial_flags.iter().any(|f| {
-                matches!(
-                    f.as_str(),
-                    "response_coverage_gap" | "mixed_schema_legacy_overlap_suppressed"
-                )
-            })
+            !e.is_excluded_auto_review()
+                && e.partial_flags.iter().any(|f| {
+                    matches!(
+                        f.as_str(),
+                        "response_coverage_gap" | "mixed_schema_legacy_overlap_suppressed"
+                    )
+                })
         });
         result.cost_usd =
             (result.unpriced_events == 0 && !coverage_incomplete).then_some(result.priced_cost_usd);
@@ -504,7 +937,82 @@ impl TokenStore {
         self.summary(Some(start), Some(start.saturating_add(86400)), pricing)
     }
     pub fn reprice(&mut self, pricing: &Pricing) {
-        self.reconcile(pricing);
+        if self.usage_dirty || self.last_pricing.as_ref() != Some(pricing) {
+            self.reconcile(pricing);
+        }
+    }
+
+    fn ensure_indexes(&mut self) {
+        if !self.indexes_ready {
+            self.known_observations = self
+                .observations
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.identity.clone(), index))
+                .collect();
+            self.known_quota = self.quota.iter().map(quota_identity).collect();
+            self.legacy_quota = self
+                .quota
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.origin_session.is_none() && row.source_id.is_none())
+                .map(|(index, row)| (legacy_quota_identity(row), index))
+                .collect();
+            self.indexes_ready = true;
+        }
+    }
+    fn record_task_parent(
+        &mut self,
+        task: &str,
+        payload: &Value,
+        timestamp_ms: Option<i64>,
+        report: &mut ImportReport,
+    ) {
+        // Official current protocol uses ThreadSpawn serialized as `thread_spawn`:
+        // https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs
+        // SessionMeta and SessionConfiguredEvent also expose parent_thread_id.
+        let explicit = text_field(payload, &["parent_thread_id"]);
+        let spawned = payload
+            .pointer("/source/subagent/thread_spawn")
+            .and_then(|source| text_field(source, &["parent_thread_id"]));
+        if explicit.is_none() && spawned.is_none() {
+            return;
+        }
+        let conflicting_fields = explicit
+            .as_ref()
+            .zip(spawned.as_ref())
+            .is_some_and(|(a, b)| a != b);
+        let mut candidate = RecordedTaskParent {
+            parent: if conflicting_fields {
+                None
+            } else {
+                explicit.or(spawned)
+            },
+            timestamp_ms,
+        };
+        if let Some(old) = self.recorded_parents.get(task) {
+            if old.timestamp_ms > timestamp_ms {
+                return;
+            }
+            if old.timestamp_ms == timestamp_ms && old.parent != candidate.parent {
+                candidate.parent = None;
+            }
+            if old == &candidate {
+                return;
+            }
+        }
+        if candidate.parent.is_none() {
+            report.warnings.push(format!("Conflicting recorded parent metadata for task {task}; no parent relationship was inferred"));
+        }
+        self.recorded_parents.insert(task.to_owned(), candidate);
+        self.revision = self.revision.saturating_add(1);
+    }
+    fn refresh_mixed_schema_warning(&mut self) {
+        self.mixed_schema_warning = self.events.iter().any(|e| {
+            e.partial_flags
+                .iter()
+                .any(|f| f == "mixed_schema_legacy_overlap_suppressed")
+        });
     }
 
     /// Read only .jsonl files below the explicit root; never follows symlinks.
@@ -521,76 +1029,178 @@ impl TokenStore {
         paths.sort();
         let old_observation_count = self.observations.len();
         let old_context_count = self.contexts.len();
-        let old_ids: BTreeSet<_> = self.events.iter().map(|event| event.id.clone()).collect();
-        let mut known: BTreeSet<_> = self
-            .observations
-            .iter()
-            .map(|row| row.identity.clone())
-            .collect();
-        let mut known_quota: BTreeSet<_> = self.quota.iter().map(quota_identity).collect();
         for path in paths {
             report.files_scanned += 1;
-            if let Err(error) = self.import_file(&path, &mut known, &mut known_quota, &mut report) {
+            if let Err(error) = self.import_file(&path, &mut report) {
                 report
                     .warnings
                     .push(format!("Could not read {}: {error}", path.display()));
             }
         }
-        if self.observations.len() != old_observation_count
+        if self.usage_dirty
+            || self.observations.len() != old_observation_count
             || self.contexts.len() != old_context_count
             || self.last_pricing.as_ref() != Some(pricing)
         {
+            // Only a real reconciliation needs an old-ID set, never an idle poll.
+            let old_ids: BTreeSet<_> = self.events.iter().map(|event| event.id.clone()).collect();
             self.reconcile(pricing);
-        }
-        if self.events.iter().any(|e| {
-            e.partial_flags
+            report.events_added = self
+                .events
                 .iter()
-                .any(|f| f == "mixed_schema_legacy_overlap_suppressed")
-        }) {
+                .filter(|event| !old_ids.contains(&event.id))
+                .count();
+        }
+        if self.mixed_schema_warning {
             report.warnings.push("Some legacy usage overlaps response records without comparable IDs/counters; it was excluded to prevent double counting. Token totals are a lower bound and complete cost is unknown.".into());
         }
-        self.quota.sort_by_key(|row| row.timestamp);
-        report.events_added = self
-            .events
-            .iter()
-            .filter(|event| !old_ids.contains(&event.id))
-            .count();
+        if !report.quota_observations.is_empty() {
+            self.quota
+                .sort_by_key(|row| (row.timestamp, row.timestamp_ms));
+            // Sorting invalidates legacy enrichment positions, only relevant at migration.
+            self.legacy_quota = self
+                .quota
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.origin_session.is_none() && row.source_id.is_none())
+                .map(|(index, row)| (legacy_quota_identity(row), index))
+                .collect();
+        }
         report.quota_observations.sort_by_key(|row| row.timestamp);
         Ok(report)
     }
 
-    fn import_file(
+    /// Add an explicitly selected official `session_index.jsonl`. No Codex home,
+    /// sibling file, database, credential or conversation is discovered implicitly.
+    /// Official schema: codex-rs/rollout/src/session_index.rs (OpenAI Codex).
+    pub fn import_dir_with_metadata(
         &mut self,
-        path: &Path,
-        known: &mut BTreeSet<String>,
-        known_quota: &mut BTreeSet<String>,
-        report: &mut ImportReport,
-    ) -> io::Result<()> {
+        root: impl AsRef<Path>,
+        metadata_path: Option<&Path>,
+        pricing: &Pricing,
+    ) -> io::Result<ImportReport> {
+        let mut report = self.import_dir(root, pricing)?;
+        if let Some(path) = metadata_path {
+            if let Err(error) = self.import_metadata_index(path, &mut report) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    report.warnings.push(format!(
+                        "Could not read task-name metadata {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        } else if self.metadata_path.take().is_some() {
+            self.metadata_cursor = SourceCursor::default();
+            self.metadata_names.clear();
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(report)
+    }
+
+    fn import_metadata_index(&mut self, path: &Path, report: &mut ImportReport) -> io::Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if self.metadata_path.take().is_some() {
+                    self.metadata_names.clear();
+                    self.metadata_cursor = SourceCursor::default();
+                    self.revision = self.revision.saturating_add(1);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(invalid_data(
+                "Task metadata must be an explicitly selected regular file, not a symlink",
+            ));
+        }
+        let key = fs::canonicalize(path)?.to_string_lossy().into_owned();
+        report.files_scanned += 1;
+        if self.metadata_path.as_ref() != Some(&key) {
+            self.metadata_cursor = SourceCursor::default();
+            self.metadata_names.clear();
+            self.metadata_path = Some(key);
+            self.revision = self.revision.saturating_add(1);
+        }
+        if source_unchanged(&self.metadata_cursor, &metadata) {
+            report.files_unchanged += 1;
+            report.partial_lines += usize::from(self.metadata_cursor.offset < metadata.len());
+            return Ok(());
+        }
+        let mut file = File::open(path)?;
+        let metadata = file.metadata()?;
+        let mut cursor = self.metadata_cursor.clone();
+        if source_rewritten(&mut file, &cursor, &metadata)? {
+            cursor = SourceCursor {
+                generation: cursor.generation.saturating_add(1),
+                ..Default::default()
+            };
+            self.metadata_names.clear();
+            report.source_resets += 1;
+        }
+        file.seek(SeekFrom::Start(cursor.offset))?;
+        let mut reader = BufReader::new(file);
+        loop {
+            let (bytes, length, complete, oversized) = read_bounded_line(&mut reader)?;
+            if length == 0 {
+                break;
+            }
+            if !complete {
+                report.partial_lines += 1;
+                break;
+            }
+            cursor.offset = cursor.offset.saturating_add(length);
+            report.lines_read += 1;
+            if oversized {
+                report.malformed_lines += 1;
+                continue;
+            }
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => {
+                    report.malformed_lines += 1;
+                    continue;
+                }
+            };
+            // The upstream index is append-only; last nonempty entry wins,
+            // regardless of timestamp order. Arbitrary `title`/message fields
+            // are intentionally not interpreted as task-name metadata.
+            if let (Some(id), Some(name)) = (
+                text_field(&value, &["id"]),
+                text_field(&value, &["thread_name"]),
+            ) {
+                self.metadata_names.insert(id, name.trim().to_owned());
+            }
+        }
+        finish_cursor(&mut reader.into_inner(), &mut cursor, &metadata)?;
+        if self.metadata_cursor != cursor {
+            self.metadata_cursor = cursor;
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn import_file(&mut self, path: &Path, report: &mut ImportReport) -> io::Result<()> {
         let canonical = fs::canonicalize(path)?;
         let key = canonical.to_string_lossy().into_owned();
         let mut cursor = self.sources.get(&key).cloned().unwrap_or_default();
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if source_unchanged(&cursor, &metadata) {
+            report.files_unchanged += 1;
+            report.partial_lines += usize::from(cursor.offset < metadata.len());
+            return Ok(());
+        }
+        self.ensure_indexes();
         let mut file = File::open(path)?;
         let metadata = file.metadata()?;
-        let modified_ns = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|d| u64::try_from(d.as_nanos()).ok());
-        let file_identity = file_identity(&metadata);
-        let changed = metadata.len() < cursor.offset
-            || (cursor.file_identity.is_some() && cursor.file_identity != file_identity)
-            || (cursor.offset > 0
-                && cursor.modified_ns.is_some()
-                && cursor.modified_ns != modified_ns
-                && metadata.len() <= cursor.observed_len)
-            || (cursor.prefix_len > 0
-                && hash_range(&mut file, 0, cursor.prefix_len)? != cursor.prefix_hash)
-            || (cursor.anchor_len > 0
-                && hash_range(
-                    &mut file,
-                    cursor.offset.saturating_sub(cursor.anchor_len as u64),
-                    cursor.anchor_len,
-                )? != cursor.anchor_hash);
+        let changed = source_rewritten(&mut file, &cursor, &metadata)?;
         if changed {
             let generation = cursor.generation + 1;
             cursor = SourceCursor {
@@ -635,28 +1245,13 @@ impl TokenStore {
                     continue;
                 }
             };
-            self.consume_value(
-                &value,
-                &key,
-                &mut cursor,
-                changed,
-                (&mut *known, &mut *known_quota),
-                report,
-            );
+            self.consume_value(&value, &key, &mut cursor, changed, report);
         }
-        let mut file = reader.into_inner();
-        cursor.prefix_len = (cursor.offset as usize).min(256);
-        cursor.anchor_len = (cursor.offset as usize).min(128);
-        cursor.prefix_hash = hash_range(&mut file, 0, cursor.prefix_len)?;
-        cursor.anchor_hash = hash_range(
-            &mut file,
-            cursor.offset.saturating_sub(cursor.anchor_len as u64),
-            cursor.anchor_len,
-        )?;
-        cursor.observed_len = metadata.len();
-        cursor.modified_ns = modified_ns;
-        cursor.file_identity = file_identity;
-        self.sources.insert(key, cursor);
+        finish_cursor(&mut reader.into_inner(), &mut cursor, &metadata)?;
+        if self.sources.get(&key) != Some(&cursor) {
+            self.revision = self.revision.saturating_add(1);
+            self.sources.insert(key, cursor);
+        }
         Ok(())
     }
 
@@ -666,23 +1261,28 @@ impl TokenStore {
         source: &str,
         cursor: &mut SourceCursor,
         rewritten: bool,
-        known_sets: (&mut BTreeSet<String>, &mut BTreeSet<String>),
         report: &mut ImportReport,
     ) {
-        let (known, known_quota) = known_sets;
         let payload = value.get("payload").unwrap_or(value);
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
         let response_scoped = kind == "token_usage_record" || payload_kind == "token_usage_record";
-        if kind == "session_meta" {
-            cursor.session = text_field(payload, &["id", "thread_id", "session_id"]);
+        if kind == "session_meta"
+            || kind == "session_configured"
+            || payload_kind == "session_configured"
+        {
+            cursor.session = if kind == "session_meta" {
+                text_field(payload, &["id", "thread_id", "session_id"])
+            } else {
+                text_field(payload, &["thread_id", "session_id", "id"])
+            };
             cursor.turn_id = None;
+            cursor.model = None;
+            cursor.model_timestamp_ms = None;
+            cursor.model_turn_id = None;
         } else if !response_scoped && cursor.session.is_none() {
             cursor.session = text_field(payload, &["thread_id", "session_id"])
                 .or_else(|| text_field(value, &["thread_id", "session_id"]));
-        }
-        if kind == "turn_context" || matches!(payload_kind, "task_started" | "turn_started") {
-            cursor.turn_id = text_field(payload, &["turn_id"]);
         }
         let timestamp_ms = parse_timestamp(value).or_else(|| parse_timestamp(payload));
         // A copied record keeps its original logical owner. Its root `session_id`
@@ -693,19 +1293,54 @@ impl TokenStore {
             .clone()
             .or_else(|| cursor.session.clone())
             .unwrap_or_else(|| format!("unidentified:{}", stable_hash(source.as_bytes())));
-        if kind == "turn_context"
-            || kind == "session_meta"
-            || payload_kind == "thread_settings_applied"
+        if cursor.session.as_deref() == Some(session.as_str())
+            && (kind == "turn_context" || matches!(payload_kind, "task_started" | "turn_started"))
         {
+            cursor.turn_id = text_field(payload, &["turn_id"]);
+        }
+        if matches!(kind, "session_meta" | "session_configured")
+            || payload_kind == "session_configured"
+        {
+            self.record_task_parent(&session, payload, timestamp_ms, report);
+            if let Some(name) = text_field(payload, &["thread_name"]) {
+                let entry = RecordedTaskName { name, timestamp_ms };
+                if self
+                    .recorded_names
+                    .get(&session)
+                    .is_none_or(|old| entry.timestamp_ms >= old.timestamp_ms)
+                {
+                    self.recorded_names.insert(session.clone(), entry);
+                }
+            }
+        }
+        if matches!(
+            kind,
+            "turn_context" | "session_meta" | "session_configured" | "thread_settings_applied"
+        ) || matches!(
+            payload_kind,
+            "session_configured" | "thread_settings_applied"
+        ) {
             let settings = payload.get("thread_settings").unwrap_or(payload);
             if let Some(model) = text_field(settings, &["model", "model_slug"]) {
-                cursor.model = Some(model.clone());
+                let turn_id = text_field(payload, &["turn_id"]).or_else(|| {
+                    (cursor.session.as_deref() == Some(session.as_str()))
+                        .then(|| cursor.turn_id.clone())
+                        .flatten()
+                });
+                self.recorded_task_models
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(model.clone());
+                if cursor.session.as_deref() == Some(session.as_str()) {
+                    cursor.model = Some(model.clone());
+                    cursor.model_timestamp_ms = timestamp_ms;
+                    cursor.model_turn_id = turn_id.clone();
+                }
                 if let Some(timestamp_ms) = timestamp_ms {
                     self.contexts.push(ModelContext {
                         timestamp_ms,
                         session: session.clone(),
-                        turn_id: text_field(payload, &["turn_id"])
-                            .or_else(|| cursor.turn_id.clone()),
+                        turn_id,
                         model,
                     });
                 }
@@ -725,9 +1360,21 @@ impl TokenStore {
                     let observation = ImportedQuotaObservation {
                         timestamp: timestamp_ms.div_euclid(1000),
                         payload: rate_limits.clone(),
+                        origin_session: (cursor.session.is_some() || explicit_thread.is_some())
+                            .then(|| session.clone()),
+                        source_id: Some(format!("{:016x}", stable_hash(source.as_bytes()))),
+                        timestamp_ms: Some(timestamp_ms),
                     };
-                    if known_quota.insert(quota_identity(&observation)) {
-                        self.quota.push(observation.clone());
+                    if self.known_quota.insert(quota_identity(&observation)) {
+                        if let Some(index) = self
+                            .legacy_quota
+                            .remove(&legacy_quota_identity(&observation))
+                        {
+                            self.known_quota.remove(&quota_identity(&self.quota[index]));
+                            self.quota[index] = observation.clone();
+                        } else {
+                            self.quota.push(observation.clone());
+                        }
                         report.quota_observations.push(observation);
                     }
                 } else {
@@ -802,6 +1449,13 @@ impl TokenStore {
             "token_count"
         };
         let mut snapshot_flags = Vec::new();
+        let raw_turn_counts = payload
+            .get("turn_token_usage")
+            .filter(|v| v.is_object())
+            .map(|value| RawTurnCounts {
+                input: raw_count(value, &["input_tokens", "input"]),
+                output: raw_count(value, &["output_tokens", "output"]),
+            });
         let turn_total = payload
             .get("turn_token_usage")
             .filter(|v| !v.is_null())
@@ -810,10 +1464,14 @@ impl TokenStore {
             .get("thread_token_usage")
             .filter(|v| !v.is_null())
             .and_then(|v| parse_counts(v, &mut snapshot_flags));
-        if snapshot_flags
-            .iter()
-            .any(|f| f != "cache_write_pricing_unmodeled")
-        {
+        if snapshot_flags.iter().any(|f| {
+            !matches!(
+                f.as_str(),
+                "cache_write_pricing_unmodeled"
+                    | "cached_count_unavailable"
+                    | "reasoning_count_unavailable"
+            )
+        }) {
             flag(&mut flags, "invalid_usage_snapshot");
         }
         if rewritten {
@@ -836,13 +1494,48 @@ impl TokenStore {
             turn_total.map(Counts::signature).unwrap_or_default(),
             thread_total.map(Counts::signature).unwrap_or_default()
         );
-        if !known.insert(identity.clone()) {
-            report.duplicate_observations += 1;
-            return;
-        }
         let source_model = (cursor.session.as_deref() == Some(session.as_str()))
             .then(|| cursor.model.clone())
             .flatten();
+        let source_model_timestamp_ms = source_model.as_ref().and(cursor.model_timestamp_ms);
+        let source_model_turn_id = source_model.as_ref().and(cursor.model_turn_id.clone());
+        if let Some(index) = self.known_observations.get(&identity).copied() {
+            let existing = &mut self.observations[index];
+            // During migration, old cursors replay without duplicating usage,
+            // while restoring raw-field availability that older stores lost.
+            let old_flags = existing.flags.clone();
+            if existing.source_model != source_model
+                || existing.source_model_timestamp_ms != source_model_timestamp_ms
+                || existing.source_model_turn_id != source_model_turn_id
+            {
+                // Prefer concrete replay evidence to an older cache's missing model.
+                if source_model.is_some() {
+                    existing.source_model = source_model;
+                    existing.source_model_timestamp_ms = source_model_timestamp_ms;
+                    existing.source_model_turn_id = source_model_turn_id;
+                    self.usage_dirty = true;
+                }
+            }
+            existing
+                .flags
+                .retain(|value| !value.ends_with("_count_unavailable") || flags.contains(value));
+            let old_raw = existing.raw_turn_counts.clone();
+            if let Some(raw) = raw_turn_counts {
+                if let Some(existing_raw) = &mut existing.raw_turn_counts {
+                    existing_raw.input = existing_raw.input.or(raw.input);
+                    existing_raw.output = existing_raw.output.or(raw.output);
+                } else {
+                    existing.raw_turn_counts = Some(raw);
+                }
+            }
+            if old_flags != existing.flags || old_raw != existing.raw_turn_counts {
+                self.usage_dirty = true;
+            }
+            report.duplicate_observations += 1;
+            return;
+        }
+        self.known_observations
+            .insert(identity.clone(), self.observations.len());
         self.observations.push(UsageObservation {
             identity,
             timestamp_ms,
@@ -853,9 +1546,12 @@ impl TokenStore {
             turn_id,
             source_kind: Some(source_kind.into()),
             turn_total,
+            raw_turn_counts,
             thread_total,
             model,
             source_model,
+            source_model_timestamp_ms,
+            source_model_turn_id,
             total,
             last,
             flags,
@@ -863,6 +1559,26 @@ impl TokenStore {
     }
 
     fn reconcile(&mut self, pricing: &Pricing) {
+        if self.observations.is_empty() {
+            for event in &mut self.events {
+                if !event.model_assumed
+                    && event.model == AUTO_REVIEW_MODEL
+                    && !event
+                        .partial_flags
+                        .iter()
+                        .any(|flag| flag == "model_override")
+                {
+                    flag(&mut event.partial_flags, AUTO_REVIEW_EXCLUDED);
+                }
+                event.cost_usd = event_cost(event, pricing);
+            }
+            self.normalization_version = NORMALIZATION_VERSION;
+            self.last_pricing = Some(pricing.clone());
+            self.usage_dirty = false;
+            self.revision = self.revision.saturating_add(1);
+            return;
+        }
+
         #[derive(Default)]
         struct SessionState {
             total: Option<Counts>,
@@ -888,12 +1604,21 @@ impl TokenStore {
                 && a.turn_id == b.turn_id
                 && a.model == b.model
         });
-        let mut contexts_by_session: BTreeMap<&str, Vec<&ModelContext>> = BTreeMap::new();
+        let recorded_models = RecordedModels::new(&self.contexts);
+        let mut model_evidence = self.recorded_task_models.clone();
         for context in &self.contexts {
-            contexts_by_session
-                .entry(&context.session)
+            model_evidence
+                .entry(context.session.clone())
                 .or_default()
-                .push(context);
+                .insert(context.model.clone());
+        }
+        for row in &self.observations {
+            if let Some(model) = recorded_models.recorded(row) {
+                model_evidence
+                    .entry(row.session.clone())
+                    .or_default()
+                    .insert(model.to_owned());
+            }
         }
         let mut states: BTreeMap<String, SessionState> = BTreeMap::new();
         let mut result: Vec<TokenEvent> = Vec::new();
@@ -987,17 +1712,64 @@ impl TokenStore {
                 continue;
             }
             let counts = counts.normalized(&mut flags);
-            let recorded_model = row
-                .model
-                .as_deref()
-                .or(row.source_model.as_deref())
-                .or_else(|| {
-                    let contexts = contexts_by_session.get(row.session.as_str())?;
-                    let index = contexts
-                        .partition_point(|c| c.timestamp_ms <= row.timestamp_ms)
-                        .checked_sub(1)?;
-                    Some(contexts[index].model.as_str())
+            let recorded_model = recorded_models.recorded(row);
+            let mut counts = counts;
+            if recorded_model == Some(AUTO_REVIEW_MODEL) {
+                let aggregate_scope_uncertain = flags.iter().any(|flag| {
+                    matches!(
+                        flag.as_str(),
+                        "initial_snapshot_contains_unattributed_usage"
+                            | "gap_spans_unobserved_requests"
+                            | "reset_baseline_uncertain"
+                    )
                 });
+                let pure_review_evidence = model_evidence
+                    .get(&row.session)
+                    .is_some_and(|models| models.len() == 1 && models.contains(AUTO_REVIEW_MODEL));
+                if !aggregate_scope_uncertain || pure_review_evidence {
+                    flag(&mut flags, AUTO_REVIEW_EXCLUDED);
+                    if aggregate_scope_uncertain {
+                        flag(&mut flags, "excluded_review_aggregate_scope_uncertain");
+                    }
+                } else if let Some(last) = row.last.filter(|last| !counts.decreased_from(*last)) {
+                    // A mixed-model cumulative gap is not wholly attributable to
+                    // its latest review request. Keep the residual visibly unknown.
+                    let residual = counts.sub(last);
+                    if !residual.is_zero() {
+                        let mut residual_flags = flags.clone();
+                        flag(&mut residual_flags, "legacy_model_scope_uncertain");
+                        result.push(TokenEvent {
+                            id: format!("{id}:unattributed"),
+                            timestamp: row.timestamp_ms.div_euclid(1000),
+                            model: UNATTRIBUTED_MODEL.into(),
+                            model_assumed: false,
+                            session: row.session.clone(),
+                            response_id: None,
+                            turn_id: None,
+                            source_kind: Some("token_count".into()),
+                            input: residual.input,
+                            cached: residual.cached,
+                            uncached: residual.input.saturating_sub(residual.cached),
+                            output: residual.output,
+                            reasoning: residual.reasoning,
+                            cost_usd: None,
+                            partial_flags: residual_flags,
+                        });
+                    }
+                    counts = last;
+                    flags.retain(|flag| {
+                        !matches!(
+                            flag.as_str(),
+                            "initial_snapshot_contains_unattributed_usage"
+                                | "gap_spans_unobserved_requests"
+                                | "reset_baseline_uncertain"
+                        )
+                    });
+                    flag(&mut flags, AUTO_REVIEW_EXCLUDED);
+                } else {
+                    flag(&mut flags, "legacy_model_scope_uncertain");
+                }
+            }
             let override_model = pricing
                 .model_override
                 .as_deref()
@@ -1034,8 +1806,19 @@ impl TokenStore {
             };
             if let Some(index) = event_positions.get(&event.id).copied() {
                 let previous = &mut result[index];
-                if previous.model != event.model {
+                let conflicting_exclusion =
+                    previous.is_excluded_auto_review() != event.is_excluded_auto_review();
+                if previous.model != event.model || conflicting_exclusion {
                     flag(&mut event.partial_flags, "request_model_changed");
+                }
+                if conflicting_exclusion {
+                    previous
+                        .partial_flags
+                        .retain(|flag| flag != AUTO_REVIEW_EXCLUDED);
+                    event
+                        .partial_flags
+                        .retain(|flag| flag != AUTO_REVIEW_EXCLUDED);
+                    flag(&mut event.partial_flags, "request_recorded_model_conflict");
                 }
                 if previous.timestamp.div_euclid(86400) != event.timestamp.div_euclid(86400) {
                     flag(&mut event.partial_flags, "request_spans_dates");
@@ -1056,10 +1839,21 @@ impl TokenStore {
                 result.push(event);
             }
         }
-        self.reconcile_response_records(&mut result, &contexts_by_session, pricing);
+        self.reconcile_response_records(&mut result, &recorded_models, pricing);
         result.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
         self.events = result;
+        self.normalization_version = NORMALIZATION_VERSION;
         self.last_pricing = Some(pricing.clone());
+        self.refresh_mixed_schema_warning();
+        if self.indexes_ready {
+            for (index, row) in self.observations.iter().enumerate() {
+                if let Some(position) = self.known_observations.get_mut(&row.identity) {
+                    *position = index;
+                }
+            }
+        }
+        self.usage_dirty = false;
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// A response is one completed provider response, a turn is `(thread_id,
@@ -1069,7 +1863,7 @@ impl TokenStore {
     fn reconcile_response_records(
         &self,
         legacy: &mut Vec<TokenEvent>,
-        contexts: &BTreeMap<&str, Vec<&ModelContext>>,
+        recorded_models: &RecordedModels<'_>,
         pricing: &Pricing,
     ) {
         let mut selected: BTreeMap<(&str, &str), &UsageObservation> = BTreeMap::new();
@@ -1126,6 +1920,10 @@ impl TokenStore {
         for row in &self.observations {
             if row.source_kind.as_deref() != Some("token_usage_record") {
                 if let Some(id) = legacy_event_id(row) {
+                    legacy_rows
+                        .entry(format!("{id}:unattributed"))
+                        .or_default()
+                        .push(row);
                     legacy_rows.entry(id).or_default().push(row);
                 }
             }
@@ -1217,7 +2015,15 @@ impl TokenStore {
                 kept.push(event);
                 continue;
             }
-            let endpoint = rows.last().and_then(|r| r.total);
+            let endpoint = rows.last().and_then(|r| {
+                r.total.map(|total| {
+                    if event.id.ends_with(":unattributed") {
+                        total.sub(r.last.unwrap_or_default())
+                    } else {
+                        total
+                    }
+                })
+            });
             // One legacy aggregate endpoint plus non-reset cumulative coordinates
             // lets us remove covered response ranges without relying on file order.
             if let (Some(Some(ranges)), Some(end)) =
@@ -1353,28 +2159,30 @@ impl TokenStore {
             if coverage_unknown.contains(thread) {
                 flag(&mut flags, "mixed_schema_legacy_overlap_suppressed");
             }
-            let recorded = row
-                .model
-                .as_deref()
+            // Updated/replayed records may omit the model that an earlier
+            // version of this exact response explicitly recorded. Preserve that
+            // identity rather than falling back to a later thread model or Sol.
+            let explicit_models: BTreeSet<&str> = versions[&key]
+                .iter()
+                .filter_map(|version| version.model.as_deref())
+                .collect();
+            let explicit = versions[&key]
+                .iter()
+                .filter(|version| version.model.is_some())
+                .max_by_key(|version| (version.timestamp_ms, &version.identity))
+                .and_then(|version| version.model.as_deref());
+            let recorded = explicit
+                .or_else(|| recorded_models.recorded(row))
                 .or_else(|| {
-                    let turn = row.turn_id.as_deref()?;
-                    contexts
-                        .get(thread)?
+                    versions[&key]
                         .iter()
-                        .rev()
-                        .find(|c| {
-                            c.turn_id.as_deref() == Some(turn) && c.timestamp_ms <= row.timestamp_ms
-                        })
-                        .map(|c| c.model.as_str())
-                })
-                .or(row.source_model.as_deref())
-                .or_else(|| {
-                    let rows = contexts.get(thread)?;
-                    let at = rows
-                        .partition_point(|c| c.timestamp_ms <= row.timestamp_ms)
-                        .checked_sub(1)?;
-                    Some(rows[at].model.as_str())
+                        .find_map(|version| recorded_models.recorded(version))
                 });
+            if explicit_models.len() > 1 {
+                flag(&mut flags, "response_model_conflict");
+            } else if recorded == Some(AUTO_REVIEW_MODEL) {
+                flag(&mut flags, AUTO_REVIEW_EXCLUDED);
+            }
             let chosen = pricing
                 .model_override
                 .as_deref()
@@ -1503,15 +2311,21 @@ fn event_cost(event: &TokenEvent, pricing: &Pricing) -> Option<f64> {
         matches!(
             s.as_str(),
             "request_model_changed"
+                | "request_recorded_model_conflict"
+                | "legacy_model_scope_uncertain"
                 | "initial_snapshot_contains_unattributed_usage"
                 | "gap_spans_unobserved_requests"
                 | "reset_baseline_uncertain"
                 | "missing_token_fields"
+                | "input_count_unavailable"
+                | "cached_count_unavailable"
+                | "output_count_unavailable"
                 | "invalid_token_counts"
                 | "cached_exceeded_input"
                 | "reasoning_exceeded_output"
                 | "mixed_schema_residual_unattributed"
                 | "response_record_conflict"
+                | "response_model_conflict"
                 | "cache_write_pricing_unmodeled"
         )
     }) {
@@ -1550,7 +2364,33 @@ fn parse_timestamp(value: &Value) -> Option<i64> {
         numeric.checked_mul(1000)
     }
 }
+fn raw_count(value: &Value, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        })
+}
 fn parse_counts(value: &Value, flags: &mut Vec<String>) -> Option<Counts> {
+    for (names, unavailable) in [
+        (&["input_tokens", "input"][..], "input_count_unavailable"),
+        (
+            &["cached_input_tokens", "cache_read_input_tokens", "cached"][..],
+            "cached_count_unavailable",
+        ),
+        (&["output_tokens", "output"][..], "output_count_unavailable"),
+        (
+            &["reasoning_output_tokens", "reasoning_tokens", "reasoning"][..],
+            "reasoning_count_unavailable",
+        ),
+    ] {
+        if raw_count(value, names).is_none() {
+            flag(flags, unavailable);
+        }
+    }
     if !value.is_object() {
         flag(flags, "invalid_token_counts");
         return None;
@@ -1599,6 +2439,70 @@ fn parse_counts(value: &Value, flags: &mut Vec<String>) -> Option<Counts> {
         .normalized(flags),
     )
 }
+fn modified_ns(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+}
+#[cfg(unix)]
+fn changed_ns(metadata: &fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+    Some(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+}
+#[cfg(not(unix))]
+fn changed_ns(_metadata: &fs::Metadata) -> Option<i128> {
+    None
+}
+fn source_unchanged(cursor: &SourceCursor, metadata: &fs::Metadata) -> bool {
+    // A missing filesystem timestamp cannot establish that the source is unchanged.
+    cursor.modified_ns.is_some()
+        && cursor.modified_ns == modified_ns(metadata)
+        && cursor.observed_len == metadata.len()
+        && cursor.file_identity == file_identity(metadata)
+        && cursor.changed_ns == changed_ns(metadata)
+        && cursor.offset <= metadata.len()
+}
+fn source_rewritten(
+    file: &mut File,
+    cursor: &SourceCursor,
+    metadata: &fs::Metadata,
+) -> io::Result<bool> {
+    Ok(metadata.len() < cursor.offset
+        || (cursor.file_identity.is_some() && cursor.file_identity != file_identity(metadata))
+        || (cursor.offset > 0
+            && cursor.modified_ns.is_some()
+            && (cursor.modified_ns != modified_ns(metadata)
+                || cursor.changed_ns != changed_ns(metadata))
+            && metadata.len() <= cursor.observed_len)
+        || (cursor.prefix_len > 0 && hash_range(file, 0, cursor.prefix_len)? != cursor.prefix_hash)
+        || (cursor.anchor_len > 0
+            && hash_range(
+                file,
+                cursor.offset.saturating_sub(cursor.anchor_len as u64),
+                cursor.anchor_len,
+            )? != cursor.anchor_hash))
+}
+fn finish_cursor(
+    file: &mut File,
+    cursor: &mut SourceCursor,
+    metadata: &fs::Metadata,
+) -> io::Result<()> {
+    cursor.prefix_len = (cursor.offset as usize).min(256);
+    cursor.anchor_len = (cursor.offset as usize).min(128);
+    cursor.prefix_hash = hash_range(file, 0, cursor.prefix_len)?;
+    cursor.anchor_hash = hash_range(
+        file,
+        cursor.offset.saturating_sub(cursor.anchor_len as u64),
+        cursor.anchor_len,
+    )?;
+    cursor.observed_len = metadata.len();
+    cursor.modified_ns = modified_ns(metadata);
+    cursor.file_identity = file_identity(metadata);
+    cursor.changed_ns = changed_ns(metadata);
+    Ok(())
+}
 #[cfg(unix)]
 fn file_identity(metadata: &fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -1613,8 +2517,24 @@ fn stable_hash(bytes: &[u8]) -> u64 {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     })
 }
-fn quota_identity(observation: &ImportedQuotaObservation) -> String {
+fn legacy_quota_identity(observation: &ImportedQuotaObservation) -> String {
     format!("{}:{}", observation.timestamp, observation.payload)
+}
+fn quota_identity(observation: &ImportedQuotaObservation) -> String {
+    // Same snapshot copied to another source in the same logical session remains
+    // one observation; different sessions retain independent provenance evidence.
+    format!(
+        "{}:{}:{}",
+        observation
+            .timestamp_ms
+            .unwrap_or(observation.timestamp.saturating_mul(1000)),
+        observation
+            .origin_session
+            .as_deref()
+            .or(observation.source_id.as_deref())
+            .unwrap_or(""),
+        observation.payload
+    )
 }
 fn hash_range(file: &mut File, offset: u64, len: usize) -> io::Result<u64> {
     file.seek(SeekFrom::Start(offset))?;
@@ -2132,7 +3052,7 @@ mod tests {
         assert!(store.events().iter().all(|e| e.cost_usd.is_none()));
     }
     #[test]
-    fn missing_optional_counters_are_zero_but_missing_required_fields_are_partial() {
+    fn missing_counters_remain_marked_unavailable_instead_of_claiming_zero() {
         let dir = TempDir::new().unwrap();
         write_log(
             &dir,
@@ -2156,7 +3076,13 @@ mod tests {
         store.import_dir(dir.path(), &sample_pricing()).unwrap();
         assert_eq!(store.events()[0].cached, 0);
         assert_eq!(store.events()[0].reasoning, 0);
-        assert!(!store.events()[0].is_partial());
+        assert!(store.events()[0]
+            .partial_flags
+            .contains(&"cached_count_unavailable".into()));
+        assert!(store.events()[0]
+            .partial_flags
+            .contains(&"reasoning_count_unavailable".into()));
+        assert_eq!(store.events()[0].cost_usd, None);
         assert!(store.events()[1]
             .partial_flags
             .contains(&"missing_token_fields".into()));
@@ -2688,7 +3614,7 @@ mod tests {
         let checkpoint = dir.path().join("state.json");
         old.save(&checkpoint).unwrap();
         let mut loaded = TokenStore::load(&checkpoint).unwrap();
-        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.version, STORE_VERSION);
         assert_eq!(loaded.sources.len(), 0);
         assert_eq!(loaded.observation_count(), 1);
         let report = loaded.import_dir(dir.path(), &sample_pricing()).unwrap();

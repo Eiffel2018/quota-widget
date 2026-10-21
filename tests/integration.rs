@@ -660,8 +660,9 @@ fn history_merge_reset_in_another_window_does_not_split_this_windows_duplicate()
     unrelated_reset.before = "0".into();
     unrelated_reset.after = "100".into();
     unrelated_reset.delta = "100".into();
-    let merged = quota_widget::history::merge(vec![first, unrelated_reset], vec![copy]);
-    assert_eq!(merged.len(), 2);
+    let raw = quota_widget::history::merge(vec![first, unrelated_reset], vec![copy]);
+    assert_eq!(raw.len(), 3, "raw observations remain available");
+    assert_eq!(quota_widget::history::normalized(&raw).len(), 2);
 }
 
 #[test]
@@ -691,6 +692,9 @@ fn historical_replay_retains_real_observations_older_than_thirty_days() {
     let base = 1_700_000_000i64;
     let observation = |timestamp, used| ImportedQuotaObservation {
         timestamp,
+        origin_session: None,
+        source_id: None,
+        timestamp_ms: None,
         payload: json!({"limit_id":"codex","primary":{
             "used_percent":used,"window_minutes":10080,"resets_at":base + 100 * 86400
         }}),

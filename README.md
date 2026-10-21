@@ -1,4 +1,4 @@
-# Quota Widget 0.3.0
+# Quota Widget 0.3.2
 
 原生 Rust + eframe 桌面小工具，重建自 0.2.1 的畫面、已恢復字型／圖示、格式與行為證據。本專案是新的可維護實作，不是聲稱找回遺失的原始碼。沒有 Electron、WebView、Node 或 Python 常駐服務。
 
@@ -10,12 +10,17 @@
 - 額度 metadata／重設時間漂移不製造 0→0 重設事件。實際回補建立新的週期。
 - 近期下降的加權速率與具理由／信心範圍的估計；過期的估計保留過期狀態，不假裝一定準時扣額。
 - 每日扣額紀錄、每日 Token 明細、日期選單、前後一天、CSV／JSON 匯出。
-- 主視窗底部按 Task 分行：可複製的短 ID、最新事件時間、單筆估算費用、本次百分比區間內該 Task 累計；可捲動。保留最近 24 小時或本區間內有記錄的 Task，真實扣額／回補後開新區間，分界未知顯示 $—。底行保留整體累計。
+- 主視窗按實際 parent_thread_id 關係列樹狀 Task；主代理自身費用獨立一行，其下 [+] 子代理列合計全部已知後代，每個只計一次。預設收起，展開可看子代理名稱、最新時間、單筆費用和本%累計，支援多層；無關係不猜測、循環獨立顯示。預設最多 10 個可見行，超過才捲動，可在設定修改。滑鼠移到 Task 可看名稱、完整 ID、最新 Response 的 Input／Cached／Uncached／Output／Reasoning 及匹配 Turn 累計 Input／Output。
+- 本%累計及底行使用最後已確認扣額／重設作分界，啟動會重算該分界後的已記錄用量。沒有可用分界時自本次啟動以 $0.0000 開始累加並標示 *；已知部分持續相加，未知事件不假裝免費。
+- 多個 session 內快取額度快照的衝突保留為不確定觀察，不再當成重設；原始觀察保留，畫面只整理可確認的變動。
+- 匯入／存檔／匯出在背景執行，無變更檔案不重讀，不變的價格不重算；主視窗與每日明細使用索引、快取和可視行繪製。
 - 預設 30 天日期瀏覽，保留可匯入的更早歷史。只有實際額度觀察才還原額度歷史；Token 不能反推百分比。
 - 新版 token_usage_record 以 (thread_id, response_id) 去重，每筆 usage 是單次 response；舊版 token_count 以累計差分回退。Turn／Task（thread_id）分組只加總去重後事件，不累加累計快照。混合格式無法確定對應時優先 response 記錄並明示部分覆蓋，避免雙計。
 - 遞迴掃描指定 sessions 目錄所有 JSONL；增量位元組 offsets、session 累計差分與去重可跨重啟保存。
 - 記錄相同累計值的重複通知不重計；不同請求的相同用量不靠數字去重。截斷、重寫、累計重設與缺漏標示部分資料。
 - 輸入是單次請求整份上下文（不是僅新增提示詞），輸入＝快取＋未快取；推理包含在輸出內，不重複計費。模型未知預設 gpt-6.1-sol 並明示假設；6 Luna 只來自實際記錄或手動覆寫。
+- 精確模型 codex-auto-review 依要求從預設 Task 行、子代理數、區間／整體估算及每日明細排除；原始記錄保留，可切到 Token 明細「查看排除紀錄」稽核及匯出。排除不代表免費，官方額度讀數不變。普通 Sol 審查工作不按名稱排除。
+- 每筆 Response／可歸屬舊版事件各依實際模型計價；Luna 子代理不繼承 Sol 主代理價格。high／max 不另乘單價。只有未記錄模型時才假設 Sol；有模型名稱但無價格時保持費用未知。
 - 新設定預設採 2026-10-17 核對的官方 Standard 價格假設；可切 Fast／自訂，不覆蓋既有自訂表。完整單次輸入超過 272,000 時，整筆輸入／快取 ×2、輸出 ×1.5。未知價格或單次請求歧義顯示 $—。所有 $ 都是模型等價估算，不是 ChatGPT 訂閱實際帳單。
 
 ## 啟動
@@ -36,7 +41,7 @@ Linux：桌面需 X11／Wayland 及 OpenGL。執行 quota-widget。
 
 資料目錄：Windows %LOCALAPPDATA%/quota-widget；Mac ~/Library/Application Support/quota-widget；Linux $XDG_CONFIG_HOME/quota-widget 或 ~/.config/quota-widget。
 
-settings.json 保存偏好／價格；history.json 保存額度觀察事件；tokens.json 保存去重後用量、必要的模型／session 識別、來源 offsets。沒有對話正文或憑證。匯出存到 exports/。請把含本機 session／來源路徑的資料視為私人資料。
+settings.json 保存偏好／價格；history.json 保存額度觀察事件；tokens.json 保存去重後用量、必要的模型／session 識別、明確 Task 名稱及上層關係、來源 offsets。名稱來自 metadata 或所選 sessions 同層 session_index.jsonl，不從對話正文猜測。沒有對話正文或憑證。匯出存到 exports/。請把含本機 session／來源路徑的資料視為私人資料。
 
 只有一個寫入者能持有該資料目錄的 OS 鎖；其他視窗改為唯讀。損壞的儲存檔不會以空資料覆寫。程式不自動刪除舊歷史；自行備份後可手動管理。Demo 不讀取或保存真實資料。
 
@@ -74,3 +79,25 @@ inspect 不修改來源或儲存檔；import 只修改明確指定 state 並取�
 - GUI：https://docs.rs/eframe/0.32.3/eframe/
 - Rust 實作：MIT，見 LICENSE。
 - Noto Sans CJK：SIL OFL，見 assets/FONT-LICENSE.txt；其他字型／依賴見 assets/THIRD-PARTY-NOTICES.txt 及 Cargo.lock。
+
+## 每次扣額的模型分項
+
+扣額紀錄每行的「模型分項」顯示實際觀察區間的起迄、下降百分點、已知估算總和、每百分點平均，以及各 model 的 Input / Cached / Uncached / Output / Reasoning / 費用。按每筆實際模型計價，不使用 parent 同價假設。多百分點跳變只保留整段平均，不製造單一百分點資料。
+
+完整區間才能直接比較；首次觀察、重設邊界、缺口、未知價格或假設模型都附限制。官方 quota 與 API 等價費用不是相同計費單位，單次粗粒度觀察不能證明訂閱扣額規則。不同額度視窗是同一使用量的不同觀察，請勿把它們相加。
+
+背景工作會更新 quota-intervals.json；原始 token／quota 歷史仍為依據，重啟可重建，換價格時會重新估算。扣額 JSON 包含 completed_intervals；CSV 同時另存 -models.csv，每列一個區間／模型，方便比較實驗。
+
+## 合成樹狀驗證（不接觸真實帳戶）
+
+    python3 fixtures/generate_tree_fixture.py ./synthetic-tree
+    quota-widget --offline --data-dir ./synthetic-tree/state
+
+此產生器只在指定資料夾建立合成的15個Task、13個子代理關係、巢狀子代理及重複額度快照；程式不連線。請測試 [+] 展開／收起、七項tooltip、設定行數上限、日期及匯出。離線額度本身會顯示「—」，這是預期狀態。
+
+## 合成模型／排除驗證
+
+    python3 fixtures/generate_review_fixture.py ./synthetic-review
+    quota-widget --offline --data-dir ./synthetic-review/state
+
+另加 --with-completed 可產生已完成的 2 百分點區間供查看分項。此資料全為合成，不會更動真實 Codex 設定。

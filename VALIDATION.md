@@ -1,37 +1,43 @@
-# Validation — Quota Widget 0.3.0, 2026-10-17 UTC
+# Quota Widget 0.3.2 validation — 2026-10-17 UTC
 
-## Passed
+All execution used an isolated Linux workspace and synthetic JSONL. No user computer, real account, credentials, or live user-session files were accessed.
 
-- Rust 1.99.1, locked dependency graph, rustfmt check.
-- Strict `cargo clippy --all-targets --locked -- -D warnings`.
-- 114 unit tests and 27 integration tests (141 total), all passed.
-- Linux x86-64 native debug and optimized release builds.
-- Windows x86-64 GNU optimized release build; inspected PE32+ AMD64 GUI executable and imports. Imported DLLs are Windows system libraries; no Electron/Node/WebView/Python runtime is bundled.
-- Complete `cargo check --target aarch64-apple-darwin` passes. This is code/type checking, not linking or execution.
-- Actual native GUI rendering under an authenticated X11 display, Openbox and Mesa llvmpipe OpenGL 4.5.
-- Actual pointer drag: window moved from (35,35) to (155,105). Actual bottom-right resize: 310×360 to 400×430.
-- Light/dark theme, separate settings/history/token windows, close and reopen, transparent rounded widget rendering.
-- ABOVE/topmost state remains after other-window activation and minimize/restore. The active window stayed the settings window across a 16-second topmost reassertion; no focus stealing was observed.
-- GUI daily CSV and JSON exports were opened and checked: 2 synthetic events, 200 input, 80 cached, 120 uncached, 40 output including 16 reasoning, synthetic cost $0.00022. Local timestamps and pricing basis are included.
-- New-schema GUI CSV/JSON checked: 7 deduplicated responses across 6 tasks/turns, 20,350 input and 2,035 output, Standard estimated total $0.003443. Unknown model attribution remains visibly assumed. Per-Task scrolling was tested with six tasks; its viewport does not overlap the footer.
-- Corrupt settings/history/token files were hash-checked before and after a real GUI run and normal close; unchanged.
-- Response-scoped tests cover replayed/updated response IDs, distinct equal requests, logical child-task identity, turn/thread snapshots, mixed-format overlap, incomplete coverage, positive cache-write unknown pricing, and v1 cursor migration. Task-view tests independently verify latest per-event cost and per-task interval reset without double counting.
-- Synthetic tests cover 5,087 unchanged 0→0 metadata jitters, true reset then new drops, sparse and 180-day retained histories, duplicate cumulative snapshots, equal distinct requests, counter reset/compaction ambiguity, stable restart offsets, model changes and assumptions, missing prices, exact 272,000 versus 272,001 long-context pricing and Fast multiplier.
-- Cross-process writer exclusion, read-only inspection while locked, forced process death and atomic JSON persistence.
+## Automated checks
 
-All account/CLI tests used a synthetic subprocess. All JSONL tests used generated fixtures and isolated temporary homes. No real account, credentials or user session directory was accessed.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --offline --locked --all-targets -- -D warnings`: passed.
+- `cargo test --offline --locked`: 256 normal tests passed; three substantial benchmarks are intentionally ignored in that normal command and were separately run successfully in release mode.
+- Rust 1.99.1; eframe 0.32.3; Cargo.lock retained. No runtime web app or Electron dependency.
 
-## UI comparison and intentional changes
+Coverage includes response/thread deduplication, legacy cumulative deltas, mixed schema overlap, model switches, unknown models, long-context prices, custom-price migration/restart, exact recorded auto-review exclusion, seven Luna children under a Sol parent, retained excluded raw data, filtered Turn snapshots, tree totals and cycles, real versus cached quota resets, background persistence/corrupt-file guards, numeric partial totals, all daily export formats and excluded audit export, first-frame dark/light theme pinning against an opposite system theme, and completed interval attribution/model sums.
 
-The five original screenshots were inspected as image pixels. The reconstruction keeps the original native Rust/eframe stack, recovered icon/CJK font, dark green/light palette, rounded outline, prominent percentage, thin progress track, quota/credits/reset rows and native detail windows.
+Completed intervals include actual multi-point changes without fabricated subdivisions, startup/reset/gap/unknown-model non-comparability, account/source/window/epoch boundaries, stable identities, missing versus zero cost, and exclusion-aware own-model totals. No hypothetical parent-price feature is included.
 
-The main window expands from the original 276×250 baseline to 310×360 to fit the requested two buttons and scrollable per-Task cost table and interval summary. This is intentional, not a claim of pixel-identical reproduction. Native DPI, fonts, shadows and window-manager decoration differ across OSes. Current actual UI captures are included in the release's validation/screenshots directory.
+## Substantial synthetic benchmarks
 
-## Not validated / blocked
+Optimized Linux measurements from this release (not promises about a user's machine):
 
-- The Windows EXE was cross-compiled on Linux. It was NOT executed on native Windows; display drivers, DPI, monitor changes, sleep/resume and Windows-specific topmost behavior still need native acceptance testing.
-- There is NO macOS executable in this release. Linux lacks an authorized Apple SDK/Xcode and Darwin linking environment. The complete source and Apple Silicon build/package script are included; an authorized Mac is needed to produce and natively validate the app.
-- No real authenticated Codex quota retrieval was attempted. The user must use their own already-installed, already-authenticated official CLI.
-- No Authenticode signature, Apple Developer ID signature or notarization. Do not disable security protections or bypass warnings.
-- Power-loss durability, multi-monitor/DPI transitions and prolonged production load were not tested. Atomic replacement and process-crash recovery were tested.
-- Fees are dated API-equivalent estimates with an explicit Standard/Fast assumption, not subscription billing. Cache-write/region/tool add-ons are not modeled separately. See docs/PRICING.md.
+- 200 files / 50,000 events / 100,200 lines / 18,873,790 bytes: initial import 527.284 ms; unchanged poll median 0.479 ms; one appended event 279.156 ms; identical pricing 0.001 ms. Peak test-process RSS 148,656 KiB.
+- 100,000 events / 1,000 Tasks / 2,000 quota history rows: indexed Task range median 0.073 ms; full history batch accounting 0.338 ms; cached accounting repaint 0.000133 ms. Original uncached reference frame 220.229 ms, indexed reference frame 34.364 ms.
+- 100,000 events / 10,000 quota rows / 79,993 model-breakdown rows: interval index 16.912 ms, completed interval derivation 33.632 ms. Indexed range aggregation avoids history-by-event rescans.
+
+Import, normalization, indexing, atomic persistence and export remain background-owned. No-op polls do not clone full history or rewrite interval files. Retired snapshots are destroyed off the GUI thread.
+
+## Platform artifacts and limits
+
+- Linux x86_64 release built and exercised through actual eframe windows on authenticated Xvfb/Openbox, software OpenGL. Screenshots are actual rendered UI with synthetic fixtures, not mockups.
+- Windows x64 release cross-built successfully with the GNU target. PE headers identify an x86-64 GUI executable; imported DLLs are Windows system libraries. It has NOT been run or accepted on native Windows in this environment.
+- macOS Apple Silicon `aarch64-apple-darwin` code check passed. No Apple SDK/linker is present, so no Mac application/binary was linked, packaged, signed or tested.
+- No Authenticode signing or Apple notarization. Do not disable security protections or bypass warnings.
+
+The full source package contains the exact final source and lockfile, complete embedded fonts/icon and licenses, fixtures, tests, build instructions/scripts and selected validation evidence. External build artifacts and generated runtime state are excluded.
+
+Pricing is dated API-equivalent estimation, not actual subscription charges. Exact recorded `codex-auto-review` is excluded by request, with retained audit records; no free-billing claim. Standard/Fast defaults for Sol/Luna/Astra were checked against official documentation on 2026-10-17. Existing custom rates are preserved. See docs/PRICING.md.
+
+## Actual final UI acceptance
+
+The same final Linux binary was launched, closed and relaunched with persisted settings. Verified collapsed/expanded tree, seven visible Luna descendants rather than 26 (19 excluded review tasks), actual-name/model/rate tooltip with all seven counters, default mixed-model details, separate 19-record review audit, readable dark header buttons after restart, and numeric zero current buckets after a completed decrement.
+
+The synthetic completed 2pp interval displays $0.1362 total and $0.0681 per percentage point. Model detail shows eight Luna responses totaling $0.0192 and three Sol responses totaling $0.1170. The actual GUI's CSV and JSON export buttons were exercised; parsed exports reconcile to those exact amounts and contain no excluded auto-review usage. The initial incomplete interval displays a numeric $0.0000 with uncertainty rather than a negative zero or invented comparable ratio.
+
+See validation/release-0.3.2/final-*.png and selected logs/examples. The blank live quota in offline screenshots is intentional: fixtures supply local usage/history, not a fabricated official live balance.
