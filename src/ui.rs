@@ -187,16 +187,34 @@ struct HistoryCache {
     sources_generation: Option<u64>,
     sources: Vec<(String, Option<String>, String)>,
     has_legacy: bool,
-    key: Option<(u64, u64, NaiveDate, String, bool)>,
+    key: Option<HistoryCacheKey>,
+    work_key: Option<HistoryCacheKey>,
     rows: Vec<(HistoryEvent, Option<f64>, bool)>,
     weighted: Option<f64>,
     interval_indices: Vec<usize>,
     table_rows: Vec<TableIntervalRow>,
+    pending_segments: Vec<DailyQuotaSegment>,
+    day_token_indices: Vec<usize>,
+    next_segment: usize,
+    weighted_usd: f64,
+    weighted_points: f64,
+    weighted_samples: usize,
+    has_lower_bound: bool,
+}
+type HistoryCacheKey = (u64, u64, NaiveDate, String, bool, bool);
+#[derive(Clone)]
+struct DailyQuotaSegment {
+    event: Option<HistoryEvent>,
+    change: String,
+    start: i64,
+    end: i64,
+    points: f64,
 }
 struct TableIntervalRow {
     interval_index: Option<usize>,
     presentation: IntervalPresentation,
     models: Vec<quota_widget::intervals::ModelIntervalUsage>,
+    task_counts: [usize; 4],
 }
 struct WidgetApp {
     settings: Settings,
@@ -309,6 +327,7 @@ fn recovered_history_presentations(
     history: &[HistoryEvent],
     costs: &accounting::CostIndex,
     token_events: &[TokenEvent],
+    wanted: Option<&BTreeSet<String>>,
 ) -> BTreeMap<
     String,
     (
@@ -331,6 +350,9 @@ fn recovered_history_presentations(
     let mut previous: BTreeMap<(String, String, Option<String>, String), Vec<(i64, i64)>> =
         BTreeMap::new();
     let mut recovered = BTreeMap::new();
+    // TokenStore normalizes the snapshot by (timestamp, id), so each interval
+    // can use a binary range instead of rescanning all historical token rows.
+    let tokens = token_events;
     for event in visible {
         if event.kind != quota_widget::model::HistoryKind::QuotaDecrease {
             continue;
@@ -359,19 +381,22 @@ fn recovered_history_presentations(
                     .map(|(at, _)| *at)
             });
             if let Some(start) = start {
-                let cost = costs.observed(start, event.observed_at_unix);
-                let models =
-                    quota_widget::intervals::model_usage(token_events.iter().filter(|token| {
-                        token.timestamp > start && token.timestamp <= event.observed_at_unix
-                    }));
-                recovered.insert(
-                    intervals::history_event_key(&event),
-                    (
-                        start,
-                        interval_views::recovered_observation(&event, start, cost),
-                        models,
-                    ),
-                );
+                let key = intervals::history_event_key(&event);
+                if wanted.is_none_or(|wanted| wanted.contains(&key)) {
+                    let lo = tokens.partition_point(|token| token.timestamp <= start);
+                    let hi =
+                        tokens.partition_point(|token| token.timestamp <= event.observed_at_unix);
+                    let cost = costs.observed(start, event.observed_at_unix);
+                    let models = quota_widget::intervals::model_usage(&tokens[lo..hi]);
+                    recovered.insert(
+                        key,
+                        (
+                            start,
+                            interval_views::recovered_observation(&event, start, cost),
+                            models,
+                        ),
+                    );
+                }
             }
             previous
                 .entry((
@@ -385,6 +410,131 @@ fn recovered_history_presentations(
         }
     }
     recovered
+}
+fn daily_quota_segments(
+    history: &[HistoryEvent],
+    day_start: i64,
+    day_end: i64,
+    future_remaining: Option<f64>,
+    now: i64,
+) -> Vec<DailyQuotaSegment> {
+    let mut events = quota_widget::history::visible_observations(history);
+    events.sort_by_key(|event| {
+        (
+            event.observed_at_unix,
+            event
+                .evidence
+                .as_ref()
+                .and_then(|evidence| evidence.observed_at_ms)
+                .unwrap_or_else(|| event.observed_at_unix.saturating_mul(1000)),
+        )
+    });
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    let mut start = day_start;
+    for event in events.into_iter().filter(|event| {
+        event.kind == quota_widget::model::HistoryKind::QuotaDecrease
+            && event.observed_at_unix >= day_start
+            && event.observed_at_unix < day_end
+    }) {
+        let Some(before) = event
+            .before
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+        else {
+            continue;
+        };
+        let Some(after) = event
+            .after
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+        else {
+            continue;
+        };
+        if before <= after || event.observed_at_unix <= start {
+            continue;
+        }
+        let account = event
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence.account_id.as_deref())
+            .unwrap_or("");
+        if !seen.insert((account.to_owned(), before.to_bits(), after.to_bits())) {
+            continue;
+        }
+        let end = event.observed_at_unix;
+        result.push(DailyQuotaSegment {
+            change: format!("{}% → {}%", event.before, event.after),
+            event: Some(event),
+            start,
+            end,
+            points: before - after,
+        });
+        start = end;
+    }
+    if let Some(remaining) = future_remaining.filter(|value| value.is_finite() && *value > 0.0) {
+        let before = remaining.round() as i64;
+        if (1..=100).contains(&before) && now >= start {
+            result.push(DailyQuotaSegment {
+                event: None,
+                change: format!("{}% → {}%", before, before - 1),
+                start,
+                end: now,
+                points: 1.0,
+            });
+        }
+    }
+    result.reverse();
+    result
+}
+fn interval_task_counts(events: &[&TokenEvent]) -> [usize; 4] {
+    let mut sol = BTreeSet::new();
+    let mut luna = BTreeSet::new();
+    let mut astra = BTreeSet::new();
+    let mut total = BTreeSet::new();
+    for event in events
+        .iter()
+        .filter(|event| !event.is_excluded_auto_review())
+    {
+        total.insert(event.session.as_str());
+        let model = event.model.to_ascii_lowercase();
+        if model.ends_with("-sol") {
+            sol.insert(event.session.as_str());
+        } else if model.ends_with("-luna") {
+            luna.insert(event.session.as_str());
+        } else if model.ends_with("-astra") {
+            astra.insert(event.session.as_str());
+        }
+    }
+    [sol.len(), luna.len(), astra.len(), total.len()]
+}
+fn active_segment_presentation(
+    change: String,
+    start: i64,
+    cost: accounting::ObservedCost,
+) -> IntervalPresentation {
+    let amount = if cost.events == 0 {
+        "未知".into()
+    } else {
+        format!(
+            "{}{}",
+            if cost.partial { "≥ " } else { "≈ " },
+            money(Some(cost.known_usd))
+        )
+    };
+    IntervalPresentation {
+        change,
+        start: display_time::datetime(start).unwrap_or_else(|| "未知".into()),
+        end: "未知".into(),
+        duration: "進行中".into(),
+        total: amount.clone(),
+        observed_total: if cost.events == 0 { "無 Token 記錄".into() } else { amount },
+        per_point: (cost.events > 0).then(|| money(Some(cost.known_usd))).unwrap_or_else(|| "未知".into()),
+        status: "尚未觀察到下一次下降".into(),
+        tooltip: "今日目前仍在此額度；以午夜或上一個首次下降時間作為起點，統計至現在。下一個百分比變化尚未發生，因此時間未知。".into(),
+    }
 }
 fn progress_label(stage: ProgressStage) -> &'static str {
     match stage {
@@ -491,12 +641,16 @@ fn total_model_usage(models: &[intervals::ModelIntervalUsage]) -> intervals::Mod
     }
     total
 }
-fn model_usage_tooltip(label: &str, model: Option<&intervals::ModelIntervalUsage>) -> String {
+fn model_usage_tooltip(
+    label: &str,
+    model: Option<&intervals::ModelIntervalUsage>,
+    task_count: usize,
+) -> String {
     let Some(model) = model else {
-        return format!("{label}\n0 筆 · $0.0000");
+        return format!("{label}\nTask：{task_count} 個\n0 筆 · $0.0000");
     };
     format!(
-        "{label}\n記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
+        "{label}\nTask：{task_count} 個\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
         model.events,
         interval_model_cost(model),
         model.input,
@@ -1043,6 +1197,7 @@ impl WidgetApp {
         self.quota.reset_continuity();
         self.main_cache.key = None;
         self.history_cache.key = None;
+        self.history_cache.work_key = None;
         self.bridge = Some(Bridge::spawn(
             (!self.settings.codex_path.trim().is_empty())
                 .then(|| PathBuf::from(self.settings.codex_path.trim())),
@@ -1143,6 +1298,7 @@ impl WidgetApp {
         self.boundary_after = Some(now());
         self.main_cache.key = None;
         self.history_cache.key = None;
+        self.history_cache.work_key = None;
         self.status = "帳戶已變更".into();
     }
     fn retain_import_warning(&mut self, warning: String) {
@@ -1307,6 +1463,7 @@ impl WidgetApp {
                             self.boundary_after = Some(now());
                             self.main_cache.key = None;
                             self.history_cache.key = None;
+                            self.history_cache.work_key = None;
                             self.status = "帳戶已變更".into();
                         }
                         self.status = "LIVE".into();
@@ -1543,6 +1700,7 @@ impl WidgetApp {
             .collect();
         self.intervals = intervals;
         self.history_cache.key = None;
+        self.history_cache.work_key = None;
         self.main_cache.key = None;
     }
     fn selected(&self) -> Option<WindowView> {
@@ -1615,25 +1773,76 @@ impl WidgetApp {
         list.sort_by_key(|e| e.observed_at_unix);
         list
     }
-    fn browsed_history(&self) -> Vec<HistoryEvent> {
-        if let Some((source, key, label)) = &self.history_selection {
-            let mut events: Vec<_> = self
-                .history
-                .iter()
-                .filter(|e| {
-                    e.source_key == *source
-                        && match (&e.window_key, key) {
-                            (Some(a), Some(b)) => a == b,
-                            _ => e.window_label == *label,
-                        }
+    fn browsed_history_on_day(&self, day: NaiveDate) -> Vec<HistoryEvent> {
+        let Some((day_start, day_end)) = display_time::day_bounds(day) else {
+            return Vec::new();
+        };
+        let live = self.selected();
+        let fallback = self
+            .history
+            .iter()
+            .filter(|event| drop_event(event) || reset_event(event))
+            .filter(|event| {
+                event.source_key == self.settings.bucket
+                    && (event.window_label.contains("週")
+                        || event.window_label.to_ascii_lowercase().contains("week"))
+            })
+            .max_by_key(|event| event.observed_at_unix)
+            .or_else(|| {
+                self.history
+                    .iter()
+                    .filter(|event| drop_event(event) || reset_event(event))
+                    .max_by_key(|event| event.observed_at_unix)
+            });
+        let selected = self
+            .history_selection
+            .as_ref()
+            .map(|(source, key, label)| (source.as_str(), key.as_deref(), label.as_str()))
+            .or_else(|| {
+                live.as_ref().map(|view| {
+                    (
+                        view.source_key.as_str(),
+                        Some(view.window_key.as_str()),
+                        view.window_label.as_str(),
+                    )
                 })
-                .cloned()
-                .collect();
-            events.sort_by_key(|e| e.observed_at_unix);
-            events
-        } else {
-            self.matching_history()
-        }
+            })
+            .or_else(|| {
+                fallback.map(|event| {
+                    (
+                        event.source_key.as_str(),
+                        event.window_key.as_deref(),
+                        event.window_label.as_str(),
+                    )
+                })
+            });
+        let mut events: Vec<_> = self
+            .history
+            .iter()
+            .filter(|event| {
+                event.observed_at_unix >= day_start
+                    && event.observed_at_unix < day_end
+                    && selected.is_some_and(|(source, key, label)| {
+                        event.source_key == source
+                            && match (event.window_key.as_deref(), key) {
+                                (Some(event_key), Some(selected_key)) => event_key == selected_key,
+                                _ => event.window_label == label,
+                            }
+                    })
+            })
+            .cloned()
+            .collect();
+        events.sort_by_key(|event| {
+            (
+                event.observed_at_unix,
+                event
+                    .evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.observed_at_ms)
+                    .unwrap_or_else(|| event.observed_at_unix.saturating_mul(1000)),
+            )
+        });
+        events
     }
     fn refresh_main_cache(&mut self) {
         let t = now();
@@ -1669,8 +1878,6 @@ impl WidgetApp {
         }
         let all = self.matching_history();
         let visible = quota_widget::history::visible_observations(&all);
-        let recovered_rows =
-            recovered_history_presentations(&all, &self.tokens.cost_index, self.tokens.events());
         let recent_events: Vec<_> = visible
             .iter()
             .rev()
@@ -1683,6 +1890,16 @@ impl WidgetApp {
             .take(5)
             .cloned()
             .collect();
+        let wanted: BTreeSet<_> = recent_events
+            .iter()
+            .map(intervals::history_event_key)
+            .collect();
+        let recovered_rows = recovered_history_presentations(
+            &all,
+            &self.tokens.cost_index,
+            self.tokens.events(),
+            Some(&wanted),
+        );
         let mut recent_tooltip = String::from("最近 5 次扣額 · UTC+8\n");
         if recent_events.is_empty() {
             recent_tooltip.push_str("已完成區間：0\n");
@@ -2014,7 +2231,7 @@ impl WidgetApp {
                         muted
                     },
                 );
-                let title_size = (12. * scale * font_multiplier).clamp(10., 16.);
+                let title_size = font_size;
                 painter.with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(147., 36.))).text(
                     pt(34., 14.),
                     Align2::LEFT_TOP,
@@ -2450,18 +2667,12 @@ impl WidgetApp {
             self.date,
             selection_key,
             self.settings.hide_unchanged,
+            self.history_intervals,
         );
-        if self.history_cache.key.as_ref() != Some(&key) {
-            let all = self.browsed_history();
-            let recovered_rows = recovered_history_presentations(
-                &all,
-                &self.tokens.cost_index,
-                self.tokens.events(),
-            );
-            let visible: BTreeSet<_> = quota_widget::history::visible_observations(&all)
-                .iter()
-                .map(intervals::history_event_key)
-                .collect();
+        if self.history_cache.key.as_ref() != Some(&key)
+            && self.history_cache.work_key.as_ref() != Some(&key)
+        {
+            let all = self.browsed_history_on_day(self.date);
             // One batch pass, instead of one full-history scan for every row.
             let costs = if self.tokens.database.is_some() {
                 all.iter()
@@ -2477,7 +2688,8 @@ impl WidgetApp {
                 accounting::history_costs(&self.tokens.cost_index, &all)
             };
             self.history_cache.rows = all
-                .into_iter()
+                .iter()
+                .cloned()
                 .zip(costs)
                 .filter_map(|(event, (cost, partial))| {
                     (local_day(event.observed_at_unix) == Some(self.date)
@@ -2486,62 +2698,105 @@ impl WidgetApp {
                 })
                 .collect();
             self.history_cache.rows.reverse();
-            self.history_cache.interval_indices.clear();
             self.history_cache.table_rows.clear();
-            for (event, _, _) in &self.history_cache.rows {
-                let event_key = intervals::history_event_key(event);
-                if !visible.contains(&event_key) {
-                    continue;
-                }
-                let index = self.interval_lookup.get(&event_key).copied();
-                let recovered = recovered_rows.get(&event_key);
-                let should_recover = recovered.is_some_and(|(start, _, _)| {
-                    event.reconciliation.is_some()
-                        || index.is_none_or(|i| self.intervals[i].start != Some(*start))
-                });
-                if should_recover {
-                    let (start, presentation, models) = recovered.unwrap();
-                    let _ = start;
-                    if let Some(index) = index {
-                        self.history_cache.interval_indices.push(index);
-                    }
-                    self.history_cache.table_rows.push(TableIntervalRow {
-                        interval_index: None,
-                        presentation: presentation.clone(),
-                        models: models.clone(),
+            self.history_cache.interval_indices.clear();
+            self.history_cache.pending_segments.clear();
+            self.history_cache.day_token_indices.clear();
+            self.history_cache.next_segment = 0;
+            self.history_cache.weighted_usd = 0.0;
+            self.history_cache.weighted_points = 0.0;
+            self.history_cache.weighted_samples = 0;
+            self.history_cache.has_lower_bound = false;
+            self.history_cache.weighted = None;
+            if self.history_intervals {
+                if let Some((day_start, day_end)) = display_time::day_bounds(self.date) {
+                    let same_live_scope = current_view.as_ref().is_some_and(|view| {
+                        self.history_selection
+                            .as_ref()
+                            .is_none_or(|(source, window, label)| {
+                                view.source_key == *source
+                                    && (window.as_deref() == Some(view.window_key.as_str())
+                                        || (window.is_none() && view.window_label == *label))
+                            })
                     });
-                } else if let Some(index) = index {
-                    self.history_cache.interval_indices.push(index);
-                    self.history_cache.table_rows.push(TableIntervalRow {
-                        interval_index: Some(index),
-                        presentation: self.interval_presentations[index].clone(),
-                        models: self.intervals[index].models.clone(),
-                    });
-                } else if drop_event(event) && event.reconciliation.is_some() {
-                    self.history_cache.table_rows.push(TableIntervalRow {
-                        interval_index: None,
-                        presentation: recovered
-                            .map(|(_, row, _)| row.clone())
-                            .unwrap_or_else(|| interval_views::unconfirmed_observation(event)),
-                        models: recovered
-                            .map(|(_, _, models)| models.clone())
-                            .unwrap_or_default(),
-                    });
+                    let future_remaining = (self.date == display_time::now_day()
+                        && same_live_scope)
+                        .then(|| {
+                            current_view
+                                .as_ref()
+                                .and_then(|view| view.remaining_percent)
+                        })
+                        .flatten();
+                    self.history_cache.pending_segments =
+                        daily_quota_segments(&all, day_start, day_end, future_remaining, now());
+                    let tokens = self.tokens.events();
+                    // TokenStore normalizes events by (timestamp, id); binary
+                    // bounds avoid scanning years of token rows before showing
+                    // the first segment for the selected day.
+                    let lo = tokens.partition_point(|event| event.timestamp < day_start);
+                    let hi = tokens.partition_point(|event| event.timestamp < day_end);
+                    self.history_cache.day_token_indices = (lo..hi).collect();
                 }
             }
-            let estimates = self
+            self.history_cache.work_key = Some(key.clone());
+        }
+        if self.history_cache.work_key.as_ref() == Some(&key)
+            && self.history_cache.next_segment < self.history_cache.pending_segments.len()
+        {
+            let segment =
+                self.history_cache.pending_segments[self.history_cache.next_segment].clone();
+            let tokens = self.tokens.events();
+            let lo = self
                 .history_cache
-                .interval_indices
+                .day_token_indices
+                .partition_point(|&index| tokens[index].timestamp <= segment.start);
+            let hi = self
+                .history_cache
+                .day_token_indices
+                .partition_point(|&index| tokens[index].timestamp <= segment.end);
+            let segment_events: Vec<_> = self.history_cache.day_token_indices[lo..hi]
                 .iter()
-                .filter_map(|&i| self.interval_estimates[i].as_ref());
-            let (usd, points) = estimates.fold((0.0, 0.0), |(usd, points), estimate| {
-                (
-                    usd + estimate.known_usd,
-                    points + estimate.percentage_points,
-                )
+                .map(|&index| &tokens[index])
+                .collect();
+            let models = intervals::model_usage(segment_events.iter().copied());
+            let task_counts = interval_task_counts(&segment_events);
+            let cost = self.tokens.cost_index.observed(segment.start, segment.end);
+            let presentation = segment.event.as_ref().map_or_else(
+                || active_segment_presentation(segment.change.clone(), segment.start, cost),
+                |event| interval_views::recovered_observation(event, segment.start, cost),
+            );
+            if cost.events > 0 && segment.points > 0.0 {
+                self.history_cache.weighted_usd += cost.known_usd;
+                self.history_cache.weighted_points += segment.points;
+                self.history_cache.weighted_samples += 1;
+                self.history_cache.has_lower_bound |= cost.partial || cost.unknown_events > 0;
+                self.history_cache.weighted =
+                    Some(self.history_cache.weighted_usd / self.history_cache.weighted_points);
+            }
+            self.history_cache.table_rows.push(TableIntervalRow {
+                interval_index: None,
+                presentation,
+                models,
+                task_counts,
             });
-            self.history_cache.weighted = (points > 0.0).then_some(usd / points);
-            self.history_cache.key = Some(key);
+            if let Some(index) = segment.event.as_ref().and_then(|event| {
+                self.interval_lookup
+                    .get(&intervals::history_event_key(event))
+            }) {
+                self.history_cache.interval_indices.push(*index);
+            }
+            self.history_cache.next_segment += 1;
+            if self.history_cache.next_segment == self.history_cache.pending_segments.len() {
+                self.history_cache.key = Some(key.clone());
+                self.history_cache.work_key = None;
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+        } else if self.history_cache.work_key.as_ref() == Some(&key)
+            && self.history_cache.pending_segments.is_empty()
+        {
+            self.history_cache.key = Some(key.clone());
+            self.history_cache.work_key = None;
         }
         ui.label(format!(
             "紀錄：{} 筆",
@@ -2552,28 +2807,21 @@ impl WidgetApp {
             }
         ));
         ui.separator();
-        let estimates: Vec<_> = self
-            .history_cache
-            .interval_indices
-            .iter()
-            .filter_map(|&i| self.interval_estimates[i].as_ref())
-            .collect();
-        let has_lower_bound = estimates.iter().any(|estimate| estimate.lower_bound);
-        let sample_points: f64 = estimates
-            .iter()
-            .map(|estimate| estimate.percentage_points)
-            .sum();
         ui.label(format!(
             "所列區間加權平均：{}{} / 百分點",
-            if has_lower_bound { "≥ " } else { "≈ " },
+            if self.history_cache.has_lower_bound {
+                "≥ "
+            } else {
+                "≈ "
+            },
             money(self.history_cache.weighted)
         ));
-        if !estimates.is_empty() {
+        if self.history_cache.weighted_samples > 0 {
             ui.label(format!(
                 "樣本：{} 個區間 · {} 百分點{}",
-                estimates.len(),
-                sample_points,
-                if has_lower_bound {
+                self.history_cache.weighted_samples,
+                self.history_cache.weighted_points,
+                if self.history_cache.has_lower_bound {
                     " · Token 覆蓋不完整，僅供下限估算"
                 } else {
                     ""
@@ -2765,7 +3013,11 @@ impl WidgetApp {
     }
     fn completed_intervals_table(&mut self, ui: &mut egui::Ui) {
         if self.history_cache.table_rows.is_empty() {
-            ui.label("已完成區間：0");
+            if self.history_cache.work_key.is_some() {
+                ui.label("正在計算今日分段");
+            } else {
+                ui.label("已完成區間：0");
+            }
             return;
         }
         let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
@@ -2841,37 +3093,40 @@ impl WidgetApp {
                                     .collect();
                                 let total = total_model_usage(&row.models);
                                 let no_token_records = row.models.is_empty();
-                                let family_cell =
-                                    |usage: Option<&intervals::ModelIntervalUsage>| {
-                                        usage.map_or_else(
-                                            || {
-                                                format!(
-                                                    "0 次\n{}",
-                                                    if no_token_records {
-                                                        "未知"
-                                                    } else {
-                                                        "$0.0000"
-                                                    }
-                                                )
-                                            },
-                                            |model| {
-                                                format!(
-                                                    "{} 次\n{}",
-                                                    model.events,
-                                                    interval_model_cost(model)
-                                                )
-                                            },
-                                        )
-                                    };
+                                let family_cell = |family_index: usize,
+                                                   usage: Option<
+                                    &intervals::ModelIntervalUsage,
+                                >| {
+                                    usage.map_or_else(
+                                        || {
+                                            format!(
+                                                "{} 個 Task\n{}",
+                                                row.task_counts[family_index],
+                                                if no_token_records {
+                                                    "未知"
+                                                } else {
+                                                    "$0.0000"
+                                                }
+                                            )
+                                        },
+                                        |model| {
+                                            format!(
+                                                "{} 個 Task\n{}",
+                                                row.task_counts[family_index],
+                                                interval_model_cost(model)
+                                            )
+                                        },
+                                    )
+                                };
                                 let cells = [
                                     view.change.clone(),
                                     change_time,
-                                    family_cell(family_models[0].as_ref()),
-                                    family_cell(family_models[1].as_ref()),
-                                    family_cell(family_models[2].as_ref()),
+                                    family_cell(0, family_models[0].as_ref()),
+                                    family_cell(1, family_models[1].as_ref()),
+                                    family_cell(2, family_models[2].as_ref()),
                                     format!(
-                                        "{} 次\n{}",
-                                        total.events,
+                                        "{} 個 Task\n{}",
+                                        row.task_counts[3],
                                         if no_token_records {
                                             "未知".to_string()
                                         } else {
@@ -2889,6 +3144,7 @@ impl WidgetApp {
                                         model_usage_tooltip(
                                             "Sol（所有版本合併）",
                                             family_models[0].as_ref(),
+                                            row.task_counts[0],
                                         )
                                     },
                                     if no_token_records {
@@ -2897,6 +3153,7 @@ impl WidgetApp {
                                         model_usage_tooltip(
                                             "Luna（所有版本合併）",
                                             family_models[1].as_ref(),
+                                            row.task_counts[1],
                                         )
                                     },
                                     if no_token_records {
@@ -2905,12 +3162,17 @@ impl WidgetApp {
                                         model_usage_tooltip(
                                             "Astra（所有版本合併）",
                                             family_models[2].as_ref(),
+                                            row.task_counts[2],
                                         )
                                     },
                                     if no_token_records {
                                         no_token_hint
                                     } else {
-                                        model_usage_tooltip("所有模型總計", Some(&total))
+                                        model_usage_tooltip(
+                                            "所有模型總計",
+                                            Some(&total),
+                                            row.task_counts[3],
+                                        )
                                     },
                                 ];
                                 for i in 0..cells.len() {
@@ -4251,6 +4513,77 @@ mod widget_revision_tests {
         assert_eq!(interval_model_cost(&model), "$0.0024 *");
     }
 
+    fn quota_drop(at: i64, before: &str, after: &str) -> HistoryEvent {
+        serde_json::from_value(serde_json::json!({
+            "session":"synthetic", "observed_at_unix":at, "source_key":"codex",
+            "epoch":0, "kind":"QuotaDecrease", "window_label":"week",
+            "window_key":"primary", "before":before, "after":after, "delta":"1"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn daily_segments_start_at_midnight_and_ignore_repeated_first_decrements() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+        let (start, end) = display_time::day_bounds(day).unwrap();
+        let history = vec![
+            quota_drop(start + 120, "11", "10"),
+            quota_drop(start + 600, "10", "9"),
+            quota_drop(start + 1200, "10", "9"),
+            quota_drop(start + 1800, "9", "8"),
+        ];
+        let rows = daily_quota_segments(&history, start, end, Some(1.), start + 2400);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].change, "1% → 0%");
+        assert!(rows[0].event.is_none());
+        assert_eq!(rows[0].start, start + 1800);
+        assert_eq!(rows[0].end, start + 2400);
+        assert_eq!(rows[1].change, "9% → 8%");
+        assert_eq!((rows[1].start, rows[1].end), (start + 600, start + 1800));
+        assert_eq!(rows[2].change, "10% → 9%");
+        assert_eq!((rows[2].start, rows[2].end), (start + 120, start + 600));
+        assert_eq!(rows[3].change, "11% → 10%");
+        assert_eq!((rows[3].start, rows[3].end), (start, start + 120));
+    }
+
+    #[test]
+    fn interval_counts_unique_tasks_per_model_family() {
+        let make = |id: &str, session: &str, model: &str, flags: Vec<String>| TokenEvent {
+            id: id.into(),
+            timestamp: 100,
+            model: model.into(),
+            model_assumed: false,
+            reasoning_effort: None,
+            session: session.into(),
+            response_id: None,
+            turn_id: None,
+            source_kind: None,
+            input: 1,
+            cached: 0,
+            uncached: 1,
+            output: 0,
+            reasoning: 0,
+            cost_usd: Some(0.01),
+            coverage_start_timestamp_ms: None,
+            partial_flags: flags,
+        };
+        let events = [
+            make("1", "task-a", "gpt-6.1-sol", vec![]),
+            make("2", "task-a", "gpt-6.1-sol", vec![]),
+            make("3", "task-a", "gpt-6-luna", vec![]),
+            make("4", "task-b", "gpt-6-luna", vec![]),
+            make("5", "task-c", "gpt-6-astra", vec![]),
+            make(
+                "6",
+                "task-review",
+                "codex-auto-review",
+                vec!["excluded_recorded_codex_auto_review".into()],
+            ),
+        ];
+        let refs: Vec<_> = events.iter().collect();
+        assert_eq!(interval_task_counts(&refs), [1, 2, 1, 3]);
+    }
+
     #[test]
     fn partial_interval_label_keeps_known_subtotal_and_explains_full_time_span() {
         let e = history_fixture();
@@ -4335,9 +4668,11 @@ mod widget_revision_tests {
         assert_eq!(views_ptr, app.interval_presentations.as_ptr());
         app.date = local_day(time + 210).unwrap();
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
-        });
+        for _ in 0..app.history.len() {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
+            });
+        }
         let ids = app.history_cache.interval_indices.clone();
         assert!(!ids.is_empty());
         assert!(ids
@@ -6543,17 +6878,23 @@ mod recovered_history_display_tests {
         }
         app.date = local_day(120).unwrap();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
-        });
+        for completed in 1..=8 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
+            });
+            assert_eq!(app.history_cache.table_rows.len(), completed);
+        }
         let recovered: Vec<_> = app
             .history_cache
             .table_rows
             .iter()
-            .filter(|(i, _)| i.is_none())
+            .filter(|row| row.interval_index.is_none())
             .collect();
         assert_eq!(recovered.len(), 8);
-        assert!(recovered.iter().all(|(_, view)| view.total == "待確認"));
-        assert_eq!(app.history_cache.interval_indices.len(), 14);
+        assert!(recovered.iter().all(|row| row.presentation.total == "未知"));
+        assert!(recovered
+            .iter()
+            .all(|row| row.presentation.status == "區間沒有 Token 記錄"));
+        assert_eq!(app.history_cache.interval_indices.len(), 8);
     }
 }

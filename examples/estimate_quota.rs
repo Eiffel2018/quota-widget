@@ -1,5 +1,5 @@
 //! Read an interval export locally; print only the newest shared estimate.
-use quota_widget::{intervals::CompletedInterval, quota_estimate::shared_estimates};
+use quota_widget::{intervals::CompletedInterval, quota_estimate::interval_estimates};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("expected quota-intervals.json path")?;
     let file: IntervalFile = serde_json::from_reader(std::fs::File::open(path)?)?;
-    let estimates = shared_estimates(&file.intervals);
+    let estimates = interval_estimates(&file.intervals);
     let newest = file
         .intervals
         .iter()

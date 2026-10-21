@@ -91,7 +91,7 @@ pub fn palette(dark: bool) -> Palette {
 /// multiplied by their previous values. Reapplying this function is idempotent
 /// and shrinking a window restores the appropriate size without cumulative zoom.
 pub fn configure_style(style: &mut egui::Style, dark: bool, font_size: f32) {
-    let font_size = if font_size.is_finite() {
+    let font_size = if font_size.is_finite() && font_size > 0.0 {
         font_size.max(MINIMUM_CONFIGURABLE_FONT)
     } else {
         REFERENCE_MINIMUM_FONT
