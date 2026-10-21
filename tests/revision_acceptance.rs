@@ -343,7 +343,7 @@ fn widget_grows_one_row_at_a_time_then_scrolls_at_configured_threshold() {
         if count > 1 {
             assert_eq!(
                 usage_views::widget_height(count, 10) - usage_views::widget_height(count - 1, 10),
-                18.
+                22.
             );
         }
     }

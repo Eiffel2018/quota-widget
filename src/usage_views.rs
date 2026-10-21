@@ -215,7 +215,7 @@ pub fn visible_task_rows(task_count: usize, threshold: usize) -> usize {
 }
 /// Logical pixels at the original 310px width; upper quota geometry stays fixed.
 pub fn widget_height(task_count: usize, threshold: usize) -> f32 {
-    296. + 18. * visible_task_rows(task_count, threshold) as f32
+    324. + 22. * visible_task_rows(task_count, threshold) as f32
 }
 
 /// What the supplied authoritative metadata says about a task's immediate parent.

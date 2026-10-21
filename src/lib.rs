@@ -1,3 +1,4 @@
+pub mod accessibility;
 pub mod accounting;
 pub mod bridge;
 pub mod display_time;

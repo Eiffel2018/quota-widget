@@ -69,8 +69,8 @@ pub fn present(interval: &CompletedInterval) -> IntervalPresentation {
         .start
         .and_then(|start| interval.end.checked_sub(start))
         .filter(|seconds| *seconds > 0 && start_time.is_some() && end_time.is_some());
-    let start = start_time.unwrap_or_else(|| "未知（缺少或無效起點）".into());
-    let end = end_time.unwrap_or_else(|| "未知（無效終點）".into());
+    let start = start_time.unwrap_or_else(|| "未知".into());
+    let end = end_time.unwrap_or_else(|| "未知".into());
     let duration = seconds.map(elapsed).unwrap_or_else(|| "未知".into());
     let change = format!("{}% → {}%", number(interval.before), number(interval.after));
     let valid_decrement = interval.before.is_finite()
@@ -95,21 +95,20 @@ pub fn present(interval: &CompletedInterval) -> IntervalPresentation {
     let per_point = match ratio {
         Some(value) if averaged => format!("平均 {}/百分點", money(value)),
         Some(value) => format!("{}/百分點", money(value)),
-        None if complete => "未知（每百分點費用不可用）".into(),
-        None => "不可比較".into(),
+        None => "未知".into(),
     };
     let status = if !complete {
-        "不完整／不可比較"
+        "部分"
     } else if ratio.is_none() {
-        "每百分點費用未知"
+        "未知"
     } else if averaged {
-        "完整／多百分點平均"
+        "平均"
     } else {
-        "完整／可比較"
+        "完整"
     }
     .to_owned();
-    let mut tooltip = format!(
-        "{} · {} · 下降 {} 百分點\n起點：{}\n終點：{}\n歷時：{}\n時段已知小計：{}\n每百分點：{}\n狀態：{}",
+    let tooltip = format!(
+        "額度視窗：{}\n額度變化：{}\n下降：{} 百分點\n起點：{}\n終點：{}\n歷時：{}\n已知小計：{}\n每百分點：{}\n狀態：{}\n記錄來源：{}\n觀察工作階段：{}",
         interval.window_label,
         change,
         number(interval.percentage_points),
@@ -118,36 +117,10 @@ pub fn present(interval: &CompletedInterval) -> IntervalPresentation {
         duration,
         total,
         per_point,
-        status
+        status,
+        interval.source_key,
+        interval.session
     );
-    tooltip.push_str(&format!(
-        "\n記錄來源：{} · 觀察工作階段：{}",
-        interval.source_key, interval.session
-    ));
-    if !complete {
-        tooltip.push_str(
-            "\n資料不完整；這是所示時段已記錄用量的小計，未能完整歸屬本次扣額，不能當作每%價格。",
-        );
-    }
-    if !interval.reasons.is_empty() {
-        tooltip.push_str("\n限制：");
-        tooltip.push_str(
-            &interval
-                .reasons
-                .iter()
-                .map(|reason| reason.label())
-                .collect::<Vec<_>>()
-                .join("；"),
-        );
-    }
-    if averaged {
-        tooltip.push_str(if ratio.is_some() {
-            "\n多百分點跳變僅顯示整段平均；沒有逐一百分點資料，不拆成虛構 1% 區間。"
-        } else {
-            "\n多百分點跳變的整段平均不可用；沒有逐一百分點資料，不拆成虛構 1% 區間。"
-        });
-    }
-    tooltip.push_str("\nAPI 等價費用估算，並非訂閱實際帳單；官方額度與 API 費用不是相同計費單位。不同額度視窗的費用不可相加。");
     IntervalPresentation {
         change,
         start,

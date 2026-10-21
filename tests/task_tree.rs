@@ -314,11 +314,11 @@ fn height_threshold_counts_summaries_and_expanded_children() {
     }
     let collapsed = task_tree_rows(&tasks, &map, &BTreeSet::new());
     assert_eq!(collapsed.len(), 2);
-    assert_eq!(widget_height(collapsed.len(), 10), 332.);
+    assert_eq!(widget_height(collapsed.len(), 10), 368.);
     let open = task_tree_rows(&tasks, &map, &expanded(&["main"]));
     assert_eq!(open.len(), 14);
     assert_eq!(visible_task_rows(open.len(), 10), 10);
-    assert_eq!(widget_height(open.len(), 10), 476.);
+    assert_eq!(widget_height(open.len(), 10), 544.);
 }
 
 #[test]

@@ -4,7 +4,7 @@ use eframe::egui::{
     ViewportCommand, ViewportId, WindowLevel,
 };
 use quota_widget::{
-    accounting,
+    accessibility, accounting,
     background::{
         Command as WorkCommand, Event as WorkEvent, Operation, Progress as WorkProgress,
         ProgressStage, Snapshot, Worker,
@@ -26,6 +26,20 @@ use std::{
     sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
+
+fn accessible_visible_rows(
+    count: usize,
+    threshold: usize,
+    scale: f32,
+    monitor_height: Option<f32>,
+) -> usize {
+    let requested = usage_views::visible_task_rows(count, threshold);
+    let available = monitor_height
+        .filter(|height| height.is_finite() && *height > 0.)
+        .map(|height| (((height - 60.) / scale - 324.) / 22.).floor().max(1.) as usize)
+        .unwrap_or(requested);
+    requested.min(available)
+}
 
 #[derive(PartialEq)]
 struct LiveSelectionKey {
@@ -97,7 +111,7 @@ impl LayoutConvergence {
             self.next_retry = None;
             self.converged = false;
             self.quiet_since = Some(t);
-            plan.minimum = Some(Vec2::new(276., height));
+            plan.minimum = Some(Vec2::new(430., height));
         }
         if self
             .observed_size
@@ -413,8 +427,7 @@ fn money(v: Option<f64>) -> String {
     })
     .unwrap_or_else(|| "$—".into())
 }
-const PARTIAL_INTERVAL_WARNING: &str =
-    "資料不完整；這是所示時段已記錄用量的小計，未能完整歸屬本次扣額，不能當作每%價格。";
+const PARTIAL_INTERVAL_WARNING: &str = "狀態：部分";
 fn history_description(
     event: &HistoryEvent,
     cost: Option<f64>,
@@ -422,22 +435,16 @@ fn history_description(
     interval: Option<&CompletedInterval>,
 ) -> String {
     if event.reconciliation.is_some() {
-        format!(
-            "{}% → {}% · 觀察有差異（不作扣額分界）",
-            event.before, event.after
-        )
+        format!("{}% → {}% · 狀態：差異", event.before, event.after)
     } else if event.kind == quota_widget::model::HistoryKind::QuotaDecrease {
         let cost_text = match interval {
-            Some(v) if !v.comparable => format!(
-                "時段已知小計 {} * · 不可按百分點比較",
-                money(Some(v.known_usd))
-            ),
+            Some(v) if !v.comparable => format!("小計 {} * · 部分", money(Some(v.known_usd))),
             Some(v) => format!(
                 "{} · {}/百分點",
                 money(Some(v.known_usd)),
                 money(v.cost_per_point)
             ),
-            None if partial => format!("已知小計 {} * · 資料不完整", money(cost)),
+            None if partial => format!("小計 {} * · 部分", money(cost)),
             None => money(cost),
         };
         format!(
@@ -455,6 +462,22 @@ fn history_description(
         )
     }
 }
+fn readable_tooltip(ui: &mut egui::Ui, text: &str, font_size: f32) {
+    // Tooltips are painted inside the native viewport, not a new OS window.
+    // Keep both the popup frame and its scroll bar inside the smallest root.
+    let screen = ui.ctx().screen_rect();
+    let width = (screen.width() - 40.).clamp(120., 680.);
+    ui.set_width(width);
+    egui::ScrollArea::vertical()
+        .max_width(width)
+        .max_height((screen.height() - 40.).max(120.))
+        .min_scrolled_height(0.)
+        .show(ui, |ui| {
+            ui.set_width(width - 20.);
+            ui.add(egui::Label::new(RichText::new(text).size(font_size)).wrap());
+        });
+}
+
 fn history_tooltip(description: &str, interval: Option<&CompletedInterval>) -> String {
     let Some(v) = interval else {
         return description.to_owned();
@@ -470,16 +493,6 @@ fn history_tooltip(description: &str, interval: Option<&CompletedInterval>) -> S
     if !v.comparable {
         text.push('\n');
         text.push_str(PARTIAL_INTERVAL_WARNING);
-    }
-    if !v.reasons.is_empty() {
-        text.push('\n');
-        text.push_str(
-            &v.reasons
-                .iter()
-                .map(|r| r.label())
-                .collect::<Vec<_>>()
-                .join(" · "),
-        );
     }
     text
 }
@@ -580,14 +593,15 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
         .as_ref()
         .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
     let mut settings = settings_read.unwrap_or_default();
-    settings.size[0] = settings.size[0].clamp(276., 1000.);
+    settings.size[0] = settings.size[0].clamp(430., 1000.);
     settings.task_visible_rows = settings.task_visible_rows.clamp(1, 50);
     settings.size[1] = usage_views::widget_height(0, settings.task_visible_rows as usize)
         * settings.size[0]
         / 310.;
     let mut viewport = ViewportBuilder::default()
         .with_inner_size(settings.size)
-        .with_min_inner_size([276., 280.])
+        .with_min_inner_size([430., 400.])
+        .with_max_inner_size([1000., 2000.])
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
@@ -841,11 +855,13 @@ impl WidgetApp {
         // Pin the saved application preference; set_visuals alone modifies the
         // currently selected style but leaves System free to switch it on frame 1.
         ctx.set_theme(egui::Theme::from_dark_mode(self.settings.dark));
-        ctx.set_visuals(if self.settings.dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        let mut style = (*ctx.style()).clone();
+        accessibility::configure_style(
+            &mut style,
+            self.settings.dark,
+            accessibility::minimum_font(self.settings.size[0]),
+        );
+        ctx.set_style(style);
     }
     fn connect(&mut self) {
         self.bridge = None;
@@ -879,7 +895,6 @@ impl WidgetApp {
         if let Some(error) = &self.quota_error {
             text.push_str(&format!("\n{error}"));
         }
-        text.push_str("\n額度使用官方 CLI 獨立連線；Token 掃描進度不代表額度已連線。\n按更新額度會在連線已結束時重新連線。設定／連接可檢查 CLI 路徑。");
         text
     }
     fn compact_status_text(&self) -> Option<String> {
@@ -966,7 +981,7 @@ impl WidgetApp {
         if let Some((progress, received)) = &self.work_progress {
             if let Some(label) = migration_progress_label(progress) {
                 return format!(
-                    "{} · 已用 {} 秒。畫面保留已載入資料。",
+                    "{} · {} 秒",
                     label,
                     progress
                         .elapsed
@@ -975,9 +990,12 @@ impl WidgetApp {
                 );
             }
             return format!(
-                "{}… 已用 {} 秒；{}/{} 檔、讀取 {} 行、{} 筆觀察、{} 筆整理用量。畫面保留已載入資料。",
+                "{} · {} 秒 · 檔案 {}/{} · 行 {} · 觀察 {} · 用量 {}",
                 progress_label(progress.stage),
-                progress.elapsed.saturating_add(received.elapsed()).as_secs(),
+                progress
+                    .elapsed
+                    .saturating_add(received.elapsed())
+                    .as_secs(),
                 progress.files_done,
                 progress.files_total,
                 progress.lines_read,
@@ -1001,11 +1019,9 @@ impl WidgetApp {
             "等待本機 Token 掃描。".into()
         } else {
             match self.last_import_elapsed {
-                Some(elapsed) => format!(
-                    "{} 本輪完成耗時 {:.1} 秒。",
-                    self.import_note,
-                    elapsed.as_secs_f64()
-                ),
+                Some(elapsed) => {
+                    format!("{} 耗時 {:.1} 秒", self.import_note, elapsed.as_secs_f64())
+                }
                 None => self.import_note.clone(),
             }
         }
@@ -1059,9 +1075,12 @@ impl WidgetApp {
     }
     fn import_diagnostic_text(&self) -> String {
         format!(
-            "{}\n來源：{}\n已載入 {} 筆用量；另有 {} 筆排除用量。\n{}\n主表依近期範圍顯示；Token 明細可切換日期。點擊開啟設定及匯入診斷。",
-            self.import_status_text(), self.settings.sessions_path,
-            self.included_count(), self.excluded_count(), self.notice
+            "{}\n來源：{}\n用量：{} · 排除：{}\n{}",
+            self.import_status_text(),
+            self.settings.sessions_path,
+            self.included_count(),
+            self.excluded_count(),
+            self.notice
         )
     }
     fn import_diagnostics_ui(&mut self, ui: &mut egui::Ui) {
@@ -1072,17 +1091,14 @@ impl WidgetApp {
         if !self.import_warnings.is_empty() {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                format!(
-                    "保留 {} 項匯入警告；未被後續空掃描清除。",
-                    self.import_warnings.len()
-                ),
+                format!("匯入警告：{}", self.import_warnings.len()),
             );
         }
         ui.collapsing("匯入診斷／來源", |ui| {
             ui.label(format!("用量來源：{}", self.settings.sessions_path));
             ui.label(format!("儲存目錄：{}", self.dir.display()));
             ui.label(format!(
-                "目前載入 {} 筆用量、{} 筆排除用量、{} 筆額度觀察。",
+                "用量：{} · 排除：{} · 額度：{}",
                 self.included_count(),
                 self.excluded_count(),
                 self.history.len()
@@ -1093,7 +1109,6 @@ impl WidgetApp {
             if !self.import_warnings.is_empty() && ui.button("清除已讀警告").clicked() {
                 self.import_warnings.clear();
             }
-            ui.small("警告最多保留 20 項；只顯示檔案及格式診斷，不顯示原始對話。");
         });
     }
     fn handle_bridge_event(&mut self, event: BridgeEvent) {
@@ -1432,18 +1447,21 @@ impl WidgetApp {
             })
             .take(5)
             .collect();
-        let mut recent_tooltip = String::from("最近 5 個已記錄扣額區間 · 香港時間 +08:00\n");
+        let mut recent_tooltip = String::from("最近 5 次扣額 · UTC+8\n");
         if recent_intervals.is_empty() {
-            recent_tooltip.push_str("尚未有已完成扣額區間。\n");
+            recent_tooltip.push_str("已完成區間：0\n");
         }
         for &index in &recent_intervals {
             let row = &self.interval_presentations[index];
             recent_tooltip.push_str(&format!(
-                "\n{} · {}\n總用度 {} · {}\n",
-                row.change, row.end, row.total, row.per_point
+                "\n{} · {}\n估算 USD {} · 每% {} · {}\n",
+                row.change,
+                row.end,
+                row.total,
+                row.per_point.replace("/百分點", ""),
+                row.status
             ));
         }
-        recent_tooltip.push_str("\n只列真實扣額區間；重設不算消耗。多百分點顯示平均。* 為不完整已知小計，不作每%比較。API 模型等價估算，並非訂閱扣款。點擊可開啟完整表格。");
         let boundary = all
             .iter()
             .filter(|e| {
@@ -1463,7 +1481,7 @@ impl WidgetApp {
         let start = boundary.as_ref().map(|e| e.observed_at_unix);
         let quota_coverage_gap = quota_endpoint_mismatch(boundary.as_ref(), live.as_ref());
         if quota_coverage_gap {
-            recent_tooltip.push_str("\n目前額度與上次記錄扣額的結束值不同，缺少中間額度觀察。累計僅為已記錄時段小計，不能當作完整的目前 1% 用度；沒有推算或補造扣額。所有 Task 本%累計均以 * 標示。");
+            recent_tooltip.push_str("\n覆蓋：部分（額度缺口）");
         }
         self.request_database_view(start, t);
         let (mut tasks, mut cost, loading) = if let Some(view) = &self.tokens.database {
@@ -1504,7 +1522,7 @@ impl WidgetApp {
             }
         }
         if loading {
-            recent_tooltip.push_str("\n正在背景更新目前範圍；暫不顯示上一範圍的累計費用。");
+            recent_tooltip.push_str("\n狀態：更新中");
         }
         cost.partial |= start.is_none() || quota_coverage_gap;
         let tree =
@@ -1524,14 +1542,10 @@ impl WidgetApp {
         let model = format!(
             "模型：{}{}",
             e.model,
-            if e.model_assumed {
-                "（未記錄，假設）"
-            } else {
-                ""
-            }
+            if e.model_assumed { "（假設）" } else { "" }
         );
         if e.is_excluded_auto_review() {
-            return format!("{model}\n依設定排除 codex-auto-review；無公開單價，不能稱為免費。官方額度不受此顯示篩選影響。");
+            return format!("{model}\n狀態：排除\n單價：未知");
         }
         if let Some(rate) = self.tokens.pricing.rates.get(&e.model) {
             let long = e.cost_usd.is_some()
@@ -1547,9 +1561,16 @@ impl WidgetApp {
                     .any(|f| f == "input_count_unavailable");
             let im = if long { 2. } else { 1. };
             let om = if long { 1.5 } else { 1. };
-            format!("{model}\n{}；USD / 1M：輸入{}／快取{}／輸出{}{}\n推理已含輸出；high／max 不另加倍率。",self.tokens.pricing.tier_label,rate.uncached_input_per_million*im,rate.cached_input_per_million*im,rate.output_per_million*om,if long {"（單次長上下文）"}else{""})
+            format!(
+                "{model}\n{}；USD / 1M：輸入{}／快取{}／輸出{}{}",
+                self.tokens.pricing.tier_label,
+                rate.uncached_input_per_million * im,
+                rate.cached_input_per_million * im,
+                rate.output_per_million * om,
+                if long { "（單次長上下文）" } else { "" }
+            )
         } else {
-            format!("{model}\n此模型沒有設定單價；不套用 Sol 價格。")
+            format!("{model}\n單價：未知")
         }
     }
     fn task_tooltip(&self, task: &usage_views::TaskRow) -> String {
@@ -1562,7 +1583,7 @@ impl WidgetApp {
             text.push_str(&format!(
                 "\n{}\nReasoning effort: {}\n香港時間: {}",
                 self.event_pricing_tooltip(e),
-                e.reasoning_effort.as_deref().unwrap_or("未知（未記錄）"),
+                e.reasoning_effort.as_deref().unwrap_or("未知"),
                 display_time::datetime(e.timestamp).unwrap_or_else(|| "未知".into())
             ));
             let number = |n: u64, flag: &str| {
@@ -1607,29 +1628,29 @@ impl WidgetApp {
         } else {
             text.push_str("\nTurn Input: 未知\nTurn Output: 未知");
         }
-        text.push_str("\n* 資料不完整／估價假設；點擊複製 ID。");
+        if task.partial {
+            text.push_str("\n狀態：部分");
+        }
         text
     }
     fn widget(&mut self, ctx: &egui::Context) {
         self.refresh_main_cache();
         let dark = self.settings.dark;
-        let (bg, fg, muted, line, accent) = if dark {
-            (
-                Color32::from_rgb(23, 39, 34),
-                Color32::from_rgb(220, 247, 229),
-                Color32::from_rgb(145, 173, 160),
-                Color32::from_rgb(48, 74, 62),
-                Color32::from_rgb(105, 177, 139),
-            )
-        } else {
-            (
-                Color32::from_rgb(240, 248, 240),
-                Color32::from_rgb(29, 61, 45),
-                Color32::from_rgb(91, 124, 106),
-                Color32::from_rgb(199, 218, 203),
-                Color32::from_rgb(65, 137, 91),
-            )
-        };
+        let palette = accessibility::palette(dark);
+        let (bg, fg, muted, line, accent) = (
+            palette.background,
+            palette.text,
+            palette.text,
+            palette.widget,
+            palette.text,
+        );
+        let root_width = ctx.screen_rect().width();
+        let font_size = accessibility::minimum_font(root_width);
+        if (ctx.style().text_styles[&egui::TextStyle::Body].size - font_size).abs() > 0.1 {
+            let mut style = (*ctx.style()).clone();
+            accessibility::configure_style(&mut style, dark, font_size);
+            ctx.set_style(style);
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -1637,16 +1658,22 @@ impl WidgetApp {
                 let w = rect.width();
                 let sx = w / 310.;
                 let sy = sx;
-                let visible=usage_views::visible_task_rows(self.main_cache.tree.len(),self.settings.task_visible_rows as usize);
+                let monitor_height=ctx.input(|input|input.viewport().monitor_size.map(|size|size.y));
+                let visible=accessible_visible_rows(self.main_cache.tree.len(),self.settings.task_visible_rows as usize,sx,monitor_height);
                 let layout=(visible,self.settings.task_visible_rows,w.round() as u32);
                 let suspended=ctx.input(|input| {
                     let viewport=input.viewport();
                     viewport.minimized.unwrap_or(false) || viewport.maximized.unwrap_or(false) || viewport.fullscreen.unwrap_or(false)
                 });
                 if !suspended {
-                    let height=usage_views::widget_height(self.main_cache.tree.len(),self.settings.task_visible_rows as usize)*sx;
+                    let height=(324.+22.*visible as f32)*sx;
                     let plan=self.layout.plan(layout,rect.size(),height,ctx.input(|input|input.pointer.any_down()),Instant::now());
-                    if let Some(minimum)=plan.minimum {ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(minimum));}
+                    if let Some(minimum)=plan.minimum {
+                        let maximum_height=monitor_height.map(|h|(h-60.).max(480.)).unwrap_or(2000.);
+                        let maximum_width=(maximum_height*310./346.).clamp(430.,1000.);
+                        ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(maximum_width,maximum_height)));
+                        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(minimum.x,minimum.y.min(maximum_height))));
+                    }
                     if let Some(size)=plan.size {ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));}
                     if let Some(delay)=plan.repaint_after {ctx.request_repaint_after(delay);}
                 }
@@ -1665,7 +1692,7 @@ impl WidgetApp {
                         pt(x, y),
                         Align2::LEFT_TOP,
                         text,
-                        FontId::proportional(size * scale),
+                        FontId::proportional((size * scale).max(font_size)),
                         color,
                     );
                 };
@@ -1729,8 +1756,8 @@ impl WidgetApp {
                 txt(34., 14., title, 14., fg);
                 if ui
                     .put(
-                        Rect::from_min_max(pt(161., 12.), pt(224., 37.)),
-                        egui::Button::new(RichText::new("扣額紀錄").size(11. * scale).color(fg)).fill(line),
+                        Rect::from_min_max(pt(148., 12.), pt(220., 37.)),
+                        egui::Button::new(RichText::new("扣額紀錄").size(font_size).color(fg)).fill(line),
                     )
                     .clicked()
                 {
@@ -1738,18 +1765,18 @@ impl WidgetApp {
                 }
                 if ui
                     .put(
-                        Rect::from_min_max(pt(230., 12.), pt(295., 37.)),
-                        egui::Button::new(RichText::new("Token明細").size(11. * scale).color(fg)).fill(line),
+                        Rect::from_min_max(pt(224., 12.), pt(301., 37.)),
+                        egui::Button::new(RichText::new("Token明細").size(font_size).color(fg)).fill(line),
                     )
                     .clicked()
                 {
                     self.tokens_open = true;
                 }
                 if let Some(progress) = self.compact_status_text() {
-                    let progress_rect = Rect::from_min_max(pt(21., 39.), pt(289., 51.));
+                    let progress_rect = Rect::from_min_max(pt(21., 39.), pt(289., 57.));
                     painter.with_clip_rect(progress_rect).text(
                         progress_rect.min, Align2::LEFT_TOP, progress,
-                        FontId::proportional(9. * scale), muted,
+                        FontId::proportional(font_size), muted,
                     );
                     if ui.interact(progress_rect, ui.id().with("import-progress"), Sense::click())
                         .on_hover_text(format!("{}\n\n{}", self.quota_diagnostic_text(), self.import_diagnostic_text())).clicked()
@@ -1767,15 +1794,15 @@ impl WidgetApp {
                         }
                     })
                     .unwrap_or_else(|| "—".into());
-                txt(20., 51., percent.clone(), 76., fg);
+                txt(20., 57., percent.clone(), 76., fg);
                 let percent_width = painter
                     .layout_no_wrap(percent.clone(), FontId::proportional(76. * scale), fg)
                     .size()
                     .x;
                 let percent_x = 20. + percent_width / sx + 5.;
-                txt(percent_x, 83., "%".into(), 33., fg);
-                txt(248., 102., "剩餘".into(), 13., muted);
-                let bar = Rect::from_min_max(pt(21., 139.), pt(289., 143.));
+                txt(percent_x, 89., "%".into(), 33., fg);
+                txt(248., 108., "剩餘".into(), 13., muted);
+                let bar = Rect::from_min_max(pt(21., 145.), pt(289., 149.));
                 painter.rect_filled(bar, 3., line);
                 if let Some(p) = remain {
                     painter.rect_filled(
@@ -1787,14 +1814,14 @@ impl WidgetApp {
                         accent,
                     );
                 }
-                txt(21., 154., "估計消耗".into(), 13., muted);
+                txt(21., 160., "估計消耗".into(), 13., muted);
                 let rate = view
                     .as_ref()
                     .and_then(|v| v.rate_per_hour)
                     .map(|r| format!("{r:.2} 百分點 / 小時"))
                     .unwrap_or_else(|| "— 等待量測".into());
-                txt(93., 154., rate, 13., fg);
-                txt(21., 178., "點數".into(), 13., muted);
+                txt(93., 160., rate, 13., fg);
+                txt(21., 184., "點數".into(), 13., muted);
                 let credits = self.quota.credits(now());
                 let credit = if let Some(v) = &view {
                     credits.into_iter().find(|c| c.source_key == v.source_key)
@@ -1803,7 +1830,7 @@ impl WidgetApp {
                 };
                 txt(
                     93.,
-                    178.,
+                    184.,
                     credit
                         .as_ref()
                         .map(|c| {
@@ -1819,7 +1846,7 @@ impl WidgetApp {
                 );
                 txt(
                     207.,
-                    178.,
+                    184.,
                     credit
                         .as_ref()
                         .and_then(|c| c.rate_per_minute)
@@ -1828,10 +1855,10 @@ impl WidgetApp {
                     12.,
                     muted,
                 );
-                txt(21., 202., "重設".into(), 13., muted);
+                txt(21., 208., "重設".into(), 13., muted);
                 txt(
                     93.,
-                    202.,
+                    208.,
                     view.as_ref()
                         .and_then(|v| v.reset_at)
                         .map(|t| duration(t - now()))
@@ -1839,68 +1866,71 @@ impl WidgetApp {
                     13.,
                     fg,
                 );
-                painter.line_segment([pt(21., 229.), pt(289., 229.)], Stroke::new(1_f32, line));
-                for (x,label) in [(21.,"Task／名稱"),(105.,"時間+8"),(163.,"用度"),(225.,"本%累計")] {txt(x,239.,label.into(),10.,muted);}
-                ui.interact(Rect::from_min_max(pt(21.,238.),pt(289.,255.)),ui.id().with("task-column-help"),Sense::hover()).on_hover_text("用度＝最新單筆 Response 的估算 USD；本%累計＝最近已確認扣額／重設後的已知用量合計。缺少邊界時從啟動開始計 0，並以 * 標示不完整。滑鼠移到 Task 可看名稱及 Token 數字。");
-                let table_bottom=257.+18.*visible as f32;
-                ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pt(21.,257.),pt(289.,table_bottom))),|ui| {
+                painter.line_segment([pt(21., 235.), pt(289., 235.)], Stroke::new(1_f32, line));
+                for (x,label) in [(21.,"Task／名稱"),(105.,"時間+8"),(163.,"用度"),(225.,"本%累計")] {txt(x,245.,label.into(),13.,fg);}
+                ui.interact(Rect::from_min_max(pt(21.,244.),pt(289.,261.)),ui.id().with("task-column-help"),Sense::hover()).on_hover_text("用度：最新 Response\n本%累計：自身估算 USD\n*：部分");
+                let table_bottom=263.+22.*visible as f32;
+                ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pt(21.,263.),pt(289.,table_bottom))),|ui| {
                     ui.spacing_mut().item_spacing=Vec2::ZERO;
-                    egui::ScrollArea::vertical().id_salt("task-interval-rows").max_height(18.*visible as f32*sy).min_scrolled_height(0.).show_rows(ui,18.*sy,self.main_cache.tree.len().max(1),|ui,range| {
+                    egui::ScrollArea::vertical().id_salt("task-interval-rows").max_height(22.*visible as f32*sy).min_scrolled_height(0.).show_rows(ui,22.*sy,self.main_cache.tree.len().max(1),|ui,range| {
                         if self.main_cache.tree.is_empty() {
-                            let response=ui.add(egui::Label::new(RichText::new(self.empty_task_status()).size(10.*scale).color(muted)).sense(Sense::click()));
+                            let response=ui.add(egui::Label::new(RichText::new(self.empty_task_status()).size(font_size).color(muted)).sense(Sense::click()));
                             if response.on_hover_text(self.import_diagnostic_text()).clicked() {self.settings_open=true;}
                             return;
                         }
                         for i in range {
                             let row=&self.main_cache.tree[i];
-                            let (r,response)=ui.allocate_exact_size(Vec2::new(268.*sx,18.*sy),Sense::hover());
+                            let (r,response)=ui.allocate_exact_size(Vec2::new(268.*sx,22.*sy),Sense::hover());
                             match row {
                                 usage_views::TaskTreeRow::SelfTask {task_id,task_index,depth,relationship}=>{
                                     let task=task_index.and_then(|i|self.main_cache.tasks.get(i));
-                                    let mut tooltip=task.map(|t|self.task_tooltip(t)).unwrap_or_else(||format!("{}\nTask ID: {}\n此 Task 沒有近期自身用量記錄。\nInput: 未知\nCached: 未知\nUncached: 未知\nOutput: 未知\nReasoning: 未知\nTurn Input: 未知\nTurn Output: 未知",self.tokens.task_name(task_id).unwrap_or("名稱未記錄"),task_id));
-                                    let relation=match relationship {usage_views::TaskRelationship::Unlinked=>"未記錄上層關係；獨立顯示".into(),usage_views::TaskRelationship::Child{parent_id}=>format!("已記錄上層: {parent_id}"),usage_views::TaskRelationship::Orphan{parent_id}=>format!("上層資料不完整: {}",parent_id.as_deref().unwrap_or("未知")),usage_views::TaskRelationship::Cycle{parent_id}=>format!("上層關係形成循環，已獨立顯示: {parent_id}")};
-                                    tooltip.push_str(&format!("\n{relation}\n本行只計自身用量。"));
-                                    response.on_hover_ui(|ui|{ui.set_max_width(260.*scale);ui.add(egui::Label::new(RichText::new(&tooltip).size(10.5*scale)).wrap());});
+                                    let mut tooltip=task.map(|t|self.task_tooltip(t)).unwrap_or_else(||format!("{}\nTask ID: {}\n狀態：無近期用量\nInput: 未知\nCached: 未知\nUncached: 未知\nOutput: 未知\nReasoning: 未知\nTurn Input: 未知\nTurn Output: 未知",self.tokens.task_name(task_id).unwrap_or("名稱未記錄"),task_id));
+                                    let relation=match relationship {usage_views::TaskRelationship::Unlinked=>"上層：未知".into(),usage_views::TaskRelationship::Child{parent_id}=>format!("上層: {parent_id}"),usage_views::TaskRelationship::Orphan{parent_id}=>format!("上層（部分）: {}",parent_id.as_deref().unwrap_or("未知")),usage_views::TaskRelationship::Cycle{parent_id}=>format!("上層（循環）: {parent_id}")};
+                                    tooltip.push_str(&format!("\n{relation}"));
+                                    response.on_hover_ui(|ui|{readable_tooltip(ui,&tooltip,font_size);});
                                     let indent=(*depth as f32*8.).min(32.);
                                     let name=self.tokens.task_name(task_id).map(str::to_owned).unwrap_or_else(||task_id.chars().take(7).collect());
-                                    let rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((81.-indent)*sx,18.*sy));
+                                    let rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((81.-indent)*sx,22.*sy));
                                     let label=if *depth>0 {format!("└ {name}")}else{name};
-                                    let font=FontId::proportional(9.5*scale);
+                                    let font=FontId::proportional(font_size);
                                     let mut short=label.clone();
                                     while ui.painter().layout_no_wrap(short.clone(),font.clone(),fg).size().x>rect.width()-2.*sx && short.chars().count()>2 {if short.ends_with('…'){short.pop();}short.pop();short.push('…');}
                                     ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).text(rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,short,font,fg);
-                                    if ui.interact(rect,ui.id().with(("task-name",task_id)),Sense::click()).on_hover_ui(|ui|{ui.set_max_width(260.*scale);ui.add(egui::Label::new(RichText::new(&tooltip).size(10.5*scale)).wrap());}).clicked(){ctx.copy_text(task_id.clone());}
+                                    if ui.interact(rect,ui.id().with(("task-name",task_id)),Sense::click()).on_hover_ui(|ui|{readable_tooltip(ui,&tooltip,font_size);}).clicked(){ctx.copy_text(task_id.clone());}
                                     let values=if let Some(task)=task {[(84.,local_time(task.latest_timestamp)),(142.,money(task.latest_cost_usd)),(204.,format!("{}{}",money(task.interval_cost_usd),if task.partial {"*"}else{""}))]}else{[(84.,"—".into()),(142.,"—".into()),(204.,if self.main_cache.loading {"$—*".into()}else{"$0.0000*".into()})]};
-                                    for (x,text) in values {ui.painter().text(r.min+Vec2::new(x*sx,2.*sy),Align2::LEFT_TOP,text,FontId::proportional(9.5*scale),fg);}
+                                    for (x,text) in values {
+                                        let cell=Rect::from_min_size(r.min+Vec2::new(x*sx,0.),Vec2::new(if x==84. {56.} else {62.} * sx,22.*sy));
+                                        ui.painter().with_clip_rect(cell.intersect(ui.clip_rect())).text(cell.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,&text,FontId::proportional(font_size),fg);
+                                        ui.interact(cell,ui.id().with(("task-cell",task_id,x as i32)),Sense::hover()).on_hover_ui(|ui|readable_tooltip(ui,&format!("{}\n{}",text,tooltip),font_size));
+                                    }
                                 }
                                 usage_views::TaskTreeRow::ChildrenSummary {parent_id,depth,descendant_count,direct_child_count,known_cost_usd,partial,expanded}=>{
                                     let indent=(*depth as f32*8.).min(32.);
                                     let label=format!("[{}] 子代理 {}",if *expanded {"−"}else{"+"},descendant_count);
-                                    let help=format!("全部已知子代理 {descendant_count} 個（直接子代理 {direct_child_count} 個）。\n合計所有後代在本額度區間的已知用量，每個 Task 只計一次，不含主代理自己的用量。\n未匯入或未記錄關係的子代理無法推測；* 表示資料不完整或估價假設。點擊展開／收起。");
+                                    let help=format!("子代理：{descendant_count}\n直接子代理：{direct_child_count}\n本%累計：{}{}",money(Some(*known_cost_usd)),if *partial {" *"} else {""});
                                     response.on_hover_text(&help);
-                                    let button_rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((200.-indent)*sx,18.*sy));
-                                    ui.painter().text(button_rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,label,FontId::proportional(9.5*scale),accent);
+                                    let button_rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((200.-indent)*sx,22.*sy));
+                                    ui.painter().text(button_rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,label,FontId::proportional(font_size),accent);
                                     if ui.interact(button_rect,ui.id().with(("children-toggle",parent_id)),Sense::click()).on_hover_text(&help).clicked(){if *expanded {self.expanded_tasks.remove(parent_id);}else{self.expanded_tasks.insert(parent_id.clone());}self.tree_generation+=1;}
-                                    ui.painter().text(r.min+Vec2::new(204.*sx,2.*sy),Align2::LEFT_TOP,format!("{}{}",money((!self.main_cache.loading).then_some(*known_cost_usd)),if *partial {"*"}else{""}),FontId::proportional(9.5*scale),accent);
+                                    ui.painter().text(r.min+Vec2::new(204.*sx,2.*sy),Align2::LEFT_TOP,format!("{}{}",money((!self.main_cache.loading).then_some(*known_cost_usd)),if *partial {"*"}else{""}),FontId::proportional(font_size),accent);
                                 }
                             }
                         }
                     });
                 });
-                let footer=if self.main_cache.loading {"正在更新目前範圍／累計 $— *".into()} else if let Some(e)=&self.main_cache.boundary {
-                    format!("{} {} 分鐘／累計 {}{}",if reset_event(e){"距本次重設"}else{"距上次記錄扣額"},(now()-e.observed_at_unix).max(0)/60,money(Some(self.main_cache.cost.known_usd)),if self.main_cache.cost.partial {" *"}else{""})
-                } else {format!("自啟動 {} 分鐘／累計 {} *",(now()-self.demo_start).max(0)/60,money(Some(self.main_cache.cost.known_usd)))};
-                txt(21.,table_bottom+10.,footer,11.,muted);
-                let footer_response=ui.interact(Rect::from_min_max(pt(21.,table_bottom+9.),pt(289.,table_bottom+29.)),ui.id().with("cost-coverage"),Sense::click());
+                let footer=if self.main_cache.loading {"更新中\n累計 $— *".into()} else if let Some(e)=&self.main_cache.boundary {
+                    format!("{} {} 分鐘\n累計 {}{}",if reset_event(e){"距本次重設"}else{"距上次扣額"},(now()-e.observed_at_unix).max(0)/60,money(Some(self.main_cache.cost.known_usd)),if self.main_cache.cost.partial {" *"}else{""})
+                } else {format!("自啟動 {} 分鐘\n累計 {} *",(now()-self.demo_start).max(0)/60,money(Some(self.main_cache.cost.known_usd)))};
+                let footer_response=ui.put(Rect::from_min_max(pt(21.,table_bottom+8.),pt(289.,table_bottom+52.)),egui::Label::new(RichText::new(footer).size(font_size).color(fg)).sense(Sense::click()).wrap());
                 let open_intervals=footer_response.clicked();
-                footer_response.on_hover_ui(|ui|{ui.set_max_width((w-16.).clamp(260.,460.));ui.add(egui::Label::new(RichText::new(&self.main_cache.recent_tooltip).size(11.)).wrap());});
+                footer_response.on_hover_ui(|ui|{readable_tooltip(ui,&self.main_cache.recent_tooltip,font_size);});
                 if open_intervals {
                     self.history_open=true; self.history_intervals=true; self.history_selection=None;
                     if let Some(i)=self.main_cache.recent_intervals.first() {if let Some(day)=local_day(self.intervals[*i].end) {self.date=day;}}
                 }
                 if ui
                     .put(
-                        Rect::from_min_max(pt(272., 198.), pt(294., 220.)),
+                        Rect::from_min_max(pt(272., 204.), pt(294., 226.)),
                         egui::Button::new("≡").frame(false),
                     )
                     .clicked()
@@ -1939,7 +1969,7 @@ impl WidgetApp {
         dates: &BTreeSet<NaiveDate>,
         id: &str,
     ) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("◀ 前一天").clicked() {
                 *date = date.pred_opt().unwrap_or(*date);
             }
@@ -2035,14 +2065,14 @@ impl WidgetApp {
                 ViewportId::from_hash_of("settings"),
                 ViewportBuilder::default()
                     .with_title("Quota Widget · 設定 / 連接")
-                    .with_inner_size([650., 700.])
+                    .with_inner_size([760., 700.])
                     .with_min_inner_size([520., 420.]),
                 |ctx, _| {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         self.settings_open = false;
                     }
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui, ctx));
+                        egui::ScrollArea::both().show(ui, |ui| self.settings_ui(ui, ctx));
                     });
                 },
             );
@@ -2057,10 +2087,10 @@ impl WidgetApp {
                 } else {
                     Color32::from_rgb(130, 75, 0)
                 },
-                "DEMO · 合成使用量與虛構價格，僅示範介面。",
+                "DEMO",
             );
         }
-        ui.label("香港時間 UTC+08:00；本機觀察時間不是後台保證的實際扣額時間。金額為模型等價估算，不是訂閱帳單。");
+        ui.label("香港時間 UTC+08:00 · 估算 USD");
         if self.history_cache.sources_generation != Some(self.history_generation) {
             self.history_cache.sources = self
                 .history
@@ -2101,16 +2131,13 @@ impl WidgetApp {
                     );
                 }
             });
-        if self.history_cache.has_legacy {
-            ui.small("舊版數字來源是當次程式的記錄編號，不能自動對應目前 Codex 帳戶；可從來源選單分開查看。每列保留原有記錄，滑鼠可看來源與工作階段。");
-        }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.history_intervals, true, "每%用度表");
             ui.selectable_value(&mut self.history_intervals, false, "全部額度觀察");
         });
         let dates = self.days();
         Self::date_controls(ui, &mut self.date, &dates, "quota-date");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .checkbox(&mut self.settings.hide_unchanged, "忽略相同百分比")
                 .changed()
@@ -2127,7 +2154,7 @@ impl WidgetApp {
         let current_view = self.selected();
         if let Some(v) = &current_view {
             ui.separator();
-            ui.label(format!("{} · {}", v.window_label, v.prediction.explanation));
+            ui.label(&v.window_label);
             if let Some(t) = v.prediction.estimated_at {
                 ui.label(format!(
                     "下次下降約 {}（估算，{}）",
@@ -2197,16 +2224,10 @@ impl WidgetApp {
             self.history_cache.weighted = (points_total > 0.0).then_some(cost_total / points_total);
             self.history_cache.key = Some(key);
         }
-        ui.label(format!(
-            "{} 筆 · * 代表資料不完整或價格未設定。較早資料只有實際額度觀察時才會還原。",
-            self.history_cache.rows.len()
-        ));
-        ui.small(
-        "重複快照已合併顯示；有差異的觀察不當作已確認回補，也不重開費用累計區間。原始記錄保留。",
-    );
+        ui.label(format!("紀錄：{} 筆", self.history_cache.rows.len()));
         ui.separator();
         ui.label(format!(
-            "可完整歸屬區間的加權成本：{} / 百分點",
+            "加權估算：{} / 百分點",
             money(self.history_cache.weighted)
         ));
         if let Some(message) = self.empty_history_diagnostic() {
@@ -2215,61 +2236,67 @@ impl WidgetApp {
         if self.history_intervals {
             self.completed_intervals_table(ui);
         } else if self.history_cache.rows.is_empty() {
-            ui.label("這一天沒有可用的額度變動觀察。Token 使用量不能反推訂閱額度。");
+            ui.label("額度紀錄：0");
         } else {
+            let row_height = 58. * ui.style().text_styles[&egui::TextStyle::Body].size / 13.;
             egui::ScrollArea::vertical()
                 .id_salt("quota-history-rows")
-                .show_rows(ui, 58.0, self.history_cache.rows.len(), |ui, range| {
-                    for index in range {
-                        let (event, cost, partial) = &self.history_cache.rows[index];
-                        let (rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 58.0),
-                            Sense::hover(),
-                        );
-                        let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-                        row.set_clip_rect(rect.intersect(ui.clip_rect()));
-                        let interval = self
-                            .interval_lookup
-                            .get(&intervals::history_event_key(event))
-                            .and_then(|i| self.intervals.get(*i));
-                        let description = history_description(event, *cost, *partial, interval);
-                        let tooltip = format!(
-                            "{}\n來源：{} · 觀察工作階段：{}",
-                            history_tooltip(&description, interval),
-                            event.source_key,
-                            event.session
-                        );
-                        row.horizontal(|ui| {
-                            ui.strong(local_time(event.observed_at_unix));
-                            if let Some(interval) = interval {
-                                if ui.small_button("模型分項").clicked() {
-                                    self.selected_interval =
-                                        Some(interval.history_event_key.clone());
-                                }
-                            }
-                            ui.add(egui::Label::new(&description).truncate())
-                                .on_hover_text(&tooltip);
-                        });
-                        row.add(
-                            egui::Label::new(
-                                RichText::new(format!(
-                                    "{} · {} · 週期 {}{}",
-                                    event.window_label,
-                                    event.source_key,
-                                    event.epoch,
-                                    if event.reconciliation.is_some() {
-                                        " · 不作累計分界"
-                                    } else {
-                                        ""
+                .show_rows(
+                    ui,
+                    row_height,
+                    self.history_cache.rows.len(),
+                    |ui, range| {
+                        for index in range {
+                            let (event, cost, partial) = &self.history_cache.rows[index];
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), row_height),
+                                Sense::hover(),
+                            );
+                            let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                            row.set_clip_rect(rect.intersect(ui.clip_rect()));
+                            let interval = self
+                                .interval_lookup
+                                .get(&intervals::history_event_key(event))
+                                .and_then(|i| self.intervals.get(*i));
+                            let description = history_description(event, *cost, *partial, interval);
+                            let tooltip = format!(
+                                "{}\n來源：{} · 觀察工作階段：{}",
+                                history_tooltip(&description, interval),
+                                event.source_key,
+                                event.session
+                            );
+                            row.horizontal(|ui| {
+                                ui.strong(local_time(event.observed_at_unix));
+                                if let Some(interval) = interval {
+                                    if ui.small_button("模型分項").clicked() {
+                                        self.selected_interval =
+                                            Some(interval.history_event_key.clone());
                                     }
-                                ))
-                                .small(),
-                            )
-                            .truncate(),
-                        );
-                        row.separator();
-                    }
-                });
+                                }
+                                ui.add(egui::Label::new(&description).truncate())
+                                    .on_hover_text(&tooltip);
+                            });
+                            row.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "{} · {} · 週期 {}{}",
+                                        event.window_label,
+                                        event.source_key,
+                                        event.epoch,
+                                        if event.reconciliation.is_some() {
+                                            " · 不作累計分界"
+                                        } else {
+                                            ""
+                                        }
+                                    ))
+                                    .small(),
+                                )
+                                .truncate(),
+                            );
+                            row.separator();
+                        }
+                    },
+                );
         }
         if let Some(interval) = self
             .selected_interval
@@ -2278,23 +2305,73 @@ impl WidgetApp {
             .and_then(|i| self.intervals.get(*i))
         {
             let mut open = true;
-            egui::Window::new("扣額區間 · 模型分項").id(egui::Id::new("completed-interval-detail")).open(&mut open).default_width(710.).show(ui.ctx(), |ui| {
-                ui.label(format!("{} → {} · 實際下降 {} 百分點", interval.start.and_then(display_time::datetime).unwrap_or_else(||"開始時間未知".into()), display_time::datetime(interval.end).unwrap_or_else(||"未知".into()), interval.percentage_points));
-                ui.strong(format!("已知估算總和 {}{} · 每百分點 {}", money(Some(interval.known_usd)), if interval.partial {" *"}else{""}, money(interval.cost_per_point)));
-                if !interval.comparable { ui.colored_label(Color32::from_rgb(210,150,70), PARTIAL_INTERVAL_WARNING); }
-                ui.small("按每筆實際 model 計價。多百分點跳變只顯示平均，不拆成虛構 1% 區間；推理已含輸出。排除 codex-auto-review，不能據此判定官方訂閱計費。");
-                if !interval.reasons.is_empty() { ui.colored_label(Color32::from_rgb(210,150,70),format!("不可直接比較／資料限制：{}",interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join(" · "))); }
-                egui::ScrollArea::both().max_height(320.).show(ui, |ui| {
-                    egui::Grid::new("interval-model-breakdown").striped(true).show(ui, |ui| {
-                        for label in ["模型","筆數","Input","Cached","Uncached","Output","Reasoning","估算 USD"] {ui.strong(label);} ui.end_row();
-                        for model in &interval.models {
-                            ui.label(format!("{}{}",model.model,if model.assumed_model_events>0 {"（含假設）"}else{""}));
-                            ui.label(model.events.to_string()); ui.label(model.input.to_string()); ui.label(model.cached.to_string()); ui.label(model.uncached.to_string()); ui.label(model.output.to_string()); ui.label(model.reasoning.to_string()); ui.label(interval_model_cost(model)); ui.end_row();
-                        }
+            egui::Window::new("扣額區間 · 模型分項")
+                .id(egui::Id::new("completed-interval-detail"))
+                .open(&mut open)
+                .default_width(710.)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "{} → {} · 實際下降 {} 百分點",
+                        interval
+                            .start
+                            .and_then(display_time::datetime)
+                            .unwrap_or_else(|| "開始時間未知".into()),
+                        display_time::datetime(interval.end).unwrap_or_else(|| "未知".into()),
+                        interval.percentage_points
+                    ));
+                    ui.strong(format!(
+                        "已知估算總和 {}{} · 每百分點 {}",
+                        money(Some(interval.known_usd)),
+                        if interval.partial { " *" } else { "" },
+                        money(interval.cost_per_point)
+                    ));
+                    if !interval.comparable {
+                        ui.colored_label(ui.visuals().warn_fg_color, PARTIAL_INTERVAL_WARNING);
+                    }
+
+                    egui::ScrollArea::both().max_height(320.).show(ui, |ui| {
+                        egui::Grid::new("interval-model-breakdown")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for label in [
+                                    "模型",
+                                    "筆數",
+                                    "Input",
+                                    "Cached",
+                                    "Uncached",
+                                    "Output",
+                                    "Reasoning",
+                                    "估算 USD",
+                                ] {
+                                    ui.strong(label);
+                                }
+                                ui.end_row();
+                                for model in &interval.models {
+                                    ui.label(format!(
+                                        "{}{}",
+                                        model.model,
+                                        if model.assumed_model_events > 0 {
+                                            "（含假設）"
+                                        } else {
+                                            ""
+                                        }
+                                    ));
+                                    ui.label(model.events.to_string());
+                                    ui.label(model.input.to_string());
+                                    ui.label(model.cached.to_string());
+                                    ui.label(model.uncached.to_string());
+                                    ui.label(model.output.to_string());
+                                    ui.label(model.reasoning.to_string());
+                                    ui.label(interval_model_cost(model));
+                                    ui.end_row();
+                                }
+                            });
                     });
+                    ui.small(format!(
+                        "事件：{} · 價格未知：{}",
+                        interval.events, interval.unknown_cost_events
+                    ));
                 });
-                ui.small(format!("{} 筆事件；{} 筆價格未知。CSV / JSON 匯出包含完整區間及 model 分項。",interval.events,interval.unknown_cost_events));
-            });
             if !open {
                 self.selected_interval = None;
             }
@@ -2313,21 +2390,26 @@ impl WidgetApp {
             .iter()
             .filter(|e| local_day(e.observed_at_unix) == Some(self.date))
             .count();
-        Some(format!("目前來源／日期沒有符合紀錄；已載入 {} 筆額度觀察，其中所選日期有 {} 筆（含其他來源）。請檢查上方「來源 / 額度視窗」、日期及「忽略相同百分比」。", self.history.len(), day_count))
+        Some(format!(
+            "目前篩選：0 · 已載入：{} · 當日：{}",
+            self.history.len(),
+            day_count
+        ))
     }
     fn completed_intervals_table(&mut self, ui: &mut egui::Ui) {
-        ui.small("每行是一個實際觀察到的扣額區間；重設不列作消耗。跨多百分點只顯示平均。* 保留不完整區間的已知小計，不能當作每%價格。滑鼠移到列可看限制。");
         if self.history_cache.interval_indices.is_empty() {
-            ui.label("這一天尚未有已完成扣額區間；可切換「全部額度觀察」查看回補或有差異的記錄。");
+            ui.label("已完成區間：0");
             return;
         }
+        let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
         const X: [f32; 8] = [0., 90., 260., 430., 525., 675., 840., 1080.];
         const WIDTH: [f32; 8] = [80., 160., 160., 85., 140., 155., 230., 80.];
         egui::ScrollArea::horizontal()
             .id_salt("interval-table-horizontal")
             .show(ui, |ui| {
-                ui.set_min_width(1160.);
-                let (header, _) = ui.allocate_exact_size(Vec2::new(1160., 26.), Sense::hover());
+                ui.set_min_width(1160. * scale);
+                let (header, _) =
+                    ui.allocate_exact_size(Vec2::new(1160. * scale, 26. * scale), Sense::hover());
                 for (i, title) in [
                     "額度變化",
                     "開始（香港）",
@@ -2343,8 +2425,8 @@ impl WidgetApp {
                 {
                     ui.put(
                         Rect::from_min_size(
-                            header.min + Vec2::new(X[i], 0.),
-                            Vec2::new(WIDTH[i], 26.),
+                            header.min + Vec2::new(X[i] * scale, 0.),
+                            Vec2::new(WIDTH[i] * scale, 26. * scale),
                         ),
                         egui::Label::new(RichText::new(*title).strong()).truncate(),
                     );
@@ -2354,15 +2436,17 @@ impl WidgetApp {
                     .id_salt("interval-table-rows")
                     .show_rows(
                         ui,
-                        42.,
+                        42. * scale,
                         self.history_cache.interval_indices.len(),
                         |ui, range| {
                             for row_index in range {
                                 let index = self.history_cache.interval_indices[row_index];
                                 let interval = &self.intervals[index];
                                 let view = &self.interval_presentations[index];
-                                let (rect, response) =
-                                    ui.allocate_exact_size(Vec2::new(1160., 42.), Sense::hover());
+                                let (rect, response) = ui.allocate_exact_size(
+                                    Vec2::new(1160. * scale, 42. * scale),
+                                    Sense::hover(),
+                                );
                                 response.on_hover_text(&view.tooltip);
                                 let cells = [
                                     &view.change,
@@ -2376,14 +2460,16 @@ impl WidgetApp {
                                 for (i, text) in cells.iter().enumerate() {
                                     ui.put(
                                         Rect::from_min_size(
-                                            rect.min + Vec2::new(X[i], 0.),
-                                            Vec2::new(WIDTH[i], 34.),
+                                            rect.min + Vec2::new(X[i] * scale, 0.),
+                                            Vec2::new(WIDTH[i] * scale, 34. * scale),
                                         ),
                                         egui::Label::new(
                                             RichText::new(
                                                 text.strip_suffix(" +08:00").unwrap_or(text),
                                             )
-                                            .size(12.),
+                                            .size(
+                                                ui.style().text_styles[&egui::TextStyle::Body].size,
+                                            ),
                                         )
                                         .truncate(),
                                     )
@@ -2392,8 +2478,8 @@ impl WidgetApp {
                                 if ui
                                     .put(
                                         Rect::from_min_size(
-                                            rect.min + Vec2::new(X[7], 2.),
-                                            Vec2::new(76., 26.),
+                                            rect.min + Vec2::new(X[7] * scale, 2.),
+                                            Vec2::new(76. * scale, 26. * scale),
                                         ),
                                         egui::Button::new("模型分項"),
                                     )
@@ -2503,7 +2589,6 @@ impl WidgetApp {
             self.show_excluded_records,
         );
         ui.heading("Token 明細 · 香港時間 UTC+08:00");
-        ui.small("估算 USD 顯示已知小計；* 代表未完整覆蓋，不能當作完整費用。全部未能估價時顯示未知；推理強度與推理 Token 數分開。 ");
         if self.demo {
             ui.colored_label(
                 if self.settings.dark {
@@ -2511,17 +2596,13 @@ impl WidgetApp {
                 } else {
                     Color32::from_rgb(130, 75, 0)
                 },
-                "DEMO · 合成使用量與虛構價格，僅示範介面。",
+                "DEMO",
             );
         }
-        ui.label("讀取本機 Codex JSONL；輸入是整份上下文（含快取），推理含於輸出，不重複計費。$ 為模型等價估算，不是實際訂閱扣款。");
-        ui.small(format!(
-            "價格基準：{}；未建模 cache-write／區域／工具附加費。",
-            self.tokens.pricing.tier_label
-        ));
+        ui.small(format!("價格基準：{}", self.tokens.pricing.tier_label));
         let dates = self.days();
         Self::date_controls(ui, &mut self.token_date, &dates, "token-date");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("重新掃描").clicked() {
                 self.start_import();
             }
@@ -2535,7 +2616,7 @@ impl WidgetApp {
                 self.settings_open = true;
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(
                 &mut self.token_group,
                 GroupBy::Response,
@@ -2544,18 +2625,13 @@ impl WidgetApp {
             ui.selectable_value(&mut self.token_group, GroupBy::Turn, "Turn（當日）");
             ui.selectable_value(&mut self.token_group, GroupBy::Task, "Task／Thread（當日）");
         });
-        ui.small("Turn／Task 只加總已去重的 response；混合模型逐筆計價，不跟隨主代理模型。high／max 不另乘單價；沒有 Turn ID 時不猜測合併。");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(
                 &mut self.show_excluded_records,
                 "查看排除紀錄（codex-auto-review）",
             );
-            ui.small(format!(
-                "保留 {} 筆；不計入 Task／子代理數及費用",
-                self.excluded_count()
-            ));
+            ui.small(format!("排除：{} 筆", self.excluded_count()));
         });
-        ui.small("只依精確模型 codex-auto-review 排除，普通 Sol 審查工作仍計入；官方額度讀數不變，排除不代表免費。");
         if old_selection
             != (
                 self.token_date,
@@ -2573,7 +2649,7 @@ impl WidgetApp {
                 self.refresh_token_cache();
             }
             let mut page_changed = false;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(self.token_page > 0, egui::Button::new("上一頁"))
                     .clicked()
@@ -2610,7 +2686,7 @@ impl WidgetApp {
         let cache = &self.token_cache;
         if cache.loading {
             if self.view_pending {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spinner();
                     ui.label(format!("正在載入 {} 的明細…", self.token_date));
                 });
@@ -2629,14 +2705,8 @@ impl WidgetApp {
             }
             return;
         }
-        if self.tokens.database.is_some() {
-            ui.small("以下合計涵蓋所選整日；翻頁不會改變合計。");
-        }
         if self.show_excluded_records {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "以下只供稽核，全部已排除，不會加入目前百分比區間或整體費用。",
-            );
+            ui.colored_label(ui.visuals().warn_fg_color, "狀態：已排除");
         }
         ui.label(format!(
             "{} 筆 · 已記錄輸入 {}（快取 {}／未快取 {}）· 輸出 {}（推理 {}）· 已可估部分 {}{}",
@@ -2654,9 +2724,13 @@ impl WidgetApp {
             }
         ));
         ui.separator();
+        let font_size = ui.style().text_styles[&egui::TextStyle::Body].size;
+        let scale = font_size / 12.;
+        let row_height = 24. * scale;
         let widths = [
             72., 150., 80., 115., 120., 45., 90., 90., 90., 80., 80., 110.,
-        ];
+        ]
+        .map(|width| width * scale);
         let headers = [
             "時間+8",
             "模型",
@@ -2674,26 +2748,26 @@ impl WidgetApp {
         let total_width: f32 = widths.iter().sum();
         egui::ScrollArea::horizontal().show(ui,|ui| {
             ui.set_min_width(total_width);
-            let (header,_) = ui.allocate_exact_size(Vec2::new(total_width,24.),Sense::hover());
+            let (header,_) = ui.allocate_exact_size(Vec2::new(total_width,row_height),Sense::hover());
             let mut x=header.left();
-            for (label,width) in headers.iter().zip(widths){ui.painter().text(Pos2::new(x+3.,header.top()+3.),Align2::LEFT_TOP,label,FontId::proportional(12.),ui.visuals().strong_text_color());x+=width;}
-            egui::ScrollArea::vertical().id_salt("token-rows").show_rows(ui,24.,cache.rows.len(),|ui,range| {
+            for (label,width) in headers.iter().zip(widths){ui.painter().text(Pos2::new(x+3.,header.top()+3.),Align2::LEFT_TOP,label,FontId::proportional(font_size),ui.visuals().strong_text_color());x+=width;}
+            egui::ScrollArea::vertical().id_salt("token-rows").show_rows(ui,row_height,cache.rows.len(),|ui,range| {
                 for i in range {
                     let e=&cache.rows[cache.rows.len()-1-i];
                     let number=|n:u64,flag:&str|if e.partial_flags.iter().any(|f|f==flag){"未知".to_owned()}else{n.to_string()};
                     let uncached=if e.partial_flags.iter().any(|f|f=="input_count_unavailable"||f=="cached_count_unavailable"){"未知".into()}else{e.uncached.to_string()};
                     let identity=match self.token_group {GroupBy::Response=>e.response_id.as_deref().unwrap_or("舊版／未知"),GroupBy::Turn=>e.turn_id.as_deref().unwrap_or("未知 Turn"),GroupBy::Task=>"當日事件合計"};
                     let values=[local_time(e.last_timestamp),format!("{}{}",e.models.join(" / "),if e.model_assumed {"（假設）"}else{""}),effort_label(e),e.session.chars().take(12).collect::<String>(),identity.chars().take(12).collect(),e.event_count.to_string(),number(e.input,"input_count_unavailable"),number(e.cached,"cached_count_unavailable"),uncached,number(e.output,"output_count_unavailable"),number(e.reasoning,"reasoning_count_unavailable"),format!("{}{}",money(e.display_cost_usd()),if e.display_cost_is_partial(){" *"}else{""})];
-                    let tooltip=format!("Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 筆費用未知\n{}",effort_label(e),self.tokens.task_name(&e.session).unwrap_or("名稱未記錄"),e.session,e.turn_id.as_deref().unwrap_or("未知"),e.response_id.as_deref().unwrap_or("未知"),display_time::datetime(e.first_timestamp).unwrap_or_else(||"未知".into()),display_time::datetime(e.last_timestamp).unwrap_or_else(||"未知".into()),e.models.join(" / "),money(e.display_cost_usd()),e.unknown_cost_events,e.partial_flags.join("\n"));
-                    let (rect,response)=ui.allocate_exact_size(Vec2::new(total_width,24.),Sense::hover());response.on_hover_text(tooltip);
+                    let tooltip=format!("Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 筆費用未知\n{}",effort_label(e),self.tokens.task_name(&e.session).unwrap_or("名稱未記錄"),e.session,e.turn_id.as_deref().unwrap_or("未知"),e.response_id.as_deref().unwrap_or("未知"),display_time::datetime(e.first_timestamp).unwrap_or_else(||"未知".into()),display_time::datetime(e.last_timestamp).unwrap_or_else(||"未知".into()),e.models.join(" / "),money(e.display_cost_usd()),e.unknown_cost_events,if e.partial_flags.is_empty() {"狀態：完整"} else {"狀態：部分"});
+                    let (rect,response)=ui.allocate_exact_size(Vec2::new(total_width,row_height),Sense::hover());response.on_hover_text(tooltip);
                     if i%2==1 {ui.painter().rect_filled(rect,0.,ui.visuals().faint_bg_color);}
                     let mut x=rect.left();
-                    for (value,width) in values.iter().zip(widths) {let cell=Rect::from_min_size(Pos2::new(x,rect.top()),Vec2::new(width,24.));ui.painter().with_clip_rect(cell.intersect(ui.clip_rect())).text(Pos2::new(x+3.,rect.top()+3.),Align2::LEFT_TOP,value,FontId::proportional(12.),ui.visuals().text_color());x+=width;}
+                    for (value,width) in values.iter().zip(widths) {let cell=Rect::from_min_size(Pos2::new(x,rect.top()),Vec2::new(width,row_height));ui.painter().with_clip_rect(cell.intersect(ui.clip_rect())).text(Pos2::new(x+3.,rect.top()+3.),Align2::LEFT_TOP,value,FontId::proportional(font_size),ui.visuals().text_color());x+=width;}
                 }
             });
         });
         if cache.count == 0 {
-            ui.label("這一天沒有可用的 Token 記錄；不會補成零使用量。");
+            ui.label("Token 紀錄：0");
         }
         if !self.notice.is_empty() {
             ui.label(&self.notice);
@@ -2751,10 +2825,7 @@ impl WidgetApp {
         } else {
             self.settings.pricing.rates.remove(model);
         }
-        self.notice = format!(
-            "已套用 {} 的價格；其他模型單價保留。估算不是訂閱實際費用。",
-            model
-        );
+        self.notice = format!("價格已套用：{}", model);
         self.request_reprice();
         self.dirty = true;
     }
@@ -2768,10 +2839,10 @@ impl WidgetApp {
                 } else {
                     Color32::from_rgb(130, 75, 0)
                 },
-                "DEMO：全部為合成範例，不連線、不讀取真實歷史，也不儲存。",
+                "DEMO",
             );
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.checkbox(&mut self.settings.dark, "深色外觀").changed() {
                 self.apply_theme(ctx);
                 self.dirty = true;
@@ -2784,8 +2855,8 @@ impl WidgetApp {
                 self.dirty = true;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Task 顯示行數（超過才捲動）");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Task 可見行數");
             if ui
                 .add(egui::DragValue::new(&mut self.settings.task_visible_rows).range(1..=50))
                 .changed()
@@ -2793,11 +2864,9 @@ impl WidgetApp {
                 self.dirty = true;
             }
         });
-        ui.small("最上層在恢復／焦點生命週期及低頻檢查重套用，不呼叫啟用或搶焦點。其他 App 的全螢幕／安全桌面仍受 OS 規則限制。");
         ui.separator();
         ui.strong("官方 Codex CLI（唯讀）");
         ui.label(self.quota_diagnostic_text());
-        ui.label("留空自動尋找原生 CLI。只讀取帳戶額度；不登入、不執行工作、不讀取憑證。");
         if ui
             .text_edit_singleline(&mut self.settings.codex_path)
             .changed()
@@ -2805,7 +2874,7 @@ impl WidgetApp {
             self.dirty = true;
         }
         ui.add_enabled_ui(!self.demo, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("重新連線").clicked() {
                     self.offline = false;
                     self.connect();
@@ -2859,7 +2928,7 @@ impl WidgetApp {
         {
             self.dirty = true;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("掃描所有可用歷史").clicked() {
                 self.start_import();
             }
@@ -2875,15 +2944,13 @@ impl WidgetApp {
                 self.dirty = true;
             }
         });
-        ui.small("預設30天瀏覽，保留更早歷史。精確 codex-auto-review 保留原始用量，但從預設 Task／子代理數／估算中排除；可在 Token 明細稽核。官方額度不變，不表示免費。");
         self.import_diagnostics_ui(ui);
         ui.separator();
-        ui.strong("模型等價價格（USD / 1M tokens）");
-        ui.label("全新設定採官方 Standard 費率假設；不是訂閱扣款。只有未記錄模型時假設 6.1 Sol；有名稱但無單價的模型保持未知。Sol／Luna／Astra 按每筆實際模型計價。");
-        ui.horizontal(|ui| {
+        ui.strong("估算單價 · USD / 1M tokens");
+        ui.horizontal_wrapped(|ui| {
             for (label, preset) in [
-                ("官方 Standard", Pricing::official_standard()),
-                ("官方 Fast / Priority", Pricing::official_fast()),
+                ("Standard（重設全部）", Pricing::official_standard()),
+                ("Fast（重設全部）", Pricing::official_fast()),
             ] {
                 if ui.button(label).clicked() {
                     let current_override = self.settings.pricing.model_override.clone();
@@ -2895,7 +2962,6 @@ impl WidgetApp {
                 }
             }
         });
-        ui.small("上方官方預設按鈕會替換所有模型單價；只改一個模型請使用下方編輯器。");
         ui.label(format!(
             "目前：{} · 核對 {}",
             self.settings.pricing.tier_label,
@@ -2912,17 +2978,16 @@ impl WidgetApp {
         if ui
             .checkbox(
                 &mut self.settings.pricing.apply_long_context,
-                "Sol／Luna >272,000 輸入／單次請求：輸入與快取 ×2、輸出 ×1.5",
+                "長上下文 >272K：輸入／快取 ×2 · 輸出 ×1.5",
             )
             .changed()
         {
             self.request_reprice();
             self.dirty = true;
         }
-        ui.small("單次請求量不明時金額為未知。未另計 cache-write、區域附加費、工具費；服務等級需自行核對。價格可變，核對日 2026-10-17。");
         let models = self.price_model_choices();
         let previous_model = self.price_model.clone();
-        egui::ComboBox::from_label("選擇模型（每個模型獨立單價）")
+        egui::ComboBox::from_label("模型")
             .selected_text(&self.price_model)
             .width(240.)
             .show_ui(ui, |ui| {
@@ -2938,13 +3003,13 @@ impl WidgetApp {
         if self.price_model != previous_model {
             self.load_price_editor();
         }
-        ui.horizontal(|ui| {
-            ui.label("或輸入 model ID 新增／編輯");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Model ID");
             if ui.text_edit_singleline(&mut self.price_model).changed() {
                 self.load_price_editor();
             }
         });
-        egui::CollapsingHeader::new("各模型目前單價一覽（點名稱切換）")
+        egui::CollapsingHeader::new("模型單價")
             .default_open(true)
             .show(ui, |ui| {
                 let mut selected = None;
@@ -2973,7 +3038,6 @@ impl WidgetApp {
                     self.load_price_editor();
                 }
             });
-        ui.small("以下只修改選中的模型；先套用，再切換。未設定的模型保持未知，可填入並確認自訂單價。選取模型不會覆寫事件的實際 model。");
         ui.checkbox(&mut self.price_configured, "已確認此模型價格");
         egui::Grid::new("prices").show(ui, |ui| {
             for (i, label) in ["未快取輸入", "快取輸入", "輸出（已含推理）"]
@@ -2993,7 +3057,7 @@ impl WidgetApp {
         if ui
             .add_enabled(
                 !self.price_model.trim().is_empty(),
-                egui::Button::new("套用此模型價格並重算"),
+                egui::Button::new("套用模型價格"),
             )
             .clicked()
         {
@@ -3005,7 +3069,7 @@ impl WidgetApp {
             .model_override
             .clone()
             .unwrap_or_default();
-        ui.label("模型覆寫（留空依記錄；會明示覆寫）");
+        ui.label("模型覆寫");
         if ui.text_edit_singleline(&mut override_model).changed() {
             self.settings.pricing.model_override =
                 (!override_model.trim().is_empty()).then(|| override_model.trim().to_string());
@@ -3013,7 +3077,6 @@ impl WidgetApp {
             self.dirty = true;
         }
         ui.separator();
-        ui.label("$—：價格或可歸屬資料不足。*：部分資料，可能有未觀察區間／首次累計快照／模型歸屬不完整。額度在 0% 時仍可持續累計 Token 等價費用。");
         if !self.notice.is_empty() {
             ui.label(&self.notice);
         }
@@ -3462,7 +3525,6 @@ impl eframe::App for WidgetApp {
             self.close_ready = self.close_finished();
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("正在關閉…");
-                ui.label("已停止新增工作，正在安全結束讀取及儲存。");
                 ui.label(format!(
                     "{} 秒",
                     self.closing_since.unwrap().elapsed().as_secs()
@@ -3687,7 +3749,7 @@ mod widget_revision_tests {
         e.reconciliation = Some(quota_widget::model::HistoryReconciliation::UncertainRecovery);
         let text = history_description(&e, None, true, None);
         assert!(text.starts_with("100% → 99%"));
-        assert!(text.contains("不作扣額分界"));
+        assert!(text.contains("狀態：差異"));
         assert!(!text.contains("回補"));
         assert!(!text.contains('$'));
     }
@@ -3724,14 +3786,14 @@ mod widget_revision_tests {
         v.known_usd = 1937.2468;
         assert!(v.partial && !v.comparable);
         let text = history_description(&e, None, true, Some(&v));
-        assert!(text.contains("時段已知小計 $1937.2468 *"));
-        assert!(text.contains("不可按百分點比較"));
+        assert!(text.contains("小計 $1937.2468 *"));
+        assert!(text.contains("部分"));
         assert!(!text.contains("$—/百分點"));
         let tip = history_tooltip(&text, Some(&v));
         for time in [v.start.unwrap(), v.end] {
             assert!(tip.contains(&display_time::datetime(time).unwrap()));
         }
-        assert!(tip.contains("不能當作每%價格"));
+        assert!(tip.contains("狀態：部分"));
     }
     #[test]
     fn comparable_interval_keeps_its_cost_per_point_and_known_zero_stays_numeric() {
@@ -3744,7 +3806,7 @@ mod widget_revision_tests {
         v.reasons.clear();
         let text = history_description(&e, None, false, Some(&v));
         assert!(text.contains("$2.0000 · $2.0000/百分點"));
-        assert!(!history_tooltip(&text, Some(&v)).contains("不能當作每%價格"));
+        assert!(!history_tooltip(&text, Some(&v)).contains("狀態：部分"));
         assert!(history_description(&e, Some(0.), true, None).contains("$0.0000 *"));
         assert!(history_description(&e, None, true, None).contains("$— *"));
     }
@@ -3789,7 +3851,7 @@ mod widget_revision_tests {
             assert!(app
                 .main_cache
                 .recent_tooltip
-                .contains(&app.interval_presentations[i].per_point));
+                .contains(&app.interval_presentations[i].status));
         }
         let text_ptr = app.main_cache.recent_tooltip.as_ptr();
         let views_ptr = app.interval_presentations.as_ptr();
@@ -3826,10 +3888,7 @@ mod widget_revision_tests {
         app.set_intervals(Arc::new(Vec::new()));
         app.refresh_main_cache();
         assert!(app.main_cache.recent_intervals.is_empty());
-        assert!(app
-            .main_cache
-            .recent_tooltip
-            .contains("尚未有已完成扣額區間"));
+        assert!(app.main_cache.recent_tooltip.contains("已完成區間：0"));
         assert!(!app.main_cache.recent_tooltip.contains("$0"));
     }
     #[test]
@@ -3842,12 +3901,9 @@ mod widget_revision_tests {
         );
         assert_eq!(app.interval_presentations.len(), app.intervals.len());
         assert!(!app.main_cache.recent_intervals.is_empty());
-        assert!(!app
-            .main_cache
-            .recent_tooltip
-            .contains("尚未有已完成扣額區間"));
+        assert!(!app.main_cache.recent_tooltip.contains("已完成區間：0"));
     }
-    fn demo_app() -> WidgetApp {
+    pub(super) fn demo_app() -> WidgetApp {
         let mut app = WidgetApp::new(
             Settings::default(),
             PathBuf::new(),
@@ -3974,8 +4030,8 @@ mod widget_revision_tests {
     fn visible_children_summary_click_expands_and_collapses() {
         let mut app = demo_app();
         let ctx = egui::Context::default();
-        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(310., 332.));
-        let pos = Pos2::new(60., 284.);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 511.));
+        let pos = Pos2::new(60. * 430. / 310., 296. * 430. / 310.);
         let frame = |app: &mut WidgetApp, events: Vec<egui::Event>| {
             let input = egui::RawInput {
                 screen_rect: Some(rect),
@@ -4291,8 +4347,8 @@ mod import_diagnostics_tests {
             assert!(app.main_cache.key.is_some());
             assert_eq!(app.status, "LIVE");
             assert!(app.compact_progress_text().unwrap().contains("17/30"));
-            assert!(app.import_status_text().contains("1234 行"));
-            assert!(app.import_status_text().contains("567 筆觀察"));
+            assert!(app.import_status_text().contains("行 1234"));
+            assert!(app.import_status_text().contains("觀察 567"));
             assert!(app.import_status_text().contains("12 秒"));
         }
         app.handle_worker_event(progress(ProgressStage::Complete));
@@ -4363,7 +4419,7 @@ mod import_diagnostics_tests {
         }
         app.handle_worker_event(progress(ProgressStage::Import(ImportPhase::Reading)));
         assert!(app.compact_progress_text().unwrap().contains("17/30 檔"));
-        assert!(app.import_status_text().contains("1234 行"));
+        assert!(app.import_status_text().contains("行 1234"));
     }
     #[test]
     fn displayed_import_remains_usable_when_later_save_fails() {
@@ -4678,9 +4734,9 @@ mod import_diagnostics_tests {
         live(&mut app, None, t, t + 86400);
         assert!(app.matching_history().is_empty());
         let message = app.empty_history_diagnostic().unwrap();
-        assert!(message.contains("已載入 1 筆"));
-        assert!(message.contains("所選日期有 1 筆"));
-        assert!(message.contains("來源 / 額度視窗"));
+        assert!(message.contains("已載入：1"));
+        assert!(message.contains("當日：1"));
+        assert!(message.contains("目前篩選：0"));
         assert_eq!(app.history[0].source_key, "legacy-source");
     }
     #[test]
@@ -4747,11 +4803,8 @@ mod import_diagnostics_tests {
         assert!(app.main_cache.cost.partial);
         assert_eq!(app.main_cache.tasks[0].interval_cost_usd, Some(3.));
         assert!(app.main_cache.tasks[0].partial);
-        assert!(app.main_cache.recent_tooltip.contains("缺少中間額度觀察"));
-        assert!(app
-            .main_cache
-            .recent_tooltip
-            .contains("不能當作完整的目前 1%"));
+        assert!(app.main_cache.recent_tooltip.contains("額度缺口"));
+        assert!(app.main_cache.recent_tooltip.contains("覆蓋：部分"));
         assert_eq!(
             app.history.len(),
             1,
@@ -4906,7 +4959,7 @@ mod database_display_tests {
         assert_eq!(app.main_cache.tasks[0].interval_cost_usd, None);
         assert_eq!(app.main_cache.tasks[0].latest_cost_usd, Some(4.));
         assert!(app.main_cache.tasks[0].partial);
-        assert!(app.main_cache.recent_tooltip.contains("正在背景更新"));
+        assert!(app.main_cache.recent_tooltip.contains("狀態：更新中"));
     }
 
     #[test]
@@ -5348,7 +5401,7 @@ mod database_display_tests {
             false,
             t + Duration::from_secs(1),
         );
-        assert_eq!(first.minimum, Some(Vec2::new(276., 510.)));
+        assert_eq!(first.minimum, Some(Vec2::new(430., 510.)));
         assert!(
             first.size.is_none(),
             "apply the new minimum before resizing"
@@ -5749,5 +5802,159 @@ mod responsive_close_tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod accessible_ui_tests {
+    use super::*;
+
+    #[test]
+    fn visible_rows_follow_threshold_and_shrink_to_fit_monitor() {
+        assert_eq!(accessible_visible_rows(9, 10, 430. / 310., Some(1080.)), 9);
+        assert_eq!(
+            accessible_visible_rows(11, 10, 430. / 310., Some(1080.)),
+            10
+        );
+        assert_eq!(accessible_visible_rows(20, 6, 430. / 310., Some(1080.)), 6);
+        let fit = accessible_visible_rows(20, 10, 2., Some(768.));
+        assert!(fit < 10);
+        assert!((324. + 22. * fit as f32) * 2. <= 768. - 60.);
+        assert_eq!(accessible_visible_rows(0, 10, 1., None), 1);
+    }
+
+    #[test]
+    fn root_painted_text_never_smaller_or_dimmer_than_rate_label() {
+        for dark in [false, true] {
+            for width in [430., 540., 700.] {
+                let mut app = super::widget_revision_tests::demo_app();
+                app.settings.dark = dark;
+                app.settings.size[0] = width;
+                let ctx = egui::Context::default();
+                app.apply_theme(&ctx);
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 1800.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.widget(ctx),
+                );
+                let minimum = accessibility::minimum_font(width);
+                let expected = accessibility::palette(dark).text;
+                let mut count = 0;
+                for clipped in output.shapes {
+                    if let egui::Shape::Text(text) = clipped.shape {
+                        for section in &text.galley.job.sections {
+                            assert!(
+                                section.format.font_id.size >= minimum - 0.01,
+                                "{}",
+                                text.galley.job.text
+                            );
+                            assert_eq!(section.format.color, expected, "{}", text.galley.job.text);
+                            count += 1;
+                        }
+                    }
+                }
+                assert!(count > 15);
+            }
+        }
+    }
+
+    #[test]
+    fn footer_hover_renders_actual_tooltip_at_readable_size() {
+        let mut app = super::widget_revision_tests::demo_app();
+        app.settings.size[0] = 430.;
+        let ctx = egui::Context::default();
+        app.apply_theme(&ctx);
+        let mut found = false;
+        for time in [0., 0.1, 1., 2., 3.] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 510.))),
+                time: Some(time),
+                events: if time == 0. {
+                    vec![egui::Event::PointerMoved(Pos2::new(215., 470.))]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| app.widget(ctx));
+            for clipped in output.shapes {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    if text.galley.job.text.contains("最近 5 次扣額") {
+                        found = true;
+                        assert!(text
+                            .galley
+                            .job
+                            .sections
+                            .iter()
+                            .all(|s| s.format.font_id.size >= 18.));
+                    }
+                }
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn narrow_task_tooltip_wraps_inside_native_viewport() {
+        let mut app = super::widget_revision_tests::demo_app();
+        app.settings.size[0] = 430.;
+        let ctx = egui::Context::default();
+        app.apply_theme(&ctx);
+        let mut found = false;
+        for time in [0., 0.1, 1., 2., 3.] {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 510.))),
+                    time: Some(time),
+                    events: if time == 0. {
+                        vec![egui::Event::PointerMoved(Pos2::new(60., 378.))]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+                |ctx| app.widget(ctx),
+            );
+            for clipped in output.shapes {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    if text.galley.job.text.contains("Turn Input:") {
+                        found = true;
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(bounds.left() >= 0. && bounds.right() <= 430., "{bounds:?}");
+                        assert!(text
+                            .galley
+                            .job
+                            .sections
+                            .iter()
+                            .all(|s| s.format.font_id.size >= 18.));
+                        for label in [
+                            "Input:",
+                            "Cached:",
+                            "Uncached:",
+                            "Output:",
+                            "Reasoning:",
+                            "Turn Input:",
+                            "Turn Output:",
+                        ] {
+                            assert!(text.galley.job.text.contains(label));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn recent_hover_contains_values_and_compact_coverage_only() {
+        let app = super::widget_revision_tests::demo_app();
+        let text = &app.main_cache.recent_tooltip;
+        assert!(text.contains("估算 USD"));
+        assert!(text.contains("部分"));
+        assert!(!text.contains("不可比較"));
+        assert!(!text.contains("只列真實"));
+        assert!(!text.contains("點擊可"));
     }
 }

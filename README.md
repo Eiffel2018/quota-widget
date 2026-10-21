@@ -1,3 +1,7 @@
+# Quota Widget 0.3.7
+
+Readable, high-contrast text and compact label/value UI. See [release notes](docs/RELEASE-0.3.7.md) and [validation](VALIDATION-0.3.7.md). Windows x64 is cross-built and unsigned; native Windows runtime remains unverified. Accounting and data storage are unchanged.
+
 # Quota Widget 0.3.6
 
 Reconnect recovery and cooperative responsive shutdown. See [release notes](docs/RELEASE-0.3.6.md) and [validation](VALIDATION-0.3.6.md). Windows x64 is cross-built; native Windows runtime is unverified. Original CLI failure cause remains unknown.

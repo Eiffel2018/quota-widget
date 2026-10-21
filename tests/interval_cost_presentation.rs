@@ -88,7 +88,7 @@ fn complete_interval_uses_canonical_subtotal_ratio_and_full_hk_bounds() {
     assert_eq!(view.duration, "00:00:10");
     assert_eq!(view.total, "$6.0000");
     assert_eq!(view.per_point, "$6.0000/百分點");
-    assert_eq!(view.status, "完整／可比較");
+    assert_eq!(view.status, "完整");
     for expected in [
         &view.start,
         &view.end,
@@ -100,8 +100,9 @@ fn complete_interval_uses_canonical_subtotal_ratio_and_full_hk_bounds() {
     }
     assert!(view.tooltip.contains("記錄來源：codex"));
     assert!(view.tooltip.contains("觀察工作階段：synthetic-observer"));
-    assert!(view.tooltip.contains("API 等價費用估算"));
-    assert!(view.tooltip.contains("並非訂閱實際帳單"));
+    assert!(view.tooltip.lines().all(|line| line.contains('：')));
+    assert!(!view.tooltip.contains("API 等價費用估算"));
+    assert!(!view.tooltip.contains("並非訂閱實際帳單"));
     assert!(!view.tooltip.contains("不能當作每%價格"));
 }
 
@@ -123,13 +124,52 @@ fn partial_unknown_prices_keep_known_subtotal_without_a_per_point_price() {
     let view = present(interval);
     assert_eq!(view.change, "99% → 97%");
     assert_eq!(view.total, "$6.0000 *");
-    assert_eq!(view.per_point, "不可比較");
-    assert_eq!(view.status, "不完整／不可比較");
-    assert!(view
-        .tooltip
-        .contains(IntervalReason::UnknownModelPrice.label()));
-    assert!(view.tooltip.contains("不能當作每%價格"));
+    assert_eq!(view.per_point, "未知");
+    assert_eq!(view.status, "部分");
+    assert!(interval
+        .reasons
+        .contains(&IntervalReason::UnknownModelPrice));
+    assert!(!view.tooltip.contains("不能當作每%價格"));
     assert!(!view.tooltip.contains("$3.0000"));
+}
+
+#[test]
+fn compact_partial_tooltip_preserves_numeric_data_and_exported_flags() {
+    let mut partial = token(15, "a", Some(6.));
+    partial.model_assumed = true;
+    partial.partial_flags.push("response_coverage_gap".into());
+    let intervals = completed_intervals(
+        &[token(0, "a", Some(0.)), partial],
+        &[quota(10, 100., 99.), quota(20, 99., 98.)],
+    );
+    let interval = &intervals[1];
+    let before = serde_json::to_value(interval).unwrap();
+    let view = present(interval);
+    assert_eq!(view.total, "$6.0000 *");
+    assert_eq!(view.per_point, "未知");
+    assert_eq!(view.status, "部分");
+    assert!(view.tooltip.lines().all(|line| line.contains('：')));
+    for prose in [
+        "不可比較",
+        "限制：",
+        "資料不完整",
+        "不能當作",
+        "並非訂閱",
+        "不拆成",
+    ] {
+        assert!(!view.tooltip.contains(prose), "unexpected prose: {prose}");
+    }
+    assert_eq!(interval.models[0].events, 1);
+    assert_eq!(interval.models[0].partial_events, 1);
+    assert_eq!(interval.models[0].coverage_gap_events, 1);
+    for reason in [
+        IntervalReason::AssumedModel,
+        IntervalReason::PartialTokenRecords,
+        IntervalReason::TokenCoverageGap,
+    ] {
+        assert!(interval.reasons.contains(&reason));
+    }
+    assert_eq!(serde_json::to_value(interval).unwrap(), before);
 }
 
 #[test]
@@ -146,8 +186,8 @@ fn unknown_prices_and_missing_tokens_have_zero_known_subtotal_with_reasons() {
         assert_eq!(intervals[1].known_usd, 0.);
         let view = present(&intervals[1]);
         assert_eq!(view.total, "$0.0000 *");
-        assert_eq!(view.per_point, "不可比較");
-        assert!(view.tooltip.contains(expected_reason.label()));
+        assert_eq!(view.per_point, "未知");
+        assert!(intervals[1].reasons.contains(&expected_reason));
     }
 }
 
@@ -160,7 +200,7 @@ fn recorded_zero_cost_is_complete_numeric_zero() {
     let view = present(&intervals[1]);
     assert_eq!(view.total, "$0.0000");
     assert_eq!(view.per_point, "$0.0000/百分點");
-    assert_eq!(view.status, "完整／可比較");
+    assert_eq!(view.status, "完整");
     assert!(!view.tooltip.contains("不完整"));
 }
 
@@ -183,7 +223,7 @@ fn raw_fractional_endpoints_and_small_costs_are_not_rounded_into_other_observati
     invalid.percentage_points = f64::NAN;
     let view = present(&invalid);
     assert_eq!(view.change, "未知% → 未知%");
-    assert_eq!(view.per_point, "不可比較");
+    assert_eq!(view.per_point, "未知");
     assert!(!view.tooltip.contains("NaN"));
     assert!(!view.tooltip.contains("inf"));
 }
@@ -206,9 +246,9 @@ fn multi_point_drop_stays_one_observation_with_an_explicit_average() {
     assert_eq!(view.change, "99.5% → 97%");
     assert_eq!(view.total, "$6.0000");
     assert_eq!(view.per_point, "平均 $2.4000/百分點");
-    assert_eq!(view.status, "完整／多百分點平均");
-    assert!(view.tooltip.contains("下降 2.5 百分點"));
-    assert!(view.tooltip.contains("不拆成虛構 1% 區間"));
+    assert_eq!(view.status, "平均");
+    assert!(view.tooltip.contains("下降：2.5 百分點"));
+    assert!(!view.tooltip.contains("不拆成虛構 1% 區間"));
 }
 
 #[test]
@@ -224,8 +264,10 @@ fn reset_derived_interval_preserves_subtotal_and_rejects_comparison() {
     );
     let view = present(&intervals[0]);
     assert_eq!(view.total, "$6.0000 *");
-    assert_eq!(view.per_point, "不可比較");
-    assert!(view.tooltip.contains(IntervalReason::ResetBoundary.label()));
+    assert_eq!(view.per_point, "未知");
+    assert!(intervals[0]
+        .reasons
+        .contains(&IntervalReason::ResetBoundary));
 }
 
 #[test]
@@ -240,7 +282,7 @@ fn partial_noncomparable_and_reset_flags_never_leak_a_stale_ratio() {
         assert_eq!(interval.cost_per_point, Some(6.));
         let view = present(&interval);
         assert_eq!(view.total, "$6.0000 *");
-        assert_eq!(view.per_point, "不可比較");
+        assert_eq!(view.per_point, "未知");
         assert!(!view.tooltip.contains("$6.0000/百分點"));
     }
 }
@@ -252,8 +294,8 @@ fn invalid_or_missing_ratio_is_unavailable_and_never_recomputed() {
         interval.cost_per_point = cost;
         let view = present(&interval);
         assert_eq!(view.total, "$6.0000");
-        assert_eq!(view.per_point, "未知（每百分點費用不可用）");
-        assert_eq!(view.status, "每百分點費用未知");
+        assert_eq!(view.per_point, "未知");
+        assert_eq!(view.status, "未知");
         assert!(!view.tooltip.contains("$6.0000/百分點"));
         assert!(!view.tooltip.contains("NaN"));
         assert!(!view.tooltip.contains("inf"));
@@ -266,11 +308,11 @@ fn absent_reversed_equal_and_overflowing_boundaries_have_unknown_duration() {
     missing.before_observed_at_unix = None;
     let interval = completed_intervals(&[], &[missing]).remove(0);
     let view = present(&interval);
-    assert_eq!(view.start, "未知（缺少或無效起點）");
+    assert_eq!(view.start, "未知");
     assert_eq!(view.duration, "未知");
-    assert!(view
-        .tooltip
-        .contains(IntervalReason::MissingStartBoundary.label()));
+    assert!(interval
+        .reasons
+        .contains(&IntervalReason::MissingStartBoundary));
     for (start, end) in [
         (20, 20),
         (21, 20),
@@ -282,7 +324,7 @@ fn absent_reversed_equal_and_overflowing_boundaries_have_unknown_duration() {
         interval.end = end;
         let view = present(&interval);
         assert_eq!(view.duration, "未知");
-        assert_eq!(view.per_point, "不可比較");
+        assert_eq!(view.per_point, "未知");
         assert_eq!(view.total, "$6.0000 *");
     }
 }
