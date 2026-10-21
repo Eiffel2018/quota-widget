@@ -310,7 +310,7 @@ fn existing_writer_blocks_import_but_allows_read_only_inspection() {
     let logs = sessions(home.path());
     let directory = home.path().join("state");
     let state = directory.join("tokens.json");
-    let _lock = DataLock::acquire(&directory).unwrap();
+    let lock = DataLock::acquire(&directory).unwrap();
     let rejected = output(
         command(home.path())
             .arg("import")
@@ -322,7 +322,11 @@ fn existing_writer_blocks_import_but_allows_read_only_inspection() {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("Another Quota Widget"));
     assert!(!state.exists());
+    // Windows byte-range locks also block snapshot's read of writer.lock.
+    // Keep the lock held for the CLI checks, and snapshot only outside its life.
+    drop(lock);
     let before = snapshot(home.path());
+    let lock = DataLock::acquire(&directory).unwrap();
     let inspected = json_output(
         command(home.path())
             .arg("inspect")
@@ -330,6 +334,7 @@ fn existing_writer_blocks_import_but_allows_read_only_inspection() {
             .arg(&logs),
     );
     assert_eq!(inspected["events"].as_array().unwrap().len(), 2);
+    drop(lock);
     assert_eq!(snapshot(home.path()), before);
 }
 

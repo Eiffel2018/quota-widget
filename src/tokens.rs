@@ -4,6 +4,8 @@
 //! reconcile all retained observations chronologically, so an older archive found
 //! later does not silently turn into a counter reset. The 30-day window is a query
 //! default, never a retention/deletion policy. Prices are deliberately unconfigured.
+#[path = "source_path.rs"]
+mod source_path;
 use chrono::{DateTime, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2751,7 +2753,9 @@ impl TokenStore {
                 "Task metadata must be an explicitly selected regular file, not a symlink",
             ));
         }
-        let key = fs::canonicalize(path)?.to_string_lossy().into_owned();
+        let key = source_path::canonicalize(path)?
+            .to_string_lossy()
+            .into_owned();
         report.files_scanned += 1;
         if self.metadata_path.as_ref() != Some(&key) {
             self.metadata_cursor = SourceCursor::default();
@@ -2841,7 +2845,7 @@ impl TokenStore {
         loader: &mut Option<&mut ThreadLoader<'_>>,
     ) -> io::Result<()> {
         checkpoint()?;
-        let canonical = fs::canonicalize(path)?;
+        let canonical = source_path::canonicalize(path)?;
         let key = canonical.to_string_lossy().into_owned();
         let mut cursor = self.sources.get(&key).cloned().unwrap_or_default();
         let metadata = fs::symlink_metadata(path)?;

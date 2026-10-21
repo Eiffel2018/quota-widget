@@ -2512,7 +2512,12 @@ mod tests {
     fn sqlite_clean_readonly_inspection_creates_no_sidecars() {
         let dir = TempDir::new().unwrap();
         let lock = crate::storage::DataLock::acquire(dir.path()).unwrap();
-        let path = dir.path().join("tokens with ? reserved.sqlite3");
+        // '?' is not a legal Windows filename; '#' also exercises URI escaping.
+        let path = dir.path().join(if cfg!(windows) {
+            "tokens with # reserved.sqlite3"
+        } else {
+            "tokens with ? reserved.sqlite3"
+        });
         let mut db = TokenDb::open(&path, true).unwrap();
         db.commit(&export(vec![event("a", "one", 1, false)], 1), 0)
             .unwrap();
