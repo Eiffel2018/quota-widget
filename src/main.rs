@@ -1,7 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod ui;
 use quota_widget::{
-    storage,
+    display_time, storage,
     tokens::{Pricing, TokenStore},
     usage_views::{self, GroupBy},
 };
@@ -34,11 +34,11 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|s| s == "--help" || s == "-h") {
-        println!("Quota Widget 0.3.2\nNative read-only Codex quota + local token history.\n\nGUI:\n  quota-widget [--demo|--offline] [--no-settings] [--data-dir PATH]\n  --demo         Synthetic data only; never starts CLI or scans real sessions\n  --offline      Never starts CLI; local import remains user-configurable\n  --no-settings  Ephemeral state; no preference/history loading or saving\n  --show-tokens  Open daily token details\n  --show-history Open daily quota history\n\nMachine interface:\n  quota-widget inspect --sessions PATH [--state PATH] [--pricing PATH]\n    Read-only import. JSON schema version 1 on stdout. Does not modify inputs.\n  quota-widget import --sessions PATH --state PATH [--pricing PATH]\n    Incrementally import into specified state, guarded by writer lock.\n  quota-widget --version\n\nExit codes: 0 success, 1 invalid arguments or operation failed.\nNo login, inference, purchases, or credential handling.");
+        println!("Quota Widget 0.3.3\nNative read-only Codex quota + local token history.\n\nGUI:\n  quota-widget [--demo|--offline] [--no-settings] [--data-dir PATH]\n  --demo         Synthetic data only; never starts CLI or scans real sessions\n  --offline      Never starts CLI; local import remains user-configurable\n  --no-settings  Ephemeral state; no preference/history loading or saving\n  --show-tokens  Open daily token details\n  --show-history Open daily quota history\n\nMachine interface:\n  quota-widget inspect --sessions PATH [--state PATH] [--pricing PATH]\n    Read-only import. JSON schema version 1 on stdout. Does not modify inputs.\n  quota-widget import --sessions PATH --state PATH [--pricing PATH]\n    Incrementally import into specified state, guarded by writer lock.\n  quota-widget --version\n\nExit codes: 0 success, 1 invalid arguments or operation failed.\nNo login, inference, purchases, or credential handling.");
         return Ok(());
     }
     if args.iter().any(|s| s == "--version") {
-        println!("quota-widget 0.3.2");
+        println!("quota-widget 0.3.3");
         return Ok(());
     }
     if matches!(args.first().map(String::as_str), Some("inspect" | "import")) {
@@ -95,12 +95,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .filter(|e| e.is_excluded_auto_review())
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"schema_version":1,"mode":args[0],"pricing_assumption":pricing.tier_label,"pricing_verified_at":pricing.verified_at,"long_context_adjustment":pricing.apply_long_context,"events":included,"excluded_auto_review_events":excluded,"exclusion_is_not_free_billing_claim":true,"turn_summaries":usage_views::group(&included,GroupBy::Turn),"task_summaries":usage_views::group(&included,GroupBy::Task),"quota_observations":store.quota_observations(),"files_scanned":report.files_scanned,"lines_read":report.lines_read,"warnings":report.warnings})
-            )?
-        );
+        let mut output = serde_json::json!({"schema_version":1,"mode":args[0],"pricing_assumption":pricing.tier_label,"pricing_verified_at":pricing.verified_at,"long_context_adjustment":pricing.apply_long_context,"events":included,"excluded_auto_review_events":excluded,"exclusion_is_not_free_billing_claim":true,"turn_summaries":usage_views::group(&included,GroupBy::Turn),"task_summaries":usage_views::group(&included,GroupBy::Task),"quota_observations":store.quota_observations(),"files_scanned":report.files_scanned,"lines_read":report.lines_read,"warnings":report.warnings});
+        output["display_timezone"] = serde_json::json!(display_time::DISPLAY_ZONE);
+        output["timestamp_basis"] =
+            serde_json::json!("UTC Unix seconds; *_hk fields are fixed +08:00 displays");
+        display_time::annotate_timestamps(&mut output);
+        println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
     let allowed = [

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2, ViewportBuilder,
     ViewportCommand, ViewportId, WindowLevel,
@@ -7,6 +7,7 @@ use quota_widget::{
     accounting,
     background::{Command as WorkCommand, Event as WorkEvent, Snapshot, Worker},
     bridge::{Bridge, BridgeCommand, BridgeEvent},
+    display_time,
     intervals::{self, CompletedInterval},
     model::{HistoryEvent, QuotaModel, WindowView},
     storage::{self, DataLock, Settings},
@@ -92,6 +93,8 @@ struct WidgetApp {
     notice: String,
     import_note: String,
     price_model: String,
+    price_models_generation: Option<u64>,
+    recorded_price_models: BTreeSet<String>,
     price_values: [f64; 3],
     price_configured: bool,
     last_focus: bool,
@@ -103,12 +106,21 @@ fn now() -> i64 {
     Utc::now().timestamp()
 }
 fn local_time(t: i64) -> String {
-    DateTime::<Utc>::from_timestamp(t, 0)
-        .map(|d| d.with_timezone(&Local).format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| "—".into())
+    display_time::time(t)
 }
 fn local_day(t: i64) -> Option<NaiveDate> {
-    DateTime::<Utc>::from_timestamp(t, 0).map(|d| d.with_timezone(&Local).date_naive())
+    display_time::day(t)
+}
+fn effort_label(group: &usage_views::UsageGroup) -> String {
+    let mut values = group.reasoning_efforts.clone();
+    if group.unknown_effort_events > 0 {
+        values.push("未知".into());
+    }
+    if values.is_empty() {
+        "未知".into()
+    } else {
+        values.join(" / ")
+    }
 }
 fn money(v: Option<f64>) -> String {
     v.map(|x| {
@@ -296,8 +308,8 @@ impl WidgetApp {
             history_open: args.iter().any(|s| s == "--show-history"),
             tokens_open: args.iter().any(|s| s == "--show-tokens"),
             settings_open: false,
-            date: Local::now().date_naive(),
-            token_date: Local::now().date_naive(),
+            date: display_time::now_day(),
+            token_date: display_time::now_day(),
             token_group: GroupBy::Response,
             show_excluded_records: false,
             import_pending: false,
@@ -309,6 +321,8 @@ impl WidgetApp {
             notice: String::new(),
             import_note: String::new(),
             price_model: "gpt-6.1-sol".into(),
+            price_models_generation: None,
+            recorded_price_models: BTreeSet::new(),
             price_values: [0.; 3],
             price_configured: false,
             last_focus: false,
@@ -701,7 +715,12 @@ impl WidgetApp {
             task.task_id
         );
         if let Some(e) = self.tokens.events().get(task.latest_event_index) {
-            text.push_str(&format!("\n{}", self.event_pricing_tooltip(e)));
+            text.push_str(&format!(
+                "\n{}\nReasoning effort: {}\n香港時間: {}",
+                self.event_pricing_tooltip(e),
+                e.reasoning_effort.as_deref().unwrap_or("未知（未記錄）"),
+                display_time::datetime(e.timestamp).unwrap_or_else(|| "未知".into())
+            ));
             let number = |n: u64, flag: &str| {
                 if e.partial_flags.iter().any(|f| f == flag) {
                     "未知".to_owned()
@@ -960,7 +979,7 @@ impl WidgetApp {
                     fg,
                 );
                 painter.line_segment([pt(21., 229.), pt(289., 229.)], Stroke::new(1_f32, line));
-                for (x,label) in [(21.,"Task／名稱"),(105.,"時間"),(163.,"用度"),(225.,"本%累計")] {txt(x,239.,label.into(),10.,muted);}
+                for (x,label) in [(21.,"Task／名稱"),(105.,"時間+8"),(163.,"用度"),(225.,"本%累計")] {txt(x,239.,label.into(),10.,muted);}
                 ui.interact(Rect::from_min_max(pt(21.,238.),pt(289.,255.)),ui.id().with("task-column-help"),Sense::hover()).on_hover_text("用度＝最新單筆 Response 的估算 USD；本%累計＝最近已確認扣額／重設後的已知用量合計。缺少邊界時從啟動開始計 0，並以 * 標示不完整。滑鼠移到 Task 可看名稱及 Token 數字。");
                 let table_bottom=257.+18.*visible as f32;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pt(21.,257.),pt(289.,table_bottom))),|ui| {
@@ -1064,12 +1083,12 @@ impl WidgetApp {
                 *date = date.succ_opt().unwrap_or(*date);
             }
             if ui.button("今天").clicked() {
-                *date = Local::now().date_naive();
+                *date = display_time::now_day();
             }
         });
     }
     fn days(&mut self) -> BTreeSet<NaiveDate> {
-        let today = Local::now().date_naive();
+        let today = display_time::now_day();
         let key = (
             self.token_generation,
             self.history_generation,
@@ -1159,7 +1178,7 @@ impl WidgetApp {
                 "DEMO · 合成使用量與虛構價格，僅示範介面。",
             );
         }
-        ui.label("本機觀察時間；不是後台保證的實際扣額時間。金額為模型等價估算，不是訂閱帳單。");
+        ui.label("香港時間 UTC+08:00；本機觀察時間不是後台保證的實際扣額時間。金額為模型等價估算，不是訂閱帳單。");
         if self.history_cache.sources_generation != Some(self.history_generation) {
             self.history_cache.sources = self
                 .history
@@ -1371,7 +1390,7 @@ impl WidgetApp {
         {
             let mut open = true;
             egui::Window::new("扣額區間 · 模型分項").id(egui::Id::new("completed-interval-detail")).open(&mut open).default_width(710.).show(ui.ctx(), |ui| {
-                ui.label(format!("{} → {} · 實際下降 {} 百分點", interval.start.map(local_time).unwrap_or_else(||"開始時間未知".into()), local_time(interval.end), interval.percentage_points));
+                ui.label(format!("{} → {} · 實際下降 {} 百分點", interval.start.and_then(display_time::datetime).unwrap_or_else(||"開始時間未知".into()), display_time::datetime(interval.end).unwrap_or_else(||"未知".into()), interval.percentage_points));
                 ui.strong(format!("已知估算總和 {}{} · 每百分點 {}", money(Some(interval.known_usd)), if interval.partial {" *"}else{""}, money(interval.cost_per_point)));
                 ui.small("按每筆實際 model 計價。多百分點跳變只顯示平均，不拆成虛構 1% 區間；推理已含輸出。排除 codex-auto-review，不能據此判定官方訂閱計費。");
                 if !interval.reasons.is_empty() { ui.colored_label(Color32::from_rgb(210,150,70),format!("不可直接比較／資料限制：{}",interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join(" · "))); }
@@ -1396,7 +1415,8 @@ impl WidgetApp {
     }
 
     fn token_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Token 明細");
+        ui.heading("Token 明細 · 香港時間 UTC+08:00");
+        ui.small("估算 USD 顯示已知小計；* 代表未完整覆蓋，不能當作完整費用。全部未能估價時顯示未知；推理強度與推理 Token 數分開。 ");
         if self.demo {
             ui.colored_label(
                 if self.settings.dark {
@@ -1499,7 +1519,7 @@ impl WidgetApp {
             cache.input.saturating_sub(cache.cached),
             cache.output,
             cache.reasoning,
-            money(Some(cache.cost)),
+            money((cache.count > cache.missing).then_some(cache.cost)),
             if cache.missing > 0 {
                 format!("；{} 筆費用未知", cache.missing)
             } else {
@@ -1508,10 +1528,13 @@ impl WidgetApp {
         ));
         ui.small(&self.import_note);
         ui.separator();
-        let widths = [72., 165., 115., 120., 45., 90., 90., 90., 80., 80., 110.];
+        let widths = [
+            72., 150., 80., 115., 120., 45., 90., 90., 90., 80., 80., 110.,
+        ];
         let headers = [
-            "時間",
+            "時間+8",
             "模型",
+            "推理強度",
             "Task / Session",
             "Turn / Response",
             "筆數",
@@ -1534,8 +1557,8 @@ impl WidgetApp {
                     let number=|n:u64,flag:&str|if e.partial_flags.iter().any(|f|f==flag){"未知".to_owned()}else{n.to_string()};
                     let uncached=if e.partial_flags.iter().any(|f|f=="input_count_unavailable"||f=="cached_count_unavailable"){"未知".into()}else{e.uncached.to_string()};
                     let identity=match self.token_group {GroupBy::Response=>e.response_id.as_deref().unwrap_or("舊版／未知"),GroupBy::Turn=>e.turn_id.as_deref().unwrap_or("未知 Turn"),GroupBy::Task=>"當日事件合計"};
-                    let values=[local_time(e.last_timestamp),format!("{}{}",e.models.join(" / "),if e.model_assumed {"（假設）"}else{""}),e.session.chars().take(12).collect::<String>(),identity.chars().take(12).collect(),e.event_count.to_string(),number(e.input,"input_count_unavailable"),number(e.cached,"cached_count_unavailable"),uncached,number(e.output,"output_count_unavailable"),number(e.reasoning,"reasoning_count_unavailable"),format!("{}{}",money(e.cost_usd),if e.partial_flags.is_empty(){""}else{" *"})];
-                    let tooltip=format!("{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 筆費用未知\n{}",self.tokens.task_name(&e.session).unwrap_or("名稱未記錄"),e.session,e.turn_id.as_deref().unwrap_or("未知"),e.response_id.as_deref().unwrap_or("未知"),local_time(e.first_timestamp),local_time(e.last_timestamp),e.models.join(" / "),money(Some(e.known_cost_subtotal_usd)),e.unknown_cost_events,e.partial_flags.join("\n"));
+                    let values=[local_time(e.last_timestamp),format!("{}{}",e.models.join(" / "),if e.model_assumed {"（假設）"}else{""}),effort_label(e),e.session.chars().take(12).collect::<String>(),identity.chars().take(12).collect(),e.event_count.to_string(),number(e.input,"input_count_unavailable"),number(e.cached,"cached_count_unavailable"),uncached,number(e.output,"output_count_unavailable"),number(e.reasoning,"reasoning_count_unavailable"),format!("{}{}",money(e.display_cost_usd()),if e.display_cost_is_partial(){" *"}else{""})];
+                    let tooltip=format!("Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 筆費用未知\n{}",effort_label(e),self.tokens.task_name(&e.session).unwrap_or("名稱未記錄"),e.session,e.turn_id.as_deref().unwrap_or("未知"),e.response_id.as_deref().unwrap_or("未知"),display_time::datetime(e.first_timestamp).unwrap_or_else(||"未知".into()),display_time::datetime(e.last_timestamp).unwrap_or_else(||"未知".into()),e.models.join(" / "),money(e.display_cost_usd()),e.unknown_cost_events,e.partial_flags.join("\n"));
                     let (rect,response)=ui.allocate_exact_size(Vec2::new(total_width,24.),Sense::hover());response.on_hover_text(tooltip);
                     if i%2==1 {ui.painter().rect_filled(rect,0.,ui.visuals().faint_bg_color);}
                     let mut x=rect.left();
@@ -1549,6 +1572,62 @@ impl WidgetApp {
         if !self.notice.is_empty() {
             ui.label(&self.notice);
         }
+    }
+    fn price_model_choices(&mut self) -> BTreeSet<String> {
+        // The model picker must not rescan all history on every settings repaint.
+        if self.price_models_generation != Some(self.token_generation) {
+            self.recorded_price_models = self
+                .tokens
+                .events
+                .iter()
+                .chain(&self.tokens.excluded_events)
+                .map(|event| event.model.clone())
+                .collect();
+            self.price_models_generation = Some(self.token_generation);
+        }
+        let mut choices = self.recorded_price_models.clone();
+        choices.extend(self.settings.pricing.rates.keys().cloned());
+        choices.extend(["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"].map(String::from));
+        choices
+    }
+    fn load_price_editor(&mut self) {
+        if let Some(price) = self.settings.pricing.rates.get(self.price_model.trim()) {
+            self.price_values = [
+                price.uncached_input_per_million,
+                price.cached_input_per_million,
+                price.output_per_million,
+            ];
+            self.price_configured = true;
+        } else {
+            self.price_values = [0.; 3];
+            self.price_configured = false;
+        }
+    }
+    fn apply_price_editor(&mut self) {
+        let model = self.price_model.trim();
+        if model.is_empty() {
+            return;
+        }
+        self.settings.pricing.tier_label = "自訂價格".into();
+        self.settings.pricing.verified_at = None;
+        if self.price_configured {
+            self.settings.pricing.rates.insert(
+                model.into(),
+                ModelPrice {
+                    uncached_input_per_million: self.price_values[0],
+                    cached_input_per_million: self.price_values[1],
+                    output_per_million: self.price_values[2],
+                },
+            );
+        } else {
+            self.settings.pricing.rates.remove(model);
+        }
+        self.notice = format!(
+            "已套用 {} 的價格；其他模型單價保留。估算不是訂閱實際費用。",
+            model
+        );
+        self.request_reprice();
+        self.dirty = true;
     }
     fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("設定 / 連接");
@@ -1682,18 +1761,12 @@ impl WidgetApp {
                     self.settings.pricing = preset;
                     self.settings.pricing.model_override = current_override;
                     self.request_reprice();
-                    if let Some(p) = self.settings.pricing.rates.get(&self.price_model) {
-                        self.price_values = [
-                            p.uncached_input_per_million,
-                            p.cached_input_per_million,
-                            p.output_per_million,
-                        ];
-                        self.price_configured = true;
-                    }
+                    self.load_price_editor();
                     self.dirty = true;
                 }
             }
         });
+        ui.small("上方官方預設按鈕會替換所有模型單價；只改一個模型請使用下方編輯器。");
         ui.label(format!(
             "目前：{} · 核對 {}",
             self.settings.pricing.tier_label,
@@ -1718,19 +1791,60 @@ impl WidgetApp {
             self.dirty = true;
         }
         ui.small("單次請求量不明時金額為未知。未另計 cache-write、區域附加費、工具費；服務等級需自行核對。價格可變，核對日 2026-10-17。");
-        if ui.text_edit_singleline(&mut self.price_model).changed() {
-            if let Some(p) = self.settings.pricing.rates.get(&self.price_model) {
-                self.price_values = [
-                    p.uncached_input_per_million,
-                    p.cached_input_per_million,
-                    p.output_per_million,
-                ];
-                self.price_configured = true;
-            } else {
-                self.price_values = [0.; 3];
-                self.price_configured = false;
-            }
+        let models = self.price_model_choices();
+        let previous_model = self.price_model.clone();
+        egui::ComboBox::from_label("選擇模型（每個模型獨立單價）")
+            .selected_text(&self.price_model)
+            .width(240.)
+            .show_ui(ui, |ui| {
+                for model in models {
+                    let label = if self.settings.pricing.rates.contains_key(&model) {
+                        model.clone()
+                    } else {
+                        format!("{model}（未設定價格）")
+                    };
+                    ui.selectable_value(&mut self.price_model, model, label);
+                }
+            });
+        if self.price_model != previous_model {
+            self.load_price_editor();
         }
+        ui.horizontal(|ui| {
+            ui.label("或輸入 model ID 新增／編輯");
+            if ui.text_edit_singleline(&mut self.price_model).changed() {
+                self.load_price_editor();
+            }
+        });
+        egui::CollapsingHeader::new("各模型目前單價一覽（點名稱切換）")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut selected = None;
+                egui::Grid::new("price-overview")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for label in ["模型", "未快取輸入", "快取輸入", "輸出"] {
+                            ui.strong(label);
+                        }
+                        ui.end_row();
+                        for (model, price) in &self.settings.pricing.rates {
+                            if ui
+                                .selectable_label(*model == self.price_model, model)
+                                .clicked()
+                            {
+                                selected = Some(model.clone());
+                            }
+                            ui.label(price.uncached_input_per_million.to_string());
+                            ui.label(price.cached_input_per_million.to_string());
+                            ui.label(price.output_per_million.to_string());
+                            ui.end_row();
+                        }
+                    });
+                if let Some(model) = selected {
+                    self.price_model = model;
+                    self.load_price_editor();
+                }
+            });
+        ui.small("以下只修改選中的模型；先套用，再切換。未設定的模型保持未知，可填入並確認自訂單價。選取模型不會覆寫事件的實際 model。");
         ui.checkbox(&mut self.price_configured, "已確認此模型價格");
         egui::Grid::new("prices").show(ui, |ui| {
             for (i, label) in ["未快取輸入", "快取輸入", "輸出（已含推理）"]
@@ -1747,24 +1861,14 @@ impl WidgetApp {
                 ui.end_row();
             }
         });
-        if ui.button("套用價格並重算").clicked() {
-            self.settings.pricing.tier_label = "自訂價格".into();
-            self.settings.pricing.verified_at = None;
-            if self.price_configured && !self.price_model.trim().is_empty() {
-                self.settings.pricing.rates.insert(
-                    self.price_model.trim().into(),
-                    ModelPrice {
-                        uncached_input_per_million: self.price_values[0],
-                        cached_input_per_million: self.price_values[1],
-                        output_per_million: self.price_values[2],
-                    },
-                );
-            } else {
-                self.settings.pricing.rates.remove(self.price_model.trim());
-            }
-            self.request_reprice();
-            self.dirty = true;
-            self.notice = "價格已套用。估算不是訂閱實際費用。".into();
+        if ui
+            .add_enabled(
+                !self.price_model.trim().is_empty(),
+                egui::Button::new("套用此模型價格並重算"),
+            )
+            .clicked()
+        {
+            self.apply_price_editor();
         }
         let mut override_model = self
             .settings
@@ -1822,7 +1926,7 @@ impl WidgetApp {
                 let usage_events=if audit_excluded {&snapshot.excluded_events[..]}else{snapshot.events()};
                 let filename = format!(
                     "{kind}-{day}-{}.{}",
-                    Utc::now().format("%H%M%S%3f"),
+                    Utc::now().with_timezone(&display_time::timezone()).format("%H%M%S%3f"),
                     if json { "json" } else { "csv" }
                 );
                 let path = folder.join(filename);
@@ -1904,12 +2008,10 @@ impl WidgetApp {
                     }]
                     .as_i64();
                     event["local_time"] = serde_json::json!(timestamp.map(local_time));
-                    event["local_datetime"] = serde_json::json!(timestamp
-                        .and_then(|t| DateTime::<Utc>::from_timestamp(t, 0))
-                        .map(|d| d
-                            .with_timezone(&Local)
-                            .format("%Y-%m-%d %H:%M:%S %:z")
-                            .to_string()));
+                    event["local_datetime"] = serde_json::json!(timestamp.and_then(display_time::datetime));
+                    event["display_timezone"] = serde_json::json!(display_time::OFFSET_LABEL);
+                    event["display_date"] = serde_json::json!(timestamp.and_then(display_time::day).map(|d|d.to_string()));
+                    display_time::annotate_timestamps(event);
                     event["excluded_from_default_totals"] = serde_json::json!(audit_excluded);
                     event["pricing_basis"] = serde_json::json!(pricing.tier_label);
                     event["pricing_verified_at"] = serde_json::json!(pricing.verified_at);
@@ -1919,12 +2021,12 @@ impl WidgetApp {
                 let result = (|| -> std::io::Result<()> {
                     std::fs::create_dir_all(&folder)?;
                     if json {
-                        storage::save_json(
-                            &path,
-                            &serde_json::json!({
+                        let mut exported = serde_json::json!({
                                 "schema_version": 1,
                                 "date": day.to_string(),
-                                "timezone": Local::now().offset().to_string(),
+                                "timezone": display_time::OFFSET_LABEL,
+                                "display_timezone": display_time::DISPLAY_ZONE,
+                                "timestamp_basis": "UTC Unix seconds; *_hk and local_* are fixed +08:00 displays",
                                 "kind": kind,
                                 "cost_basis": "estimated_model_equivalent_not_subscription_charge",
                                 "view_scope":if audit_excluded {"excluded_auto_review_audit"}else{"included_default"},
@@ -1943,16 +2045,22 @@ impl WidgetApp {
                                         .filter(|e| local_day(e.timestamp) == Some(day))
                                         .collect::<Vec<_>>(), GroupBy::Task,audit_excluded))
                                 } else { None }
-                            }),
-                        )
+                            });
+                        display_time::annotate_timestamps(&mut exported);
+                        storage::save_json(&path,&exported)
                     } else {
                         let columns: Vec<String> = if tokens {
                             vec![
                                 "timestamp",
+                                "timestamp_utc_unix",
+                                "timestamp_hk",
+                                "display_timezone",
+                                "display_date",
                                 "local_time",
                                 "local_datetime",
                                 "model",
                                 "model_assumed",
+                                "reasoning_effort",
                                 "session",
                                 "turn_id",
                                 "response_id",
@@ -1972,6 +2080,10 @@ impl WidgetApp {
                         } else {
                             vec![
                                 "observed_at_unix",
+                                "observed_at_unix_utc_unix",
+                                "observed_at_unix_hk",
+                                "display_timezone",
+                                "display_date",
                                 "local_time",
                                 "local_datetime",
                                 "source_key",
@@ -1983,7 +2095,11 @@ impl WidgetApp {
                                 "estimated_cost_usd",
                                 "partial",
                                 "interval_start",
+                                "interval_start_utc_unix",
+                                "interval_start_hk",
                                 "interval_end",
+                                "interval_end_utc_unix",
+                                "interval_end_hk",
                                 "interval_percentage_points",
                                 "interval_known_usd",
                                 "interval_cost_per_point",
@@ -2027,9 +2143,9 @@ impl WidgetApp {
                         std::fs::write(&path, out)?;
                         if !tokens {
                             let model_path = path.with_file_name(format!("{}-models.csv", path.file_stem().unwrap_or_default().to_string_lossy()));
-                            let mut models_csv=String::from("interval_key,start,end,percentage_points,interval_known_usd,interval_cost_per_point,comparable,partial,reasons,model,events,input,cached,uncached,output,reasoning,model_known_usd,unknown_cost_events,assumed_model_events\n");
+                            let mut models_csv=String::from("interval_key,start_utc_unix,end_utc_unix,start_hk,end_hk,display_timezone,percentage_points,interval_known_usd,interval_cost_per_point,comparable,partial,reasons,model,events,input,cached,uncached,output,reasoning,model_known_usd,unknown_cost_events,assumed_model_events\n");
                             for interval in &completed_export {for model in &interval.models {
-                                let values=vec![interval.history_event_key.clone(),interval.start.map(|v|v.to_string()).unwrap_or_default(),interval.end.to_string(),interval.percentage_points.to_string(),interval.known_usd.to_string(),interval.cost_per_point.map(|v|v.to_string()).unwrap_or_default(),interval.comparable.to_string(),interval.partial.to_string(),interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join("; "),model.model.clone(),model.events.to_string(),model.input.to_string(),model.cached.to_string(),model.uncached.to_string(),model.output.to_string(),model.reasoning.to_string(),model.known_usd.to_string(),model.unknown_cost_events.to_string(),model.assumed_model_events.to_string()];
+                                let values=vec![interval.history_event_key.clone(),interval.start.map(|v|v.to_string()).unwrap_or_default(),interval.end.to_string(),interval.start.and_then(display_time::datetime).unwrap_or_default(),display_time::datetime(interval.end).unwrap_or_default(),display_time::OFFSET_LABEL.into(),interval.percentage_points.to_string(),interval.known_usd.to_string(),interval.cost_per_point.map(|v|v.to_string()).unwrap_or_default(),interval.comparable.to_string(),interval.partial.to_string(),interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join("; "),model.model.clone(),model.events.to_string(),model.input.to_string(),model.cached.to_string(),model.uncached.to_string(),model.output.to_string(),model.reasoning.to_string(),model.known_usd.to_string(),model.unknown_cost_events.to_string(),model.assumed_model_events.to_string()];
                                 models_csv.push_str(&values.into_iter().map(|mut value|{if value.starts_with(['=','+','-','@','\t','\r']){value.insert(0,'\'');}format!("\"{}\"",value.replace('"',"\"\""))}).collect::<Vec<_>>().join(",")); models_csv.push('\n');
                             }}
                             std::fs::write(model_path,models_csv)?;
@@ -2308,6 +2424,43 @@ mod widget_revision_tests {
         assert!(tip.contains("Reasoning: 未知"));
     }
     #[test]
+    fn model_picker_and_editor_preserve_other_rates_and_unknowns() {
+        let mut app = demo_app();
+        app.settings.pricing = Pricing::official_standard();
+        let original = app.settings.pricing.rates.clone();
+        let choices = app.price_model_choices();
+        for name in ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"] {
+            assert!(choices.contains(name));
+        }
+        app.price_model = "gpt-6-luna".into();
+        app.load_price_editor();
+        assert_eq!(app.price_values, [0.1, 0.01, 0.5]);
+        app.price_values = [0.3, 0.04, 0.8];
+        app.apply_price_editor();
+        assert_eq!(
+            app.settings.pricing.rates["gpt-6-luna"].output_per_million,
+            0.8
+        );
+        for name in ["gpt-6.1-sol", "gpt-6-astra"] {
+            assert_eq!(app.settings.pricing.rates[name], original[name]);
+        }
+        app.price_model = "custom-recorded-model".into();
+        app.load_price_editor();
+        assert!(!app.price_configured);
+        app.price_values = [1., 0.2, 3.];
+        app.price_configured = true;
+        app.apply_price_editor();
+        assert!(app.price_model_choices().contains("custom-recorded-model"));
+        app.price_model = "gpt-6-luna".into();
+        app.load_price_editor();
+        assert_eq!(app.price_values, [0.3, 0.04, 0.8]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        storage::save_json(&path, &app.settings).unwrap();
+        let saved: Settings = storage::load_json(&path).unwrap();
+        assert_eq!(saved.pricing, app.settings.pricing);
+    }
+    #[test]
     fn main_tree_cache_expansion_preserves_self_and_global_cost() {
         let mut app = demo_app();
         assert_eq!(app.main_cache.tree.len(), 2);
@@ -2490,5 +2643,88 @@ mod widget_revision_tests {
             }
             assert_eq!(found, 2);
         }
+    }
+    #[test]
+    fn hong_kong_day_filters_exports_intervals_and_restart_without_moving_epochs() {
+        let temp = tempfile::tempdir().unwrap();
+        let utc = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        let before = utc("2026-10-17T15:59:59Z");
+        let midnight = utc("2026-10-17T16:00:00Z");
+        let late = utc("2026-10-17T23:51:00Z");
+        let source = temp.path().join("synthetic.jsonl");
+        let rows=[("prior",before),("midnight",midnight),("late",late)].into_iter().map(|(id,t)|serde_json::json!({"timestamp":t,"type":"token_usage_record","payload":{"thread_id":"synthetic-hk","turn_id":id,"response_id":id,"model":"gpt-6-luna","reasoning_effort":"max","usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":100,"reasoning_output_tokens":50}}}).to_string()).collect::<Vec<_>>().join("\n")+"\n";
+        std::fs::write(&source, rows).unwrap();
+        let mut store = TokenStore::default();
+        store
+            .import_dir(temp.path(), &Pricing::official_standard())
+            .unwrap();
+        let cache = temp.path().join("saved.json");
+        store.save(&cache).unwrap();
+        let reopened = TokenStore::load(&cache).unwrap();
+        assert_eq!(
+            reopened
+                .events()
+                .iter()
+                .map(|e| e.timestamp)
+                .collect::<Vec<_>>(),
+            vec![before, midnight, late]
+        );
+        let mut app = WidgetApp::new(
+            Settings::default(),
+            temp.path().to_owned(),
+            true,
+            false,
+            true,
+            Vec::new(),
+        );
+        app.tokens = Arc::new(Snapshot::from_store(&reopened));
+        let day = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        app.date = day;
+        app.token_date = day;
+        app.history=Arc::new([(midnight-30,"90","89"),(midnight+60,"89","88")].into_iter().map(|(timestamp,before,after)|serde_json::from_value(serde_json::json!({"session":"test","observed_at_unix":timestamp,"source_key":"codex","epoch":0,"kind":"QuotaDecrease","window_label":"week","window_key":"primary","before":before,"after":after,"delta":"1"})).unwrap()).collect());
+        assert_eq!(local_time(late), "07:51:00");
+        assert_eq!(local_day(before), Some(day.pred_opt().unwrap()));
+        for tokens in [true, false] {
+            for json in [true, false] {
+                app.export_day(tokens, json);
+                app.export_join.take().unwrap().join().unwrap();
+                assert!(app
+                    .export_rx
+                    .take()
+                    .unwrap()
+                    .recv()
+                    .unwrap()
+                    .starts_with("已匯出"));
+            }
+        }
+        for entry in std::fs::read_dir(temp.path().join("exports")).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            if path.extension().is_some_and(|e| e == "json") {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["timezone"], "+08:00");
+                assert_eq!(value["date"], "2026-10-18");
+                if value["kind"] == "tokens" {
+                    let events = value["events"].as_array().unwrap();
+                    assert_eq!(events.len(), 2);
+                    assert!(events
+                        .iter()
+                        .all(|e| e["timestamp"] == e["timestamp_utc_unix"]));
+                    let event = events.iter().find(|e| e["timestamp"] == late).unwrap();
+                    assert_eq!(event["local_time"], "07:51:00");
+                    assert_eq!(event["timestamp_hk"], "2026-10-18 07:51:00 +08:00");
+                } else {
+                    assert_eq!(value["events"].as_array().unwrap().len(), 1);
+                    let interval = &value["completed_intervals"][0];
+                    assert_eq!(interval["start"], midnight - 30);
+                    assert_eq!(interval["start_hk"], "2026-10-17 23:59:30 +08:00");
+                    assert_eq!(interval["end_hk"], "2026-10-18 00:01:00 +08:00");
+                }
+            } else {
+                assert!(text.contains("+08:00"));
+                assert!(text.contains("utc_unix"));
+            }
+        }
+        assert_eq!(duration(3600), "01:00:00");
     }
 }

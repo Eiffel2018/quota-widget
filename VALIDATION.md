@@ -1,4 +1,4 @@
-# Quota Widget 0.3.2 validation — 2026-10-17 UTC
+# Quota Widget 0.3.3 validation — 2026-10-18 UTC
 
 All execution used an isolated Linux workspace and synthetic JSONL. No user computer, real account, credentials, or live user-session files were accessed.
 
@@ -6,38 +6,38 @@ All execution used an isolated Linux workspace and synthetic JSONL. No user comp
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --offline --locked --all-targets -- -D warnings`: passed.
-- `cargo test --offline --locked`: 256 normal tests passed; three substantial benchmarks are intentionally ignored in that normal command and were separately run successfully in release mode.
-- Rust 1.99.1; eframe 0.32.3; Cargo.lock retained. No runtime web app or Electron dependency.
+- `cargo test --offline --locked`: 284 tests passed; three substantial benchmarks are intentionally ignored in that command and were separately run successfully in release mode.
+- Rust 1.99.1; eframe 0.32.3; locked dependencies retained. Native Rust, no Electron/runtime web app.
 
-Coverage includes response/thread deduplication, legacy cumulative deltas, mixed schema overlap, model switches, unknown models, long-context prices, custom-price migration/restart, exact recorded auto-review exclusion, seven Luna children under a Sol parent, retained excluded raw data, filtered Turn snapshots, tree totals and cycles, real versus cached quota resets, background persistence/corrupt-file guards, numeric partial totals, all daily export formats and excluded audit export, first-frame dark/light theme pinning against an opposite system theme, and completed interval attribution/model sums.
+New regression coverage includes fixed Hong Kong day boundaries across UTC midnight, the example 2026-10-17 23:51 UTC → 2026-10-18 07:51 +08:00, interval/CSV/JSON exports, raw epoch persistence, identical display under UTC/Los Angeles/Hong Kong/Kiritimati system timezones, recorded response/turn reasoning effort and conflicting/missing effort, one-time legacy cache enrichment with unchanged-file restart skips, known partial subtotals versus entirely unpriced or genuinely zero subtotals, and isolated per-model price editing/repricing/persistence.
 
-Completed intervals include actual multi-point changes without fabricated subdivisions, startup/reset/gap/unknown-model non-comparability, account/source/window/epoch boundaries, stable identities, missing versus zero cost, and exclusion-aware own-model totals. No hypothetical parent-price feature is included.
-
-## Substantial synthetic benchmarks
-
-Optimized Linux measurements from this release (not promises about a user's machine):
-
-- 200 files / 50,000 events / 100,200 lines / 18,873,790 bytes: initial import 527.284 ms; unchanged poll median 0.479 ms; one appended event 279.156 ms; identical pricing 0.001 ms. Peak test-process RSS 148,656 KiB.
-- 100,000 events / 1,000 Tasks / 2,000 quota history rows: indexed Task range median 0.073 ms; full history batch accounting 0.338 ms; cached accounting repaint 0.000133 ms. Original uncached reference frame 220.229 ms, indexed reference frame 34.364 ms.
-- 100,000 events / 10,000 quota rows / 79,993 model-breakdown rows: interval index 16.912 ms, completed interval derivation 33.632 ms. Indexed range aggregation avoids history-by-event rescans.
-
-Import, normalization, indexing, atomic persistence and export remain background-owned. No-op polls do not clone full history or rewrite interval files. Retired snapshots are destroyed off the GUI thread.
-
-## Platform artifacts and limits
-
-- Linux x86_64 release built and exercised through actual eframe windows on authenticated Xvfb/Openbox, software OpenGL. Screenshots are actual rendered UI with synthetic fixtures, not mockups.
-- Windows x64 release cross-built successfully with the GNU target. PE headers identify an x86-64 GUI executable; imported DLLs are Windows system libraries. It has NOT been run or accepted on native Windows in this environment.
-- macOS Apple Silicon `aarch64-apple-darwin` code check passed. No Apple SDK/linker is present, so no Mac application/binary was linked, packaged, signed or tested.
-- No Authenticode signing or Apple notarization. Do not disable security protections or bypass warnings.
-
-The full source package contains the exact final source and lockfile, complete embedded fonts/icon and licenses, fixtures, tests, build instructions/scripts and selected validation evidence. External build artifacts and generated runtime state are excluded.
-
-Pricing is dated API-equivalent estimation, not actual subscription charges. Exact recorded `codex-auto-review` is excluded by request, with retained audit records; no free-billing claim. Standard/Fast defaults for Sol/Luna/Astra were checked against official documentation on 2026-10-17. Existing custom rates are preserved. See docs/PRICING.md.
+The full suite retains all response deduplication, legacy cumulative delta, mixed schema, model switch, review exclusion, tree, actual quota boundary, background persistence, dark first-frame, completed model-wise interval and export regression tests from 0.3.2. Incomplete intervals remain non-comparable; no hypothetical parent-price feature is included.
 
 ## Actual final UI acceptance
 
-The same final Linux binary was launched, closed and relaunched with persisted settings. Verified collapsed/expanded tree, seven visible Luna descendants rather than 26 (19 excluded review tasks), actual-name/model/rate tooltip with all seven counters, default mixed-model details, separate 19-record review audit, readable dark header buttons after restart, and numeric zero current buckets after a completed decrement.
+Actual final Linux eframe windows were rendered using authenticated Xvfb/Openbox and software OpenGL, not mockups. Synthetic UTC source timestamps were displayed as Hong Kong time. Token Response and Turn views show 07:51:00 on Oct18, recorded max/high separately from reasoning counts, and unknown when no field was recorded. The partial Luna row and its tooltip both show the same $0.0046 known subtotal with an uncertainty marker. The prior HK-day response is not included. Export buttons produced three records with unchanged UTC epochs and explicit +08:00 dates. Relaunch under America/Los_Angeles preserved identical Hong Kong display, recorded effort and dark header styling.
 
-The synthetic completed 2pp interval displays $0.1362 total and $0.0681 per percentage point. Model detail shows eight Luna responses totaling $0.0192 and three Sol responses totaling $0.1170. The actual GUI's CSV and JSON export buttons were exercised; parsed exports reconcile to those exact amounts and contain no excluded auto-review usage. The initial incomplete interval displays a numeric $0.0000 with uncertainty rather than a negative zero or invented comparable ratio.
+The pricing editor now visibly lists Sol, Luna, Astra and recorded/custom models; a clickable overview exposes configured input/cache/output rates. Actual GUI selection and editing of Luna were checked, including restart. Automated tests independently verify that changing Luna does not change Sol/Astra costs, explicitly configured unknown models can be priced, and unrelated rates/overrides survive restart/recompute. Model selection edits the rate table only, not recorded event attribution.
 
-See validation/release-0.3.2/final-*.png and selected logs/examples. The blank live quota in offline screenshots is intentional: fixtures supply local usage/history, not a fabricated official live balance.
+See validation/release-0.3.3/final-*.png, examples and logs. Blank live quota in offline screenshots is intentional: fixtures do not fabricate an official live balance.
+
+## Substantial synthetic benchmarks
+
+Optimized Linux measurements, not promises about a user's machine:
+
+- 200 files / 50,000 events / 100,200 lines / 18,873,790 bytes: initial import 653.268 ms; unchanged poll median 0.527 ms; one appended event 358.336 ms; identical pricing 0.001 ms. Peak test-process RSS 174,860 KiB.
+- 100,000 events / 1,000 Tasks / 2,000 quota rows: indexed Task range median 0.213 ms; full history batch accounting 0.382 ms; cached accounting repaint 0.000133 ms. Original uncached reference frame 224.618 ms, indexed reference frame 27.557 ms.
+- 100,000 events / 10,000 quota rows / 79,993 model rows: interval index 15.774 ms; completed interval derivation 26.393 ms.
+
+Import, normalization, indexing, atomic persistence and export remain background-owned. No-op polls do not clone history or rewrite interval files. Price picker model discovery is cached by snapshot generation, not rescanned every settings repaint. The new effort field triggers one intentional replay of selected historical source files to enrich old cache data; subsequent unchanged polls skip parsing.
+
+## Platforms and limits
+
+- Linux x86_64 release built and exercised through actual UI with synthetic fixtures.
+- Windows x64 release cross-built successfully; PE headers confirm an x86-64 GUI executable. Imported DLLs are Windows system libraries. NOT executed or accepted on native Windows in this environment.
+- macOS Apple Silicon code check passed. No Apple SDK/linker is present, so no Mac binary was linked, packaged, signed or tested.
+- No Authenticode signing or Apple notarization. Do not disable security protections or bypass warnings.
+
+Source ZIP includes exact final source, Cargo.lock, full embedded fonts/icon/licenses, fixtures/tests, build instructions and selected evidence. Generated runtime state, private reference screenshots and external build artifacts are excluded. UTC epochs remain canonical; presentation and day grouping are explicitly +08:00. Durations/countdowns are unchanged. CSV uses the existing formula-injection-safe escaping for leading plus signs; explicit timestamp strings also carry +08:00.
+
+Prices are API-equivalent estimates, not subscription charges. Exact recorded codex-auto-review remains excluded by request with audit records retained; no free-billing claim. Model-specific default rates were verified 2026-10-17; high/max effort is not a separate multiplier. Missing/custom model handling and long-context caveats remain documented in docs/PRICING.md.

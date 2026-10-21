@@ -1,3 +1,9 @@
+# 0.3.3 fixed UTC+08:00 and usage detail correction
+
+All display/day filtering uses fixed Hong Kong UTC+08:00, independent of host timezone. Raw UTC epochs and durations remain untouched; exports include explicit UTC aliases and +08:00 dates. Per-response recorded reasoning effort is retained and shown separately from reasoning tokens, without an added price multiplier. Missing/conflicting effort stays unknown. Known partial Turn/Task subtotals remain visible with an incomplete marker; entirely unpriced groups stay unknown.
+
+Model pricing now has a visible Sol/Luna/Astra/recorded/custom-model selector and a clickable current-rate overview. Each model's input/cache/output edit is applied independently and retained across restart; unknown models can be explicitly configured. Selecting an editor model does not override recorded usage models.
+
 # 0.3.2 review exclusion and model pricing
 
 Exact recorded codex-auto-review usage is retained for audit but excluded from default Task rows, child counts, estimates and details. Parent/child and mixed-thread usage are priced per recorded event model; known unknown model identifiers are never silently treated as Sol. Existing raw data and custom rates are preserved. Standard/Fast presets now include officially verified Astra. High/max reasoning effort does not invent a price multiplier. Audit view/export and migration/restart regressions are included.

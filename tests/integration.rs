@@ -102,6 +102,7 @@ fn event(timestamp: i64, cost: Option<f64>) -> TokenEvent {
         timestamp,
         model: "synthetic-test-model".into(),
         model_assumed: false,
+        reasoning_effort: None,
         session: "synthetic-test-session".into(),
         response_id: None,
         turn_id: None,

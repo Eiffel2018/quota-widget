@@ -15,5 +15,5 @@ cp scripts/Info.plist "$app/Contents/Info.plist"
 file "$app/Contents/MacOS/quota-widget" | grep -q arm64
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
-ditto -c -k --sequesterRsrc --keepParent "$app" dist/quota-widget-0.3.2-macos-arm64.zip
+ditto -c -k --sequesterRsrc --keepParent "$app" dist/quota-widget-0.3.3-macos-arm64.zip
 printf '\nBuilt locally: %s\n' "$app"

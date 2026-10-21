@@ -22,6 +22,8 @@ pub struct UsageGroup {
     pub response_count: usize,
     pub models: Vec<String>,
     pub model_assumed: bool,
+    pub reasoning_efforts: Vec<String>,
+    pub unknown_effort_events: usize,
     pub input: u64,
     pub cached: u64,
     pub uncached: u64,
@@ -31,6 +33,22 @@ pub struct UsageGroup {
     pub known_cost_subtotal_usd: f64,
     pub unknown_cost_events: usize,
     pub partial_flags: Vec<String>,
+}
+impl UsageGroup {
+    /// A partial group can still contain priced responses. Keep that known
+    /// subtotal visible; distinguish an actually priced zero from no priced data.
+    pub fn display_cost_usd(&self) -> Option<f64> {
+        (self.event_count > self.unknown_cost_events).then_some(
+            if self.known_cost_subtotal_usd == 0.0 {
+                0.0
+            } else {
+                self.known_cost_subtotal_usd
+            },
+        )
+    }
+    pub fn display_cost_is_partial(&self) -> bool {
+        self.cost_usd.is_none() || !self.partial_flags.is_empty()
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskRow {
@@ -555,6 +573,13 @@ pub fn group_with_excluded(
                 response_count: rows.iter().filter(|e| e.response_id.is_some()).count(),
                 models: models.into_iter().collect(),
                 model_assumed: rows.iter().any(|e| e.model_assumed),
+                reasoning_efforts: rows
+                    .iter()
+                    .filter_map(|e| e.reasoning_effort.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                unknown_effort_events: rows.iter().filter(|e| e.reasoning_effort.is_none()).count(),
                 input: sum(|e| e.input),
                 cached: sum(|e| e.cached),
                 uncached: sum(|e| e.uncached),
@@ -588,6 +613,7 @@ mod tests {
             timestamp: time,
             model: "gpt-6.1-sol".into(),
             model_assumed: false,
+            reasoning_effort: None,
             session: session.into(),
             response_id: Some(id.into()),
             turn_id: turn.map(str::to_owned),
@@ -681,5 +707,41 @@ mod tests {
         let rows = task_rows(&[event], Some(0), 20);
         assert_eq!(rows[0].latest_cost_usd, Some(0.4415));
         assert_eq!(rows[0].interval_cost_usd, None);
+    }
+    #[test]
+    fn partial_groups_show_known_subtotal_but_unpriced_is_not_zero() {
+        let mut known = e("known", 10, "task", Some("turn"));
+        known.cost_usd = Some(0.1141);
+        known.partial_flags = vec!["mixed_schema_legacy_overlap_suppressed".into()];
+        let group = group(&[&known], GroupBy::Turn).remove(0);
+        assert_eq!(group.cost_usd, None);
+        assert_eq!(group.unknown_cost_events, 0);
+        assert_eq!(group.display_cost_usd(), Some(0.1141));
+        assert!(group.display_cost_is_partial());
+        let mut unknown = e("unknown", 11, "task", Some("turn"));
+        unknown.cost_usd = None;
+        let mixed = super::group(&[&known, &unknown], GroupBy::Turn).remove(0);
+        assert_eq!(mixed.display_cost_usd(), Some(0.1141));
+        assert_eq!(mixed.unknown_cost_events, 1);
+        let absent = super::group(&[&unknown], GroupBy::Turn).remove(0);
+        assert_eq!(absent.display_cost_usd(), None);
+        known.cost_usd = Some(0.0);
+        let zero = super::group(&[&known, &unknown], GroupBy::Turn).remove(0);
+        assert_eq!(zero.display_cost_usd(), Some(0.0));
+        assert!(zero.display_cost_is_partial());
+    }
+    #[test]
+    fn mixed_efforts_are_metadata_not_token_or_price_multipliers() {
+        let mut a = e("a", 10, "task", Some("turn"));
+        a.reasoning_effort = Some("max".into());
+        let mut b = e("b", 11, "task", Some("turn"));
+        b.reasoning_effort = Some("high".into());
+        let c = e("c", 12, "task", Some("turn"));
+        let row = group(&[&a, &b, &c], GroupBy::Turn).remove(0);
+        assert_eq!(row.reasoning_efforts, vec!["high", "max"]);
+        assert_eq!(row.unknown_effort_events, 1);
+        assert_eq!(row.output, 300);
+        assert_eq!(row.reasoning, 240);
+        assert!((row.known_cost_subtotal_usd - 1.3245).abs() < 1e-12);
     }
 }

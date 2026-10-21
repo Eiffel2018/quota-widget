@@ -17,6 +17,7 @@ fn event(index: usize, tasks: usize) -> TokenEvent {
         timestamp: BASE + index as i64,
         model: "gpt-6.1-sol".into(),
         model_assumed: false,
+        reasoning_effort: None,
         session: format!("synthetic-task-{:04}", index % tasks),
         response_id: Some(format!("synthetic-response-{index:06}")),
         turn_id: Some(format!("synthetic-turn-{}", index / 3)),

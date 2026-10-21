@@ -16,9 +16,9 @@ pub const DEFAULT_ASSUMED_MODEL: &str = "gpt-6.1-sol";
 pub const DEFAULT_BROWSE_DAYS: i64 = 30;
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 const STORE_VERSION: u32 = 3;
-// Independent of the storage schema: rebuild derived model attribution once when
+// Independent of the storage schema: rebuild derived model/effort attribution once when
 // opening old caches, without dropping raw observations or trusting old offsets.
-const NORMALIZATION_VERSION: u32 = 1;
+const NORMALIZATION_VERSION: u32 = 2;
 const AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const AUTO_REVIEW_EXCLUDED: &str = "excluded_recorded_codex_auto_review";
 const UNATTRIBUTED_MODEL: &str = "unattributed-model";
@@ -173,6 +173,10 @@ pub struct TokenEvent {
     pub timestamp: i64,
     pub model: String,
     pub model_assumed: bool,
+    /// Recorded request/turn effort, never a thread default or pricing multiplier.
+    /// Missing or conflicting evidence remains unknown, independently of token counts.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Logical task/thread ID (`thread_id`, or legacy `session_meta.id`).
     /// This is never the root-session ID of a child thread.
     pub session: String,
@@ -336,6 +340,8 @@ struct SourceCursor {
     model: Option<String>,
     model_timestamp_ms: Option<i64>,
     model_turn_id: Option<String>,
+    /// Captured only from a turn_context in this logical thread.
+    effort_context: Option<EffortContext>,
     observed_len: u64,
     modified_ns: Option<u64>,
     file_identity: Option<String>,
@@ -375,6 +381,11 @@ struct UsageObservation {
     source_model_timestamp_ms: Option<i64>,
     #[serde(default)]
     source_model_turn_id: Option<String>,
+    /// All explicitly recorded values survive duplicate enrichment and conflicts.
+    #[serde(default)]
+    reasoning_efforts: BTreeSet<String>,
+    #[serde(default)]
+    source_effort_contexts: Vec<EffortContext>,
     total: Option<Counts>,
     last: Option<Counts>,
     flags: Vec<String>,
@@ -386,6 +397,110 @@ struct ModelContext {
     #[serde(default)]
     turn_id: Option<String>,
     model: String,
+}
+
+/// Separate from model defaults: absence in a new turn context is meaningful and
+/// must not inherit a previous request's effort. Empty values therefore persist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct EffortContext {
+    timestamp_ms: i64,
+    session: String,
+    turn_id: Option<String>,
+    model: Option<String>,
+    values: BTreeSet<String>,
+}
+
+struct RecordedEfforts<'a> {
+    turns: BTreeMap<(&'a str, &'a str), Vec<&'a EffortContext>>,
+}
+impl<'a> RecordedEfforts<'a> {
+    fn new(contexts: &'a [EffortContext]) -> Self {
+        let mut turns: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for context in contexts {
+            if let Some(turn) = context.turn_id.as_deref() {
+                turns
+                    .entry((context.session.as_str(), turn))
+                    .or_default()
+                    .push(context);
+            }
+        }
+        Self { turns }
+    }
+
+    fn context_values(&self, row: &UsageObservation, at: i64) -> BTreeSet<String> {
+        let rows = row
+            .turn_id
+            .as_deref()
+            .and_then(|turn| self.turns.get(&(row.session.as_str(), turn)));
+        let end = rows.map_or(0, |rows| {
+            rows.partition_point(|context| context.timestamp_ms <= at)
+        });
+        let latest = rows.and_then(|rows| end.checked_sub(1).map(|i| rows[i]));
+        let sources: Vec<_> = row
+            .source_effort_contexts
+            .iter()
+            .filter(|context| {
+                context.session == row.session
+                    && context.turn_id == row.turn_id
+                    && context.timestamp_ms <= at
+                    && latest.is_none_or(|latest| context.timestamp_ms >= latest.timestamp_ms)
+            })
+            .collect();
+        let matches_model = |context: &EffortContext| {
+            row.model.as_ref().is_none_or(|model| {
+                context
+                    .model
+                    .as_ref()
+                    .is_none_or(|recorded| recorded == model)
+            })
+        };
+        // Captured file order resolves same-millisecond contexts. Without it,
+        // disagreeing contexts at the latest timestamp stay unknown.
+        if let Some(time) = sources.iter().map(|source| source.timestamp_ms).max() {
+            let mut values = BTreeSet::new();
+            for source in sources.iter().filter(|source| source.timestamp_ms == time) {
+                if source.values.is_empty() || !matches_model(source) {
+                    return BTreeSet::new();
+                }
+                values.extend(source.values.iter().cloned());
+            }
+            return values;
+        }
+        let Some(latest) = latest else {
+            return BTreeSet::new();
+        };
+        let mut values = BTreeSet::new();
+        for context in rows.unwrap()[..end]
+            .iter()
+            .rev()
+            .take_while(|context| context.timestamp_ms == latest.timestamp_ms)
+        {
+            if context.values.is_empty() || !matches_model(context) {
+                return BTreeSet::new();
+            }
+            values.extend(context.values.iter().cloned());
+        }
+        values
+    }
+
+    fn for_versions(&self, rows: &[&UsageObservation]) -> Option<String> {
+        // An update that omits effort must not erase the exact response's prior
+        // explicit value, nor pick up a setting changed after it was first seen.
+        let explicit: BTreeSet<_> = rows
+            .iter()
+            .flat_map(|row| row.reasoning_efforts.iter().cloned())
+            .collect();
+        if !explicit.is_empty() {
+            return (explicit.len() == 1).then(|| explicit.into_iter().next().unwrap());
+        }
+        let first = rows.iter().map(|row| row.timestamp_ms).min()?;
+        let values: BTreeSet<_> = rows
+            .iter()
+            .filter(|row| row.timestamp_ms == first)
+            .flat_map(|row| self.context_values(row, first))
+            .collect();
+        (values.len() == 1).then(|| values.into_iter().next().unwrap())
+    }
 }
 
 /// Recorded attribution is independent of whichever pricing override is selected.
@@ -489,6 +604,7 @@ pub struct TokenStore {
     sources: BTreeMap<String, SourceCursor>,
     observations: Vec<UsageObservation>,
     contexts: Vec<ModelContext>,
+    effort_contexts: Vec<EffortContext>,
     events: Vec<TokenEvent>,
     quota: Vec<ImportedQuotaObservation>,
     last_pricing: Option<Pricing>,
@@ -521,6 +637,7 @@ impl Default for TokenStore {
             sources: BTreeMap::new(),
             observations: Vec::new(),
             contexts: Vec::new(),
+            effort_contexts: Vec::new(),
             events: Vec::new(),
             quota: Vec::new(),
             last_pricing: None,
@@ -573,7 +690,8 @@ impl TokenStore {
                 }
                 if store.normalization_version < NORMALIZATION_VERSION {
                     // Replay only user-selected roots on the next import. Existing
-                    // observations are sufficient to repair most old model caches now.
+                    // observations repair model attribution immediately; effort
+                    // omitted by old caches is recovered only from selected files.
                     store.sources.clear();
                     let pricing = store.last_pricing.clone().unwrap_or_default();
                     store.reconcile(&pricing);
@@ -675,6 +793,8 @@ impl TokenStore {
                 source_model: None,
                 source_model_timestamp_ms: None,
                 source_model_turn_id: None,
+                reasoning_efforts: BTreeSet::new(),
+                source_effort_contexts: Vec::new(),
                 total: None,
                 last: Some(Counts {
                     input,
@@ -1029,6 +1149,7 @@ impl TokenStore {
         paths.sort();
         let old_observation_count = self.observations.len();
         let old_context_count = self.contexts.len();
+        let old_effort_context_count = self.effort_contexts.len();
         for path in paths {
             report.files_scanned += 1;
             if let Err(error) = self.import_file(&path, &mut report) {
@@ -1040,6 +1161,7 @@ impl TokenStore {
         if self.usage_dirty
             || self.observations.len() != old_observation_count
             || self.contexts.len() != old_context_count
+            || self.effort_contexts.len() != old_effort_context_count
             || self.last_pricing.as_ref() != Some(pricing)
         {
             // Only a real reconciliation needs an old-ID set, never an idle poll.
@@ -1280,6 +1402,7 @@ impl TokenStore {
             cursor.model = None;
             cursor.model_timestamp_ms = None;
             cursor.model_turn_id = None;
+            cursor.effort_context = None;
         } else if !response_scoped && cursor.session.is_none() {
             cursor.session = text_field(payload, &["thread_id", "session_id"])
                 .or_else(|| text_field(value, &["thread_id", "session_id"]));
@@ -1297,6 +1420,32 @@ impl TokenStore {
             && (kind == "turn_context" || matches!(payload_kind, "task_started" | "turn_started"))
         {
             cursor.turn_id = text_field(payload, &["turn_id"]);
+            cursor.effort_context = None;
+        }
+        if matches!(
+            payload_kind,
+            "task_complete" | "turn_complete" | "turn_completed" | "turn_aborted"
+        ) {
+            cursor.effort_context = None;
+        }
+        // Only this official, request/turn-scoped record supplies inherited effort.
+        // session_meta/configured and thread_settings_applied are defaults, not
+        // proof of the effort that any particular response actually used.
+        // Official writer: codex-rs/core/src/session/turn_context.rs (`effort`).
+        if kind == "turn_context" {
+            if let Some(timestamp_ms) = timestamp_ms {
+                let context = EffortContext {
+                    timestamp_ms,
+                    session: session.clone(),
+                    turn_id: text_field(payload, &["turn_id"]),
+                    model: text_field(payload, &["model", "model_slug"]),
+                    values: effort_fields(payload, &["reasoning_effort", "effort"]),
+                };
+                if cursor.session.as_deref() == Some(session.as_str()) {
+                    cursor.effort_context = Some(context.clone());
+                }
+                self.effort_contexts.push(context);
+            }
         }
         if matches!(kind, "session_meta" | "session_configured")
             || payload_kind == "session_configured"
@@ -1499,11 +1648,35 @@ impl TokenStore {
             .flatten();
         let source_model_timestamp_ms = source_model.as_ref().and(cursor.model_timestamp_ms);
         let source_model_turn_id = source_model.as_ref().and(cursor.model_turn_id.clone());
+        let reasoning_efforts = [payload, info, value]
+            .into_iter()
+            .flat_map(|value| effort_fields(value, &["reasoning_effort"]))
+            .collect::<BTreeSet<_>>();
+        let source_effort_context = cursor
+            .effort_context
+            .as_ref()
+            .filter(|context| {
+                context.session == session
+                    && context.turn_id == turn_id
+                    && context.timestamp_ms <= timestamp_ms
+            })
+            .cloned();
         if let Some(index) = self.known_observations.get(&identity).copied() {
             let existing = &mut self.observations[index];
             // During migration, old cursors replay without duplicating usage,
             // while restoring raw-field availability that older stores lost.
             let old_flags = existing.flags.clone();
+            let old_effort_count = existing.reasoning_efforts.len();
+            existing.reasoning_efforts.extend(reasoning_efforts);
+            if existing.reasoning_efforts.len() != old_effort_count {
+                self.usage_dirty = true;
+            }
+            if let Some(context) = source_effort_context {
+                if !existing.source_effort_contexts.contains(&context) {
+                    existing.source_effort_contexts.push(context);
+                    self.usage_dirty = true;
+                }
+            }
             if existing.source_model != source_model
                 || existing.source_model_timestamp_ms != source_model_timestamp_ms
                 || existing.source_model_turn_id != source_model_turn_id
@@ -1552,6 +1725,8 @@ impl TokenStore {
             source_model,
             source_model_timestamp_ms,
             source_model_turn_id,
+            reasoning_efforts,
+            source_effort_contexts: source_effort_context.into_iter().collect(),
             total,
             last,
             flags,
@@ -1743,6 +1918,7 @@ impl TokenStore {
                             timestamp: row.timestamp_ms.div_euclid(1000),
                             model: UNATTRIBUTED_MODEL.into(),
                             model_assumed: false,
+                            reasoning_effort: None,
                             session: row.session.clone(),
                             response_id: None,
                             turn_id: None,
@@ -1792,6 +1968,7 @@ impl TokenStore {
                 timestamp: row.timestamp_ms.div_euclid(1000),
                 model,
                 model_assumed,
+                reasoning_effort: None,
                 session: row.session.clone(),
                 response_id: row.response_id.clone(),
                 turn_id: row.turn_id.clone(),
@@ -1840,6 +2017,7 @@ impl TokenStore {
             }
         }
         self.reconcile_response_records(&mut result, &recorded_models, pricing);
+        self.apply_recorded_efforts(&mut result);
         result.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
         self.events = result;
         self.normalization_version = NORMALIZATION_VERSION;
@@ -1854,6 +2032,46 @@ impl TokenStore {
         }
         self.usage_dirty = false;
         self.revision = self.revision.saturating_add(1);
+    }
+
+    fn apply_recorded_efforts(&mut self, events: &mut [TokenEvent]) {
+        self.effort_contexts.sort();
+        self.effort_contexts.dedup();
+        let recorded = RecordedEfforts::new(&self.effort_contexts);
+        let mut versions: BTreeMap<String, Vec<&UsageObservation>> = BTreeMap::new();
+        for row in &self.observations {
+            let id = if row.source_kind.as_deref() == Some("token_usage_record") {
+                row.response_id.as_ref().map(|response| {
+                    format!("response:{}:{}:{response}", row.session.len(), row.session)
+                })
+            } else {
+                legacy_event_id(row)
+            };
+            if let Some(id) = id {
+                versions.entry(id).or_default().push(row);
+            }
+        }
+        for event in events {
+            // A cumulative gap/residual can span different requests or efforts.
+            // Metadata uncertainty must not alter pricing, partial flags or IDs.
+            let aggregate = event.partial_flags.iter().any(|flag| {
+                matches!(
+                    flag.as_str(),
+                    "initial_snapshot_contains_unattributed_usage"
+                        | "gap_spans_unobserved_requests"
+                        | "reset_baseline_uncertain"
+                        | "mixed_schema_residual_unattributed"
+                        | "legacy_model_scope_uncertain"
+                )
+            });
+            event.reasoning_effort = if aggregate {
+                None
+            } else {
+                versions
+                    .get(&event.id)
+                    .and_then(|rows| recorded.for_versions(rows))
+            };
+        }
     }
 
     /// A response is one completed provider response, a turn is `(thread_id,
@@ -2201,6 +2419,7 @@ impl TokenStore {
                 timestamp: first_seen[&key].div_euclid(1000),
                 model: chosen.or(recorded).unwrap_or(assumed).to_owned(),
                 model_assumed: chosen.is_none() && recorded.is_none(),
+                reasoning_effort: None,
                 session: thread.into(),
                 response_id: Some(response.into()),
                 turn_id: row.turn_id.clone(),
@@ -2337,6 +2556,19 @@ fn flag(flags: &mut Vec<String>, value: &str) {
     if !flags.iter().any(|flag| flag == value) {
         flags.push(value.into());
     }
+}
+fn effort_fields(value: &Value, names: &[&str]) -> BTreeSet<String> {
+    // Codex's ReasoningEffort schema permits nonempty custom labels. Keep the
+    // recorded label without deriving anything from the model or token count.
+    names
+        .iter()
+        .filter_map(|name| value.get(*name).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && !matches!(*value, "unknown" | "default" | "unavailable" | "n/a")
+        })
+        .map(str::to_owned)
+        .collect()
 }
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())

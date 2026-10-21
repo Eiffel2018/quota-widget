@@ -15,6 +15,7 @@ fn token(t: i64, model: &str, cost: Option<f64>) -> TokenEvent {
         timestamp: t,
         model: model.into(),
         model_assumed: false,
+        reasoning_effort: None,
         session: "synthetic-task".into(),
         response_id: Some(format!("r{t}")),
         turn_id: Some("synthetic-turn".into()),
