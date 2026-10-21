@@ -1,6 +1,16 @@
-# Quota Widget 0.3.3
+# Quota Widget 0.3.4
 
 原生 Rust + eframe 桌面小工具，重建自 0.2.1 的畫面、已恢復字型／圖示、格式與行為證據。本專案是新的可維護實作，不是聲稱找回遺失的原始碼。沒有 Electron、WebView、Node 或 Python 常駐服務。
+
+## 0.3.4 試用修正
+
+- 修復原版 history.json 數字 session、settings.json 的 bucket:null 相容性。首次實際改寫舊格式前建立獨立、位元組完全相同的備份；讀取不改動原檔。
+- 正確呈現原版 metadata 變動誤標為重設的下降紀錄，保留原來百分比／時間／來源；0→0 不作新的扣額分界。舊版匿名來源不猜測對應現有帳戶。
+- 修復匯入快照的重設證據與基準處理；有差異的觀察保留原數字，部分小計不當作每%價格。
+- 新增每%用度表、起迄時間／歷時／總用度／每百分點及模型分項。主視窗底部累計行懸停顯示最近 5 個區間，點擊開表格。
+- 近期 Task 保留期限由 24 小時縮短為 2 小時；本扣額區間有用量的 Task 及既有樹狀關係規則保留。
+
+Windows 請先關閉舊版再開新 EXE；不需要刪除設定或歷史。這是交叉編譯的 Windows 試用包，沒有宣稱已在 Windows 原生環境運行測試。實際金額仍是 API 模型等價估算。
 
 ## 功能
 
@@ -61,7 +71,7 @@ Windows GNU 交叉建置需官方 Rust x86_64-pc-windows-gnu target 及 MinGW-w6
 
     cargo build --release --locked --target x86_64-pc-windows-gnu
 
-此原碼版本與 Windows 包的驗證結果以 VALIDATION.md 為準。跨編譯不是 Windows 或 Mac 原生實測。未做 Authenticode／Apple notarization。不要停用安全防護或繞過系統警告。
+此原碼版本與 Windows 包的驗證結果以 VALIDATION-0.3.4.md 為準；舊版 VALIDATION.md 僅作先前版本記錄。跨編譯不是 Windows 或 Mac 原生實測。未做 Authenticode／Apple notarization。不要停用安全防護或繞過系統警告。
 
 ## CLI / agent 使用
 

@@ -699,7 +699,7 @@ fn legacy_task_rows(events: &[TokenEvent], boundary: Option<i64>, end: i64) -> V
         .filter_map(|(task, mut events)| {
             events.sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
             let latest = *events.last()?;
-            if latest.timestamp < end.saturating_sub(86400)
+            if latest.timestamp < end.saturating_sub(2 * 60 * 60)
                 && boundary.is_none_or(|b| latest.timestamp <= b)
             {
                 return None;

@@ -10,4 +10,5 @@ pub mod background;
 pub mod history;
 pub mod usage_views;
 
+pub mod interval_views;
 pub mod intervals;

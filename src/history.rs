@@ -25,6 +25,58 @@ fn window(e: &HistoryEvent) -> Window {
         e.window_label.clone(),
     )
 }
+/// Recovered 0.2.x live history used numeric run IDs and anonymous source-slot
+/// counters. These counters are local to a run, not account/bucket identities.
+/// Keep this compatibility path narrower than ordinary unannotated history.
+fn legacy_slot(e: &HistoryEvent) -> Option<&str> {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if e.evidence.is_some()
+        || e.window_key.is_some()
+        || e.before_observed_at_unix.is_some()
+        || e.reconciliation.is_some()
+        || !digits(&e.session)
+    {
+        return None;
+    }
+    let (source, slot) = e.source_key.split_once(':')?;
+    (digits(source) && matches!(slot, "primary" | "secondary" | "credits")).then_some(slot)
+}
+
+/// Old live history sometimes labeled real decreases as resets when metadata
+/// changed. The recorded endpoints, not that label, determine the direction.
+fn legacy_direction(e: &HistoryEvent, slot: &str) -> Option<HistoryKind> {
+    match (slot, e.kind) {
+        ("primary" | "secondary", HistoryKind::QuotaDecrease | HistoryKind::QuotaReset) => {
+            quota_values(e).map(|(before, after)| {
+                if after < before {
+                    HistoryKind::QuotaDecrease
+                } else {
+                    HistoryKind::QuotaReset
+                }
+            })
+        }
+        ("credits", HistoryKind::CreditDecrease | HistoryKind::CreditTopUp) => {
+            let before = decimal_text(&e.before)?;
+            let after = decimal_text(&e.after)?;
+            let (before_whole, before_fraction) = before.split_once('.').unwrap_or((&before, ""));
+            let (after_whole, after_fraction) = after.split_once('.').unwrap_or((&after, ""));
+            // Canonical nonnegative decimal text compares exactly by whole-part
+            // length, whole digits, then fractional digits (no trailing zeroes).
+            match after_whole
+                .len()
+                .cmp(&before_whole.len())
+                .then_with(|| after_whole.cmp(before_whole))
+                .then_with(|| after_fraction.cmp(before_fraction))
+            {
+                std::cmp::Ordering::Less => Some(HistoryKind::CreditDecrease),
+                std::cmp::Ordering::Greater => Some(HistoryKind::CreditTopUp),
+                std::cmp::Ordering::Equal => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn imported(e: &HistoryEvent) -> bool {
     e.evidence.as_ref().map_or_else(
         || e.session.starts_with("imported-local-observations"),
@@ -208,9 +260,14 @@ struct Timeline {
     seen_remaining: BTreeSet<String>,
     uncertain: bool,
 }
-fn rollover(e: &HistoryEvent) -> bool {
+fn rollover(e: &HistoryEvent, accepted_reset_at: Option<i64>) -> bool {
     e.evidence.as_ref().is_some_and(|p| {
-        p.before_reset_at
+        // An unchanged snapshot may already carry the new deadline, so the
+        // immediate raw pair can lose the rollover evidence. Prefer the last
+        // accepted timeline deadline. Conversely, an ignored old-cycle snapshot
+        // must not make a cached current-cycle value look like a second reset.
+        accepted_reset_at
+            .or(p.before_reset_at)
             .zip(p.reset_at)
             .is_some_and(|(before, after)| {
                 before <= e.observed_at_unix
@@ -248,10 +305,36 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
     });
     let mut timelines: BTreeMap<Window, Timeline> = BTreeMap::new();
     let mut result: Vec<HistoryEvent> = Vec::new();
+    let mut legacy_cycles: BTreeMap<(String, String, String), u64> = BTreeMap::new();
     // Credits do not share a quota reset cycle. Preserve exact string precision.
     let mut credit_endpoints: BTreeMap<Window, String> = BTreeMap::new();
     for original in ordered {
         let mut event = original.clone();
+        if let Some(slot) = legacy_slot(original) {
+            let Some(kind) = legacy_direction(original, slot) else {
+                continue;
+            };
+            event.kind = kind;
+            if matches!(kind, HistoryKind::QuotaDecrease | HistoryKind::QuotaReset) {
+                let cycle = legacy_cycles
+                    .entry((
+                        event.session.clone(),
+                        event.source_key.clone(),
+                        event.window_label.clone(),
+                    ))
+                    .or_default();
+                if kind == HistoryKind::QuotaReset {
+                    *cycle = cycle.saturating_add(1);
+                }
+                event.epoch = *cycle;
+            }
+            // Each row is an old live observation. Missing slots, anonymous
+            // source reuse, and other runs cannot justify rewriting its before
+            // value or suppressing it as an imported echo. Preserve all recorded
+            // fields except the derived direction and meaningful quota cycle.
+            result.push(event);
+            continue;
+        }
         if matches!(
             event.kind,
             HistoryKind::CreditDecrease | HistoryKind::CreditTopUp
@@ -284,7 +367,8 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
         ) {
             continue;
         }
-        // Ignore malformed direction labels in presentation, retaining the raw row.
+        // Outside the verified legacy shape, malformed direction labels are
+        // not evidence of a usable transition. Retain them only in raw history.
         if (event.kind == HistoryKind::QuotaDecrease) != (after < before) {
             continue;
         }
@@ -331,8 +415,15 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             state.uncertain = true;
             continue;
         }
+        // Only an actual raw rise with rollover evidence can establish a new
+        // cycle at an endpoint already seen in the old cycle. Equal raw values
+        // were excluded above, so metadata-only changes never create cycles.
+        let deadline_rollover =
+            event.kind == HistoryKind::QuotaReset && rollover(&event, state.reset_at);
+        let real_reset =
+            event.kind == HistoryKind::QuotaReset && (!is_imported || deadline_rollover);
         // The same endpoint from another session/read is not another change.
-        if (after - state.remaining).abs() <= EPSILON {
+        if (after - state.remaining).abs() <= EPSILON && !deadline_rollover {
             if let Some(index) = state.last_visible {
                 let previous = &result[index];
                 if previous.kind == event.kind
@@ -355,8 +446,6 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             }
             continue;
         }
-        let real_reset =
-            event.kind == HistoryKind::QuotaReset && (!is_imported || rollover(&event));
         if after > state.remaining + EPSILON
             && !is_imported
             && event.kind == HistoryKind::QuotaDecrease
@@ -388,10 +477,9 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
                 .seen_uncertain
                 .insert((percent_text(state.remaining), percent_text(after)))
             {
-                event.before = percent_text(state.remaining);
-                event.after = percent_text(after);
-                event.delta = percent_text(after - state.remaining);
-                event.kind = HistoryKind::QuotaReset;
+                // The conservative accounting anchor can sit below a disputed
+                // trajectory. Keep the observed direction and both endpoints:
+                // a raw 100→99 decrease is not an observed 0→99 replenishment.
                 event.partial = true;
                 event.reconciliation = Some(HistoryReconciliation::UncertainRecovery);
                 result.push(event);

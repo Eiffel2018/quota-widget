@@ -34,5 +34,17 @@
       "packaging manifests"
     ],
     "source_modified": false
+  },
+  {
+    "version": "0.3.4",
+    "archive": "quota-widget-0.3.4-full-source.zip",
+    "sha256": "fbbe9c9d8e3cc7ffc997d59c0934715b7b8365952a6aa6e79a12949ad24a5250",
+    "files": 63,
+    "excluded": [
+      "validation output",
+      "build output",
+      "packaging manifests"
+    ],
+    "source_modified": false
   }
 ]

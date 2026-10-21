@@ -67,9 +67,44 @@ pub enum HistoryReconciliation {
     ConflictingObservation,
 }
 
+/// Preserve legacy integer IDs exactly, without coercing floats, nulls or booleans.
+/// This compatibility rule belongs to history run IDs, not Codex request/model IDs.
+fn deserialize_history_session<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    struct HistorySession;
+    impl serde::de::Visitor<'_> for HistorySession {
+        type Value = String;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or nonnegative integer history session ID")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
+            Ok(value.to_owned())
+        }
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<String, E> {
+            Ok(value)
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<String, E> {
+            if value < 0 {
+                return Err(E::invalid_value(
+                    serde::de::Unexpected::Signed(value),
+                    &self,
+                ));
+            }
+            Ok(value.to_string())
+        }
+    }
+    deserializer.deserialize_any(HistorySession)
+}
+
 /// Compatible with the recovered version-1 history event shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistoryEvent {
+    // 0.2.x persisted a numeric run/session counter; rebuilt versions use text.
+    #[serde(deserialize_with = "deserialize_history_session")]
     pub session: String,
     pub observed_at_unix: i64,
     pub source_key: String,

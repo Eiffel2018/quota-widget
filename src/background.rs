@@ -233,6 +233,7 @@ struct State {
     history_revision: u64,
     saved_history_revision: Option<(PathBuf, u64)>,
     history_writes_blocked: bool,
+    history_backup_pending: Option<PathBuf>,
 }
 impl State {
     fn new() -> Self {
@@ -255,6 +256,7 @@ impl State {
             history_revision: 0,
             saved_history_revision: None,
             history_writes_blocked: false,
+            history_backup_pending: None,
         }
     }
     fn snapshot_if_changed(&mut self) -> Option<Arc<Snapshot>> {
@@ -397,6 +399,20 @@ impl State {
         {
             return;
         }
+        if self.history_backup_pending.as_ref() == Some(&path) {
+            if let Err(error) = storage::backup_legacy_history(&path) {
+                self.history_writes_blocked = true;
+                send_save_error(
+                    events,
+                    path,
+                    std::io::Error::other(format!(
+                        "Legacy history backup failed; original preserved: {error}"
+                    )),
+                );
+                return;
+            }
+            self.history_backup_pending = None;
+        }
         let file = HistoryFile {
             version: 2,
             events: &self.raw_history,
@@ -457,16 +473,20 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                     }
                     Err(error) => {
                         state.token_writes_blocked = true;
-                        Some(error.to_string())
+                        Some(format!("tokens.json: {error}"))
                     }
                 };
                 state.raw_history.clear();
                 state.history_revision = 0;
                 state.saved_history_revision = None;
                 state.history_writes_blocked = false;
+                state.history_backup_pending = None;
                 let history_error = history_path.and_then(|path| {
                     match storage::load_json::<LoadedHistory>(&path) {
                         Ok(file) if file.version == 1 || file.version == 2 => {
+                            if file.version == 1 {
+                                state.history_backup_pending = Some(path.clone());
+                            }
                             state.raw_history = file.events;
                             state.saved_history_revision = Some((path, 0));
                             None
@@ -474,11 +494,11 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Ok(_) => {
                             state.history_writes_blocked = true;
-                            Some("Unsupported history-file version; original preserved".into())
+                            Some("history.json: Unsupported history-file version; original preserved".into())
                         }
                         Err(error) => {
                             state.history_writes_blocked = true;
-                            Some(error.to_string())
+                            Some(format!("history.json: {error}"))
                         }
                     }
                 });
@@ -584,7 +604,7 @@ fn run(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
                         {
                             continue;
                         }
-                        match storage::save_json(&path, &settings) {
+                        match storage::save_settings(&path, &settings) {
                             Ok(()) => saved_settings = Some((path, bytes)),
                             Err(error) => send_save_error(&events, path, error),
                         }

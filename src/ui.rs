@@ -8,6 +8,7 @@ use quota_widget::{
     background::{Command as WorkCommand, Event as WorkEvent, Snapshot, Worker},
     bridge::{Bridge, BridgeCommand, BridgeEvent},
     display_time,
+    interval_views::{self, IntervalPresentation},
     intervals::{self, CompletedInterval},
     model::{HistoryEvent, QuotaModel, WindowView},
     storage::{self, DataLock, Settings},
@@ -28,6 +29,8 @@ struct MainCache {
     tasks: Vec<usage_views::TaskRow>,
     boundary: Option<HistoryEvent>,
     cost: accounting::ObservedCost,
+    recent_intervals: Vec<usize>,
+    recent_tooltip: String,
 }
 #[derive(Default)]
 struct TokenCache {
@@ -45,9 +48,11 @@ struct TokenCache {
 struct HistoryCache {
     sources_generation: Option<u64>,
     sources: Vec<(String, Option<String>, String)>,
+    has_legacy: bool,
     key: Option<(u64, u64, NaiveDate, String, bool)>,
     rows: Vec<(HistoryEvent, Option<f64>, bool)>,
     weighted: Option<f64>,
+    interval_indices: Vec<usize>,
 }
 struct WidgetApp {
     settings: Settings,
@@ -63,6 +68,8 @@ struct WidgetApp {
     history: Arc<Vec<HistoryEvent>>,
     intervals: Arc<Vec<CompletedInterval>>,
     interval_lookup: BTreeMap<String, usize>,
+    interval_presentations: Vec<IntervalPresentation>,
+    history_intervals: bool,
     selected_interval: Option<String>,
     token_generation: u64,
     history_generation: u64,
@@ -102,6 +109,21 @@ struct WidgetApp {
     dirty: bool,
     demo_start: i64,
 }
+fn interval_model_cost(model: &intervals::ModelIntervalUsage) -> String {
+    if model.events > 0 && model.unknown_cost_events == model.events {
+        "未知（價格未設定）".into()
+    } else {
+        format!(
+            "{}{}",
+            money(Some(model.known_usd)),
+            if model.unknown_cost_events > 0 {
+                " *"
+            } else {
+                ""
+            }
+        )
+    }
+}
 fn now() -> i64 {
     Utc::now().timestamp()
 }
@@ -131,6 +153,76 @@ fn money(v: Option<f64>) -> String {
         }
     })
     .unwrap_or_else(|| "$—".into())
+}
+const PARTIAL_INTERVAL_WARNING: &str =
+    "資料不完整；這是所示時段已記錄用量的小計，未能完整歸屬本次扣額，不能當作每%價格。";
+fn history_description(
+    event: &HistoryEvent,
+    cost: Option<f64>,
+    partial: bool,
+    interval: Option<&CompletedInterval>,
+) -> String {
+    if event.reconciliation.is_some() {
+        format!(
+            "{}% → {}% · 觀察有差異（不作扣額分界）",
+            event.before, event.after
+        )
+    } else if event.kind == quota_widget::model::HistoryKind::QuotaDecrease {
+        let cost_text = match interval {
+            Some(v) if !v.comparable => format!(
+                "時段已知小計 {} * · 不可按百分點比較",
+                money(Some(v.known_usd))
+            ),
+            Some(v) => format!(
+                "{} · {}/百分點",
+                money(Some(v.known_usd)),
+                money(v.cost_per_point)
+            ),
+            None if partial => format!("已知小計 {} * · 資料不完整", money(cost)),
+            None => money(cost),
+        };
+        format!(
+            "{}% → {}% · 扣除 {} 百分點 · {}",
+            event.before, event.after, event.delta, cost_text
+        )
+    } else if event.kind == quota_widget::model::HistoryKind::QuotaReset {
+        format!("{}% → {}% · 額度補回 / 新週期", event.before, event.after)
+    } else {
+        format!(
+            "{} → {} · {}",
+            event.before,
+            event.after,
+            event.kind.label()
+        )
+    }
+}
+fn history_tooltip(description: &str, interval: Option<&CompletedInterval>) -> String {
+    let Some(v) = interval else {
+        return description.to_owned();
+    };
+    let mut text = format!(
+        "{}\n時段：{} → {}",
+        description,
+        v.start
+            .and_then(display_time::datetime)
+            .unwrap_or_else(|| "開始時間未知".into()),
+        display_time::datetime(v.end).unwrap_or_else(|| "結束時間未知".into())
+    );
+    if !v.comparable {
+        text.push('\n');
+        text.push_str(PARTIAL_INTERVAL_WARNING);
+    }
+    if !v.reasons.is_empty() {
+        text.push('\n');
+        text.push_str(
+            &v.reasons
+                .iter()
+                .map(|r| r.label())
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
+    }
+    text
 }
 fn duration(s: i64) -> String {
     let s = s.max(0);
@@ -291,6 +383,8 @@ impl WidgetApp {
             history: Arc::new(Vec::new()),
             intervals: Arc::new(Vec::new()),
             interval_lookup: BTreeMap::new(),
+            interval_presentations: Vec::new(),
+            history_intervals: true,
             selected_interval: None,
             token_generation: 0,
             history_generation: 0,
@@ -499,13 +593,7 @@ impl WidgetApp {
                     }
                 }
                 WorkEvent::IntervalsUpdated { intervals } => {
-                    self.interval_lookup = intervals
-                        .iter()
-                        .enumerate()
-                        .map(|(i, row)| (row.history_event_key.clone(), i))
-                        .collect();
-                    self.intervals = intervals;
-                    self.history_cache.key = None;
+                    self.set_intervals(intervals);
                 }
                 WorkEvent::SaveFailed { path: _, error } => {
                     self.notice = format!("儲存失敗，畫面仍保留資料：{error}");
@@ -546,6 +634,18 @@ impl WidgetApp {
         }
         self.last_save = Instant::now();
     }
+    fn set_intervals(&mut self, intervals: Arc<Vec<CompletedInterval>>) {
+        self.interval_lookup = intervals
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.history_event_key.clone(), i))
+            .collect();
+        // Reformat only when canonical data changes, never on every repaint.
+        self.interval_presentations = intervals.iter().map(interval_views::present).collect();
+        self.intervals = intervals;
+        self.history_cache.key = None;
+        self.main_cache.key = None;
+    }
     fn selected(&self) -> Option<WindowView> {
         let views = self.quota.views(now());
         views
@@ -570,14 +670,16 @@ impl WidgetApp {
             .history
             .iter()
             .filter(|e| drop_event(e) || reset_event(e))
-            .find(|e| {
+            .filter(|e| {
                 e.source_key == self.settings.bucket
                     && (e.window_label.contains("週") || e.window_label.contains("week"))
             })
+            .max_by_key(|e| e.observed_at_unix)
             .or_else(|| {
                 self.history
                     .iter()
-                    .find(|e| drop_event(e) || reset_event(e))
+                    .filter(|e| drop_event(e) || reset_event(e))
+                    .max_by_key(|e| e.observed_at_unix)
             });
         let selection = view
             .as_ref()
@@ -648,14 +750,38 @@ impl WidgetApp {
             return;
         }
         let all = self.matching_history();
+        let recent_intervals: Vec<_> = all
+            .iter()
+            .rev()
+            .filter(|e| e.observed_at_unix <= t)
+            .filter_map(|e| {
+                self.interval_lookup
+                    .get(&intervals::history_event_key(e))
+                    .copied()
+            })
+            .take(5)
+            .collect();
+        let mut recent_tooltip = String::from("最近 5 個已記錄扣額區間 · 香港時間 +08:00\n");
+        if recent_intervals.is_empty() {
+            recent_tooltip.push_str("尚未有已完成扣額區間。\n");
+        }
+        for &index in &recent_intervals {
+            let row = &self.interval_presentations[index];
+            recent_tooltip.push_str(&format!(
+                "\n{} · {}\n總用度 {} · {}\n",
+                row.change, row.end, row.total, row.per_point
+            ));
+        }
+        recent_tooltip.push_str("\n只列真實扣額區間；重設不算消耗。多百分點顯示平均。* 為不完整已知小計，不作每%比較。API 模型等價估算，並非訂閱扣款。點擊可開啟完整表格。");
         let boundary = all
-            .into_iter()
+            .iter()
             .filter(|e| {
                 e.observed_at_unix <= t
                     && quota_widget::history::is_confirmed_quota_change(e)
                     && !unchanged(e)
             })
-            .max_by_key(|e| e.observed_at_unix);
+            .max_by_key(|e| e.observed_at_unix)
+            .cloned();
         let start = boundary.as_ref().map(|e| e.observed_at_unix);
         let tasks =
             self.tokens
@@ -674,6 +800,8 @@ impl WidgetApp {
             tasks,
             boundary,
             cost,
+            recent_intervals,
+            recent_tooltip,
         };
     }
     fn event_pricing_tooltip(&self, e: &TokenEvent) -> String {
@@ -1026,7 +1154,13 @@ impl WidgetApp {
                     format!("{} {} 分鐘／累計 {}{}",if reset_event(e){"距本次重設"}else{"距上次扣額"},(now()-e.observed_at_unix).max(0)/60,money(Some(self.main_cache.cost.known_usd)),if self.main_cache.cost.partial {" *"}else{""})
                 } else {format!("自啟動 {} 分鐘／累計 {} *",(now()-self.demo_start).max(0)/60,money(Some(self.main_cache.cost.known_usd)))};
                 txt(21.,table_bottom+10.,footer,11.,muted);
-                ui.interact(Rect::from_min_max(pt(21.,table_bottom+9.),pt(289.,table_bottom+29.)),ui.id().with("cost-coverage"),Sense::hover()).on_hover_text("累計為 API 模型等價的已知小計，並非訂閱扣款。* 表示邊界或部分歷史／價格／模型假設不完整；缺資料不會阻止已知用量繼續相加。無扣額歷史時，自本次啟動開始累計。價格及狀態見設定／Token 明細。");
+                let footer_response=ui.interact(Rect::from_min_max(pt(21.,table_bottom+9.),pt(289.,table_bottom+29.)),ui.id().with("cost-coverage"),Sense::click());
+                let open_intervals=footer_response.clicked();
+                footer_response.on_hover_ui(|ui|{ui.set_max_width((w-16.).clamp(260.,460.));ui.add(egui::Label::new(RichText::new(&self.main_cache.recent_tooltip).size(11.)).wrap());});
+                if open_intervals {
+                    self.history_open=true; self.history_intervals=true; self.history_selection=None;
+                    if let Some(i)=self.main_cache.recent_intervals.first() {if let Some(day)=local_day(self.intervals[*i].end) {self.date=day;}}
+                }
                 if ui
                     .put(
                         Rect::from_min_max(pt(272., 198.), pt(294., 220.)),
@@ -1119,7 +1253,7 @@ impl WidgetApp {
                 ViewportId::from_hash_of("quota-history"),
                 ViewportBuilder::default()
                     .with_title("Quota Widget · 扣額紀錄")
-                    .with_inner_size([780., 610.])
+                    .with_inner_size([1160., 650.])
                     .with_min_inner_size([560., 400.]),
                 |ctx, _| {
                     if ctx.input(|i| i.viewport().close_requested()) {
@@ -1193,6 +1327,13 @@ impl WidgetApp {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
+            self.history_cache.has_legacy = self.history.iter().any(|e| {
+                e.window_key.is_none()
+                    && e.evidence.is_none()
+                    && e.source_key
+                        .split_once(':')
+                        .is_some_and(|(prefix, _)| prefix.parse::<u64>().is_ok())
+            });
             self.history_cache.sources_generation = Some(self.history_generation);
         }
         egui::ComboBox::from_label("來源 / 額度視窗")
@@ -1212,6 +1353,13 @@ impl WidgetApp {
                     );
                 }
             });
+        if self.history_cache.has_legacy {
+            ui.small("舊版數字來源是當次程式的記錄編號，不能自動對應目前 Codex 帳戶；可從來源選單分開查看。每列保留原有記錄，滑鼠可看來源與工作階段。");
+        }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.history_intervals, true, "每%用度表");
+            ui.selectable_value(&mut self.history_intervals, false, "全部額度觀察");
+        });
         let dates = self.days();
         Self::date_controls(ui, &mut self.date, &dates, "quota-date");
         ui.horizontal(|ui| {
@@ -1272,15 +1420,18 @@ impl WidgetApp {
             self.history_cache.rows.reverse();
             let mut cost_total = 0.0;
             let mut points_total = 0.0;
+            self.history_cache.interval_indices.clear();
             for (event, _, _) in &self.history_cache.rows {
-                if let Some(interval) = self
+                if let Some(&index) = self
                     .interval_lookup
                     .get(&intervals::history_event_key(event))
-                    .and_then(|i| self.intervals.get(*i))
-                    .filter(|interval| interval.comparable)
                 {
-                    cost_total += interval.known_usd;
-                    points_total += interval.percentage_points;
+                    self.history_cache.interval_indices.push(index);
+                    let interval = &self.intervals[index];
+                    if interval.comparable && !interval.partial {
+                        cost_total += interval.known_usd;
+                        points_total += interval.percentage_points;
+                    }
                 }
             }
             self.history_cache.weighted = (points_total > 0.0).then_some(cost_total / points_total);
@@ -1298,7 +1449,9 @@ impl WidgetApp {
             "可完整歸屬區間的加權成本：{} / 百分點",
             money(self.history_cache.weighted)
         ));
-        if self.history_cache.rows.is_empty() {
+        if self.history_intervals {
+            self.completed_intervals_table(ui);
+        } else if self.history_cache.rows.is_empty() {
             ui.label("這一天沒有可用的額度變動觀察。Token 使用量不能反推訂閱額度。");
         } else {
             egui::ScrollArea::vertical()
@@ -1316,40 +1469,13 @@ impl WidgetApp {
                             .interval_lookup
                             .get(&intervals::history_event_key(event))
                             .and_then(|i| self.intervals.get(*i));
-                        let description = if event.reconciliation.is_some() {
-                            format!(
-                                "{}% → {}% · 額度觀察有差異，未確認回補",
-                                event.before, event.after
-                            )
-                        } else if event.kind == quota_widget::model::HistoryKind::QuotaDecrease {
-                            format!(
-                                "{}% → {}% · 扣除 {} 百分點 · {}{}",
-                                event.before,
-                                event.after,
-                                event.delta,
-                                interval
-                                    .map(|v| format!(
-                                        "{} · {}/百分點",
-                                        money(Some(v.known_usd)),
-                                        money(v.cost_per_point)
-                                    ))
-                                    .unwrap_or_else(|| money(*cost)),
-                                if interval.map(|v| v.partial).unwrap_or(*partial) {
-                                    " *"
-                                } else {
-                                    ""
-                                }
-                            )
-                        } else if event.kind == quota_widget::model::HistoryKind::QuotaReset {
-                            format!("{}% → {}% · 額度補回 / 新週期", event.before, event.after)
-                        } else {
-                            format!(
-                                "{} → {} · {}",
-                                event.before,
-                                event.after,
-                                event.kind.label()
-                            )
-                        };
+                        let description = history_description(event, *cost, *partial, interval);
+                        let tooltip = format!(
+                            "{}\n來源：{} · 觀察工作階段：{}",
+                            history_tooltip(&description, interval),
+                            event.source_key,
+                            event.session
+                        );
                         row.horizontal(|ui| {
                             ui.strong(local_time(event.observed_at_unix));
                             if let Some(interval) = interval {
@@ -1359,7 +1485,7 @@ impl WidgetApp {
                                 }
                             }
                             ui.add(egui::Label::new(&description).truncate())
-                                .on_hover_text(&description);
+                                .on_hover_text(&tooltip);
                         });
                         row.add(
                             egui::Label::new(
@@ -1392,6 +1518,7 @@ impl WidgetApp {
             egui::Window::new("扣額區間 · 模型分項").id(egui::Id::new("completed-interval-detail")).open(&mut open).default_width(710.).show(ui.ctx(), |ui| {
                 ui.label(format!("{} → {} · 實際下降 {} 百分點", interval.start.and_then(display_time::datetime).unwrap_or_else(||"開始時間未知".into()), display_time::datetime(interval.end).unwrap_or_else(||"未知".into()), interval.percentage_points));
                 ui.strong(format!("已知估算總和 {}{} · 每百分點 {}", money(Some(interval.known_usd)), if interval.partial {" *"}else{""}, money(interval.cost_per_point)));
+                if !interval.comparable { ui.colored_label(Color32::from_rgb(210,150,70), PARTIAL_INTERVAL_WARNING); }
                 ui.small("按每筆實際 model 計價。多百分點跳變只顯示平均，不拆成虛構 1% 區間；推理已含輸出。排除 codex-auto-review，不能據此判定官方訂閱計費。");
                 if !interval.reasons.is_empty() { ui.colored_label(Color32::from_rgb(210,150,70),format!("不可直接比較／資料限制：{}",interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join(" · "))); }
                 egui::ScrollArea::both().max_height(320.).show(ui, |ui| {
@@ -1399,7 +1526,7 @@ impl WidgetApp {
                         for label in ["模型","筆數","Input","Cached","Uncached","Output","Reasoning","估算 USD"] {ui.strong(label);} ui.end_row();
                         for model in &interval.models {
                             ui.label(format!("{}{}",model.model,if model.assumed_model_events>0 {"（含假設）"}else{""}));
-                            ui.label(model.events.to_string()); ui.label(model.input.to_string()); ui.label(model.cached.to_string()); ui.label(model.uncached.to_string()); ui.label(model.output.to_string()); ui.label(model.reasoning.to_string()); ui.label(format!("{}{}",money(Some(model.known_usd)),if model.unknown_cost_events>0 {" *"}else{""})); ui.end_row();
+                            ui.label(model.events.to_string()); ui.label(model.input.to_string()); ui.label(model.cached.to_string()); ui.label(model.uncached.to_string()); ui.label(model.output.to_string()); ui.label(model.reasoning.to_string()); ui.label(interval_model_cost(model)); ui.end_row();
                         }
                     });
                 });
@@ -1412,6 +1539,107 @@ impl WidgetApp {
         if !self.notice.is_empty() {
             ui.label(&self.notice);
         }
+    }
+
+    fn completed_intervals_table(&mut self, ui: &mut egui::Ui) {
+        ui.small("每行是一個實際觀察到的扣額區間；重設不列作消耗。跨多百分點只顯示平均。* 保留不完整區間的已知小計，不能當作每%價格。滑鼠移到列可看限制。");
+        if self.history_cache.interval_indices.is_empty() {
+            ui.label("這一天尚未有已完成扣額區間；可切換「全部額度觀察」查看回補或有差異的記錄。");
+            return;
+        }
+        const X: [f32; 8] = [0., 90., 260., 430., 525., 675., 840., 1080.];
+        const WIDTH: [f32; 8] = [80., 160., 160., 85., 140., 155., 230., 80.];
+        egui::ScrollArea::horizontal()
+            .id_salt("interval-table-horizontal")
+            .show(ui, |ui| {
+                ui.set_min_width(1160.);
+                let (header, _) = ui.allocate_exact_size(Vec2::new(1160., 26.), Sense::hover());
+                for (i, title) in [
+                    "額度變化",
+                    "開始（香港）",
+                    "結束（香港）",
+                    "歷時",
+                    "估算 USD 總用度",
+                    "USD / 百分點",
+                    "資料狀態",
+                    "模型",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    ui.put(
+                        Rect::from_min_size(
+                            header.min + Vec2::new(X[i], 0.),
+                            Vec2::new(WIDTH[i], 26.),
+                        ),
+                        egui::Label::new(RichText::new(*title).strong()).truncate(),
+                    );
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("interval-table-rows")
+                    .show_rows(
+                        ui,
+                        42.,
+                        self.history_cache.interval_indices.len(),
+                        |ui, range| {
+                            for row_index in range {
+                                let index = self.history_cache.interval_indices[row_index];
+                                let interval = &self.intervals[index];
+                                let view = &self.interval_presentations[index];
+                                let (rect, response) =
+                                    ui.allocate_exact_size(Vec2::new(1160., 42.), Sense::hover());
+                                response.on_hover_text(&view.tooltip);
+                                let cells = [
+                                    &view.change,
+                                    &view.start,
+                                    &view.end,
+                                    &view.duration,
+                                    &view.total,
+                                    &view.per_point,
+                                    &view.status,
+                                ];
+                                for (i, text) in cells.iter().enumerate() {
+                                    ui.put(
+                                        Rect::from_min_size(
+                                            rect.min + Vec2::new(X[i], 0.),
+                                            Vec2::new(WIDTH[i], 34.),
+                                        ),
+                                        egui::Label::new(
+                                            RichText::new(
+                                                text.strip_suffix(" +08:00").unwrap_or(text),
+                                            )
+                                            .size(12.),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&view.tooltip);
+                                }
+                                if ui
+                                    .put(
+                                        Rect::from_min_size(
+                                            rect.min + Vec2::new(X[7], 2.),
+                                            Vec2::new(76., 26.),
+                                        ),
+                                        egui::Button::new("模型分項"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_interval =
+                                        Some(interval.history_event_key.clone());
+                                }
+                                ui.painter().hline(
+                                    rect.x_range(),
+                                    rect.bottom() - 1.,
+                                    Stroke::new(
+                                        1_f32,
+                                        ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                    ),
+                                );
+                            }
+                        },
+                    );
+            });
     }
 
     fn token_ui(&mut self, ui: &mut egui::Ui) {
@@ -2184,6 +2412,10 @@ impl WidgetApp {
         self.history = Arc::new(quota_widget::history::normalized(&self.quota.history));
         self.quota.history.clear();
         self.history_generation += 1;
+        self.set_intervals(Arc::new(intervals::completed_intervals(
+            self.tokens.events(),
+            &self.history,
+        )));
     }
 }
 impl eframe::App for WidgetApp {
@@ -2371,6 +2603,177 @@ mod async_export_tests {
 #[cfg(test)]
 mod widget_revision_tests {
     use super::*;
+    fn history_fixture() -> HistoryEvent {
+        serde_json::from_value(serde_json::json!({"session":"synthetic","observed_at_unix":1792252800,"before_observed_at_unix":1792249200,"source_key":"codex","window_label":"week","window_key":"primary","epoch":0,"kind":"QuotaDecrease","before":"2","after":"1","delta":"1"})).unwrap()
+    }
+    #[test]
+    fn uncertain_history_label_retains_observed_drop_without_claiming_refill() {
+        let mut e = history_fixture();
+        e.before = "100".into();
+        e.after = "99".into();
+        e.reconciliation = Some(quota_widget::model::HistoryReconciliation::UncertainRecovery);
+        let text = history_description(&e, None, true, None);
+        assert!(text.starts_with("100% → 99%"));
+        assert!(text.contains("不作扣額分界"));
+        assert!(!text.contains("回補"));
+        assert!(!text.contains('$'));
+    }
+    #[test]
+    fn model_breakdown_unknown_price_is_distinct_from_known_zero_and_partial_zero() {
+        let mut model = intervals::ModelIntervalUsage {
+            model: "synthetic-model".into(),
+            input: 0,
+            cached: 0,
+            uncached: 0,
+            output: 0,
+            reasoning: 0,
+            known_usd: 0.,
+            unknown_cost_events: 0,
+            events: 1,
+            assumed_model_events: 0,
+            model_assumed: false,
+            partial_events: 0,
+            coverage_gap_events: 0,
+        };
+        assert_eq!(interval_model_cost(&model), "$0.0000");
+        model.unknown_cost_events = 1;
+        assert_eq!(interval_model_cost(&model), "未知（價格未設定）");
+        model.events = 2;
+        assert_eq!(interval_model_cost(&model), "$0.0000 *");
+        model.known_usd = 0.0024;
+        assert_eq!(interval_model_cost(&model), "$0.0024 *");
+    }
+
+    #[test]
+    fn partial_interval_label_keeps_known_subtotal_and_explains_full_time_span() {
+        let e = history_fixture();
+        let mut v = intervals::completed_intervals(&[], std::slice::from_ref(&e)).remove(0);
+        v.known_usd = 1937.2468;
+        assert!(v.partial && !v.comparable);
+        let text = history_description(&e, None, true, Some(&v));
+        assert!(text.contains("時段已知小計 $1937.2468 *"));
+        assert!(text.contains("不可按百分點比較"));
+        assert!(!text.contains("$—/百分點"));
+        let tip = history_tooltip(&text, Some(&v));
+        for time in [v.start.unwrap(), v.end] {
+            assert!(tip.contains(&display_time::datetime(time).unwrap()));
+        }
+        assert!(tip.contains("不能當作每%價格"));
+    }
+    #[test]
+    fn comparable_interval_keeps_its_cost_per_point_and_known_zero_stays_numeric() {
+        let e = history_fixture();
+        let mut v = intervals::completed_intervals(&[], std::slice::from_ref(&e)).remove(0);
+        v.known_usd = 2.;
+        v.partial = false;
+        v.comparable = true;
+        v.cost_per_point = Some(2.);
+        v.reasons.clear();
+        let text = history_description(&e, None, false, Some(&v));
+        assert!(text.contains("$2.0000 · $2.0000/百分點"));
+        assert!(!history_tooltip(&text, Some(&v)).contains("不能當作每%價格"));
+        assert!(history_description(&e, Some(0.), true, None).contains("$0.0000 *"));
+        assert!(history_description(&e, None, true, None).contains("$— *"));
+    }
+    #[test]
+    fn recent_interval_tooltip_and_table_share_canonical_cached_rows() {
+        let mut app = demo_app();
+        let time = now() - 600;
+        let events: Vec<_> = (0..8)
+            .map(|i| {
+                let mut e = history_fixture();
+                e.observed_at_unix = time + i * 30;
+                e.before_observed_at_unix = Some(e.observed_at_unix - 30);
+                e.before = (90 - i).to_string();
+                e.after = (89 - i).to_string();
+                e
+            })
+            .collect();
+        app.history = Arc::new(events);
+        app.history_generation += 1;
+        app.set_intervals(Arc::new(intervals::completed_intervals(&[], &app.history)));
+        app.refresh_main_cache();
+        assert_eq!(app.main_cache.recent_intervals.len(), 5);
+        let recent: Vec<_> = app
+            .main_cache
+            .recent_intervals
+            .iter()
+            .map(|&i| app.intervals[i].end)
+            .collect();
+        assert_eq!(
+            recent,
+            vec![time + 210, time + 180, time + 150, time + 120, time + 90]
+        );
+        for &i in &app.main_cache.recent_intervals {
+            assert!(app
+                .main_cache
+                .recent_tooltip
+                .contains(&app.interval_presentations[i].change));
+            assert!(app
+                .main_cache
+                .recent_tooltip
+                .contains(&app.interval_presentations[i].total));
+            assert!(app
+                .main_cache
+                .recent_tooltip
+                .contains(&app.interval_presentations[i].per_point));
+        }
+        let text_ptr = app.main_cache.recent_tooltip.as_ptr();
+        let views_ptr = app.interval_presentations.as_ptr();
+        for _ in 0..20 {
+            app.refresh_main_cache();
+        }
+        assert_eq!(text_ptr, app.main_cache.recent_tooltip.as_ptr());
+        assert_eq!(views_ptr, app.interval_presentations.as_ptr());
+        app.date = local_day(time + 210).unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
+        });
+        let ids = app.history_cache.interval_indices.clone();
+        assert!(!ids.is_empty());
+        assert!(ids
+            .iter()
+            .all(|&i| local_day(app.intervals[i].end) == Some(app.date)));
+        let ids_ptr = app.history_cache.interval_indices.as_ptr();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
+        });
+        assert_eq!(ids_ptr, app.history_cache.interval_indices.as_ptr());
+        let mut repriced = app.intervals.as_ref().clone();
+        repriced.last_mut().unwrap().known_usd = 12.3456;
+        app.set_intervals(Arc::new(repriced));
+        app.refresh_main_cache();
+        assert!(app.main_cache.recent_tooltip.contains("$12.3456"));
+        assert!(app.history_cache.key.is_none());
+    }
+    #[test]
+    fn empty_recent_interval_hover_has_no_fabricated_price() {
+        let mut app = demo_app();
+        app.set_intervals(Arc::new(Vec::new()));
+        app.refresh_main_cache();
+        assert!(app.main_cache.recent_intervals.is_empty());
+        assert!(app
+            .main_cache
+            .recent_tooltip
+            .contains("尚未有已完成扣額區間"));
+        assert!(!app.main_cache.recent_tooltip.contains("$0"));
+    }
+    #[test]
+    fn demo_completed_intervals_populate_the_canonical_presentation_cache() {
+        let app = demo_app();
+        assert!(!app.intervals.is_empty());
+        assert_eq!(
+            app.intervals.as_slice(),
+            intervals::completed_intervals(app.tokens.events(), &app.history)
+        );
+        assert_eq!(app.interval_presentations.len(), app.intervals.len());
+        assert!(!app.main_cache.recent_intervals.is_empty());
+        assert!(!app
+            .main_cache
+            .recent_tooltip
+            .contains("尚未有已完成扣額區間"));
+    }
     fn demo_app() -> WidgetApp {
         let mut app = WidgetApp::new(
             Settings::default(),

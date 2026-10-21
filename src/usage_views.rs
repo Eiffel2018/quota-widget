@@ -85,7 +85,7 @@ pub fn task_rows(events: &[TokenEvent], boundary: Option<i64>, end: i64) -> Vec<
         .filter_map(|(task, mut events)| {
             events.sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
             let latest = *events.last()?;
-            if latest.timestamp < end.saturating_sub(86400)
+            if latest.timestamp < end.saturating_sub(2 * 60 * 60)
                 && boundary.is_none_or(|b| latest.timestamp <= b)
             {
                 return None;
@@ -187,7 +187,7 @@ impl UsageIndex {
                 }
                 let latest_index = s.indices[hi - 1];
                 let latest = &events[latest_index];
-                if latest.timestamp < end.saturating_sub(86400) && latest.timestamp <= start {
+                if latest.timestamp < end.saturating_sub(2 * 60 * 60) && latest.timestamp <= start {
                     return None;
                 }
                 let lo = s.times.partition_point(|t| *t <= start).min(hi);

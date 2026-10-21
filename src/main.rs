@@ -34,11 +34,11 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|s| s == "--help" || s == "-h") {
-        println!("Quota Widget 0.3.3\nNative read-only Codex quota + local token history.\n\nGUI:\n  quota-widget [--demo|--offline] [--no-settings] [--data-dir PATH]\n  --demo         Synthetic data only; never starts CLI or scans real sessions\n  --offline      Never starts CLI; local import remains user-configurable\n  --no-settings  Ephemeral state; no preference/history loading or saving\n  --show-tokens  Open daily token details\n  --show-history Open daily quota history\n\nMachine interface:\n  quota-widget inspect --sessions PATH [--state PATH] [--pricing PATH]\n    Read-only import. JSON schema version 1 on stdout. Does not modify inputs.\n  quota-widget import --sessions PATH --state PATH [--pricing PATH]\n    Incrementally import into specified state, guarded by writer lock.\n  quota-widget --version\n\nExit codes: 0 success, 1 invalid arguments or operation failed.\nNo login, inference, purchases, or credential handling.");
+        println!("Quota Widget 0.3.4\nNative read-only Codex quota + local token history.\n\nGUI:\n  quota-widget [--demo|--offline] [--no-settings] [--data-dir PATH]\n  --demo         Synthetic data only; never starts CLI or scans real sessions\n  --offline      Never starts CLI; local import remains user-configurable\n  --no-settings  Ephemeral state; no preference/history loading or saving\n  --show-tokens  Open daily token details\n  --show-history Open daily quota history\n\nMachine interface:\n  quota-widget inspect --sessions PATH [--state PATH] [--pricing PATH]\n    Read-only import. JSON schema version 1 on stdout. Does not modify inputs.\n  quota-widget import --sessions PATH --state PATH [--pricing PATH]\n    Incrementally import into specified state, guarded by writer lock.\n  quota-widget --version\n\nExit codes: 0 success, 1 invalid arguments or operation failed.\nNo login, inference, purchases, or credential handling.");
         return Ok(());
     }
     if args.iter().any(|s| s == "--version") {
-        println!("quota-widget 0.3.3");
+        println!("quota-widget 0.3.4");
         return Ok(());
     }
     if matches!(args.first().map(String::as_str), Some("inspect" | "import")) {

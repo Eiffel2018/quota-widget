@@ -1,7 +1,7 @@
 //! One process owns writes. Atomic replacements never overwrite a newer instance.
 use crate::tokens::Pricing;
 use fs2::FileExt;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -16,6 +16,7 @@ pub struct Settings {
     pub codex_path: String,
     pub position: Option<[f32; 2]>,
     pub size: [f32; 2],
+    #[serde(deserialize_with = "deserialize_bucket")]
     pub bucket: String,
     pub window: String,
     pub history_days: u32,
@@ -33,7 +34,7 @@ impl Default for Settings {
             codex_path: String::new(),
             position: None,
             size: [310., 360.],
-            bucket: "codex".into(),
+            bucket: default_bucket(),
             window: "weekly".into(),
             history_days: 30,
             hide_unchanged: true,
@@ -44,6 +45,16 @@ impl Default for Settings {
         }
     }
 }
+fn default_bucket() -> String {
+    "codex".into()
+}
+
+/// Older settings stored the automatic selection as `Option<String>::None`.
+/// Accept only that null or a string; all other fields keep their strict types.
+fn deserialize_bucket<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|bucket| bucket.unwrap_or_else(default_bucket))
+}
+
 pub fn home() -> PathBuf {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
@@ -92,12 +103,87 @@ impl DataLock {
     }
 }
 pub fn load_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
+    serde_json::from_slice(&read_json_bytes(path)?).map_err(io::Error::other)
+}
+
+fn read_json_bytes(path: &Path) -> io::Result<Vec<u8>> {
     let metadata = fs::metadata(path)?;
     if metadata.len() > 256 * 1024 * 1024 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
     }
-    serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
+    fs::read(path)
 }
+
+/// Preserve the exact old history bytes before the first authorized migration
+/// write. A unique create-new backup never replaces any existing backup. A copy
+/// error aborts the caller's replacement, leaving the original untouched.
+pub fn backup_legacy_history(path: &Path) -> io::Result<PathBuf> {
+    backup_legacy_file(path)
+}
+
+fn backup_legacy_file(path: &Path) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("Missing legacy filename"))?
+        .to_string_lossy();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let backup = path.with_file_name(format!("{name}.pre-0.3.4-{stamp}.bak"));
+    let mut input = File::open(path)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)?;
+    let result = io::copy(&mut input, &mut output).and_then(|_| output.sync_all());
+    drop(output);
+    if let Err(error) = result {
+        // This exact file was just created by us; never leave an incomplete
+        // copy labeled as a usable backup. The source has not been touched.
+        let _ = fs::remove_file(&backup);
+        return Err(error);
+    }
+    Ok(backup)
+}
+
+/// Called only for an authorized save while the caller holds the data lock.
+/// Revalidate the existing file on every replacement: even a caller holding
+/// defaults after a failed load must not overwrite corrupt settings. Loading
+/// settings itself never writes or creates a backup.
+pub fn save_settings(path: &Path, settings: &Settings) -> io::Result<()> {
+    match read_json_bytes(path) {
+        Ok(bytes) => {
+            serde_json::from_slice::<Settings>(&bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid existing settings; original preserved: {error}"),
+                )
+            })?;
+            // Inspect the same validated bytes so a missing bucket (already
+            // supported by defaults) does not trigger a legacy-null backup.
+            let raw: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            if !raw.is_object() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid existing settings; original preserved: expected a JSON object",
+                ));
+            }
+            if raw.get("bucket").is_some_and(serde_json::Value::is_null) {
+                backup_legacy_file(path).map_err(|error| {
+                    io::Error::other(format!(
+                        "Legacy settings backup failed; original preserved: {error}"
+                    ))
+                })?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    save_json(path, settings)
+}
+
 pub fn save_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let parent = path
         .parent()
