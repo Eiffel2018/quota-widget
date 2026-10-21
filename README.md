@@ -3,7 +3,7 @@
 同一連續額度區間共用一致的每百分點估值，原始 Token 小計另列保留。
 資料覆蓋不完整時標示下限；支援 Windows ImDisk RAM Drive。
 
-[0.3.9 計法與更新說明](docs/RELEASE-0.3.9.md) · [已恢復的版本歷史](docs/SOURCE-HISTORY.md)
+[0.3.9 計法與更新說明](docs/RELEASE-0.3.9.md) · [Windows 驗證](VALIDATION-0.3.9.md) · [已恢復的版本歷史](docs/SOURCE-HISTORY.md)
 
 建置及測試：`cargo test --locked`、`cargo build --release --locked`。
 編譯輸出及測試暫存可透過 `CARGO_TARGET_DIR`、`TEMP`、`TMP` 放到 RAM Drive；
