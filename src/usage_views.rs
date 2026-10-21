@@ -252,8 +252,9 @@ pub enum TaskTreeRow {
     ChildrenSummary {
         parent_id: String,
         depth: usize,
-        /// All known descendants, including those with metadata but no recent usage.
-        /// A grandchild is counted once, regardless of the expansion state.
+        /// Relevant descendants only: eligible tasks and the ancestors needed to
+        /// connect them. A grandchild is counted once, regardless of expansion.
+        /// This is a display count, never a claim about running agent slots.
         descendant_count: usize,
         direct_child_count: usize,
         /// The known current-interval subtotal, excluding the parent's own usage.
@@ -305,10 +306,11 @@ impl TaskTreeNode {
 /// Build the visible task tree using only recorded child-thread -> parent-thread
 /// relationships. An empty `expanded` set collapses every subagent group.
 ///
-/// The scope starts at the supplied recent/current-interval task rows, includes
-/// their metadata ancestors, and includes all recorded descendants of those
-/// roots. Unrelated historical metadata components are not shown. A referenced parent without a row is preserved as a metadata-only
-/// task, with no invented response time or cost. Empty parent identities remain
+/// The scope starts at the supplied recent/current-interval task rows and adds
+/// only the metadata ancestors needed to connect them. Historical descendants
+/// and sibling branches are not resurrected merely because their parent is shown.
+/// A referenced parent without a row is preserved as a metadata-only task, with
+/// no invented response time or cost. Empty parent identities remain
 /// separate orphans. Missing relationships remain unlinked; names, paths and
 /// similar timestamps are never evidence of parentage.
 ///
@@ -347,15 +349,9 @@ pub fn task_tree_rows(
         .map(|(index, node)| (node.id.clone(), index))
         .collect();
 
-    // Reverse edges let a relevant root retain all known subagents, including
-    // inactive descendants with metadata but no recent own usage. Unrelated
-    // historical components are never visited.
-    let mut recorded_children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (child, parent) in parents {
-        if !parent.trim().is_empty() {
-            recorded_children.entry(parent).or_default().push(child);
-        }
-    }
+    // Walk upward only. The caller already selected recent/current-interval
+    // usage. Reverse traversal would undo that selection by resurrecting every
+    // historical child of each relevant root (and falsely inflate its count).
     // Visit each relevant identity once; the index map bounds even cyclic walks.
     let mut index = 0;
     while index < nodes.len() {
@@ -375,15 +371,6 @@ pub fn task_tree_rows(
                 nodes[index].relationship = TaskRelationship::Child {
                     parent_id: parent_id.clone(),
                 };
-            }
-        }
-        if let Some(children) = recorded_children.get(nodes[index].id.as_str()) {
-            for &child in children {
-                if !node_indices.contains_key(child) {
-                    let child_index = nodes.len();
-                    nodes.push(TaskTreeNode::new(child.to_owned(), None, tasks));
-                    node_indices.insert(child.to_owned(), child_index);
-                }
             }
         }
         index += 1;

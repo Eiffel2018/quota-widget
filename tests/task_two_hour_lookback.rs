@@ -1,5 +1,5 @@
 //! Synthetic regression for the user's requested 24h -> 2h live-list change.
-//! Accounting and metadata-descendant semantics remain unchanged.
+//! Accounting is retained; stale metadata does not undo the live-list cutoff.
 use quota_widget::{
     tokens::TokenEvent,
     usage_views::{self, TaskTreeRow, UsageIndex},
@@ -87,12 +87,13 @@ fn missing_boundary_uses_same_two_hour_grace_without_importing_lifetime_totals()
     assert_eq!(usage_views::task_rows(&events, None, end).len(), 1);
 }
 #[test]
-fn recorded_descendant_behavior_is_not_changed_by_the_lookback_request() {
+fn stale_recorded_descendants_do_not_bypass_the_live_list_cutoff() {
     let events = vec![event("parent", 100_000, Some(1.))];
     let tasks = UsageIndex::new(&events).task_rows(&events, Some(99_999), 99_999, 100_000);
     let parents = BTreeMap::from([("old-child".into(), "parent".into())]);
     let rows = usage_views::task_tree_rows(&tasks, &parents, &BTreeSet::from(["parent".into()]));
-    assert!(rows.iter().any(
-        |r| matches!(r,TaskTreeRow::SelfTask{task_id,task_index:None,..} if task_id=="old-child")
-    ));
+    assert!(!rows
+        .iter()
+        .any(|r| matches!(r,TaskTreeRow::SelfTask{task_id,..} if task_id=="old-child")));
+    assert_eq!(parents.len(), 1, "historical relationship is retained");
 }

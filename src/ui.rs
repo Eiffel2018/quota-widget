@@ -1907,7 +1907,7 @@ impl WidgetApp {
                                 usage_views::TaskTreeRow::ChildrenSummary {parent_id,depth,descendant_count,direct_child_count,known_cost_usd,partial,expanded}=>{
                                     let indent=(*depth as f32*8.).min(32.);
                                     let label=format!("[{}] 子代理 {}",if *expanded {"−"}else{"+"},descendant_count);
-                                    let help=format!("子代理：{descendant_count}\n直接子代理：{direct_child_count}\n本%累計：{}{}",money(Some(*known_cost_usd)),if *partial {" *"} else {""});
+                                    let help=format!("顯示子代理：{descendant_count}\n直接分支：{direct_child_count}\n範圍：近2h／本%\n本%累計：{}{}",money(Some(*known_cost_usd)),if *partial {" *"} else {""});
                                     response.on_hover_text(&help);
                                     let button_rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((200.-indent)*sx,22.*sy));
                                     ui.painter().text(button_rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,label,FontId::proportional(font_size),accent);

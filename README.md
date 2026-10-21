@@ -1,3 +1,7 @@
+# Quota Widget 0.3.8
+
+Hide inactive historical subagent branches from the live Task tree. Keep recent/current-interval contributors and their required ancestors. Historical accounting is preserved. See [release notes](docs/RELEASE-0.3.8.md) and [validation](VALIDATION-0.3.8.md).
+
 # Quota Widget 0.3.7
 
 Readable, high-contrast text and compact label/value UI. See [release notes](docs/RELEASE-0.3.7.md) and [validation](VALIDATION-0.3.7.md). Windows x64 is cross-built and unsigned; native Windows runtime remains unverified. Accounting and data storage are unchanged.
@@ -37,7 +41,7 @@ Windows 請先關閉舊版再開新 EXE；不需要刪除設定或歷史。這�
 - 額度 metadata／重設時間漂移不製造 0→0 重設事件。實際回補建立新的週期。
 - 近期下降的加權速率與具理由／信心範圍的估計；過期的估計保留過期狀態，不假裝一定準時扣額。
 - 每日扣額紀錄、每日 Token 明細、日期選單、前後一天、CSV／JSON 匯出。
-- 主視窗按實際 parent_thread_id 關係列樹狀 Task；主代理自身費用獨立一行，其下 [+] 子代理列合計全部已知後代，每個只計一次。預設收起，展開可看子代理名稱、最新時間、單筆費用和本%累計，支援多層；無關係不猜測、循環獨立顯示。預設最多 10 個可見行，超過才捲動，可在設定修改。滑鼠移到 Task 可看名稱、完整 ID、最新 Response 的 Input／Cached／Uncached／Output／Reasoning 及匹配 Turn 累計 Input／Output。
+- 主視窗按實際 parent_thread_id 關係列樹狀 Task；主代理自身費用獨立一行，其下 [+] 子代理列合計近期／本%範圍的後代及必要連接節點，每個只計一次。預設收起，展開可看子代理名稱、最新時間、單筆費用和本%累計，支援多層；無關係不猜測、循環獨立顯示。預設最多 10 個可見行，超過才捲動，可在設定修改。滑鼠移到 Task 可看名稱、完整 ID、最新 Response 的 Input／Cached／Uncached／Output／Reasoning 及匹配 Turn 累計 Input／Output。
 - 本%累計及底行使用最後已確認扣額／重設作分界，啟動會重算該分界後的已記錄用量。沒有可用分界時自本次啟動以 $0.0000 開始累加並標示 *；已知部分持續相加，未知事件不假裝免費。
 - 多個 session 內快取額度快照的衝突保留為不確定觀察，不再當成重設；原始觀察保留，畫面只整理可確認的變動。
 - 匯入／存檔／匯出在背景執行，無變更檔案不重讀，不變的價格不重算；主視窗與每日明細使用索引、快取和可視行繪製。

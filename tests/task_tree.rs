@@ -142,7 +142,7 @@ fn nested_descendants_count_once_and_keep_self_costs_separate() {
 }
 
 #[test]
-fn metadata_only_parent_keeps_active_child_and_all_known_inactive_descendants() {
+fn metadata_only_parent_keeps_active_child_without_resurrecting_stale_branches() {
     let tasks = vec![task("active-child", 20, Some(2.))];
     let map = parents(&[
         ("active-child", "parent"),
@@ -159,18 +159,10 @@ fn metadata_only_parent_keeps_active_child_and_all_known_inactive_descendants() 
             ..
         }
     ));
-    assert_eq!(summary(&collapsed, "parent"), (3, 2, 2., true, false));
+    assert_eq!(summary(&collapsed, "parent"), (1, 1, 2., false, false));
     let open = task_tree_rows(&tasks, &map, &expanded(&["parent", "inactive-child"]));
-    assert_eq!(
-        self_ids(&open),
-        [
-            ("parent", 0),
-            ("active-child", 1),
-            ("inactive-child", 1),
-            ("inactive-grandchild", 2)
-        ]
-    );
-    assert_eq!(summary(&open, "inactive-child"), (1, 1, 0., true, true));
+    assert_eq!(self_ids(&open), [("parent", 0), ("active-child", 1)]);
+    assert_eq!(summary(&open, "parent"), (1, 1, 2., false, true));
     assert!(!self_ids(&open)
         .iter()
         .any(|(id, _)| id.starts_with("irrelevant")));
