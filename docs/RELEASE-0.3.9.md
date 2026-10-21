@@ -40,6 +40,11 @@ and existing symlink exclusions. Missing or inaccessible paths still fail. No
 RAM-drive remount, filesystem change or application-data migration is needed.
 [Microsoft documents the Mount Manager limitation and NT path option](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew).
 
+The Windows build script remaps local home/workspace paths in compiler metadata
+before creating distributable binaries. Existing compiler flags are retained,
+paths with spaces are supported, and its environment change is scoped to the
+script. Runtime data and credentials are still excluded independently.
+
 Close the old application before starting the new executable. Existing settings,
 history and SQLite state are retained. Keep useful source/releases in durable,
 named folders; disposable build and test files can live on a RAM drive.
