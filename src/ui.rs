@@ -200,6 +200,7 @@ struct HistoryCache {
     weighted_points: f64,
     weighted_samples: usize,
     has_lower_bound: bool,
+    calculation_error: Option<String>,
 }
 type HistoryCacheKey = (u64, u64, NaiveDate, String, bool, bool);
 #[derive(Clone)]
@@ -516,7 +517,7 @@ fn active_segment_presentation(
     cost: accounting::ObservedCost,
 ) -> IntervalPresentation {
     let amount = if cost.events == 0 {
-        "未知".into()
+        "$0.0000".into()
     } else {
         format!(
             "{}{}",
@@ -530,8 +531,8 @@ fn active_segment_presentation(
         end: "未知".into(),
         duration: "進行中".into(),
         total: amount.clone(),
-        observed_total: if cost.events == 0 { "無 Token 記錄".into() } else { amount },
-        per_point: (cost.events > 0).then(|| money(Some(cost.known_usd))).unwrap_or_else(|| "未知".into()),
+        observed_total: if cost.events == 0 { "0 筆 Token 記錄".into() } else { amount },
+        per_point: money(Some(cost.known_usd)),
         status: "尚未觀察到下一次下降".into(),
         tooltip: "今日目前仍在此額度；以午夜或上一個首次下降時間作為起點，統計至現在。下一個百分比變化尚未發生，因此時間未知。".into(),
     }
@@ -2520,7 +2521,7 @@ impl WidgetApp {
                 ViewportId::from_hash_of("quota-history"),
                 ViewportBuilder::default()
                     .with_title("Quota Widget · 扣額紀錄")
-                    .with_inner_size([900., 650.])
+                    .with_inner_size([1120., 760.])
                     .with_min_inner_size([560., 400.]),
                 |ctx, _| {
                     if ctx.input(|i| i.viewport().close_requested()) {
@@ -2729,13 +2730,15 @@ impl WidgetApp {
                         .flatten();
                     self.history_cache.pending_segments =
                         daily_quota_segments(&all, day_start, day_end, future_remaining, now());
-                    let tokens = self.tokens.events();
-                    // TokenStore normalizes events by (timestamp, id); binary
-                    // bounds avoid scanning years of token rows before showing
-                    // the first segment for the selected day.
-                    let lo = tokens.partition_point(|event| event.timestamp < day_start);
-                    let hi = tokens.partition_point(|event| event.timestamp < day_end);
-                    self.history_cache.day_token_indices = (lo..hi).collect();
+                    if self.tokens.database.is_none() {
+                        let tokens = self.tokens.events();
+                        // TokenStore normalizes events by (timestamp, id); binary
+                        // bounds avoid scanning years of token rows before showing
+                        // the first segment for the selected day.
+                        let lo = tokens.partition_point(|event| event.timestamp < day_start);
+                        let hi = tokens.partition_point(|event| event.timestamp < day_end);
+                        self.history_cache.day_token_indices = (lo..hi).collect();
+                    }
                 }
             }
             self.history_cache.work_key = Some(key.clone());
@@ -2745,22 +2748,53 @@ impl WidgetApp {
         {
             let segment =
                 self.history_cache.pending_segments[self.history_cache.next_segment].clone();
+            let loaded_segment = if let Some(view) = &self.tokens.database {
+                quota_widget::token_db::TokenDb::open_readonly(&view.database_path).and_then(|db| {
+                    db.query_events(
+                        Some(segment.start.saturating_add(1)),
+                        Some(segment.end.saturating_add(1)),
+                        false,
+                    )
+                })
+            } else {
+                Ok(Vec::new())
+            };
+            let Ok(loaded_segment) = loaded_segment else {
+                self.history_cache.calculation_error =
+                    Some("無法讀取此區間的 Token 資料；請重新開啟扣額記錄重試。".into());
+                self.history_cache.key = Some(key.clone());
+                self.history_cache.work_key = None;
+                self.completed_intervals_table(ui);
+                return;
+            };
             let tokens = self.tokens.events();
-            let lo = self
-                .history_cache
-                .day_token_indices
-                .partition_point(|&index| tokens[index].timestamp <= segment.start);
-            let hi = self
-                .history_cache
-                .day_token_indices
-                .partition_point(|&index| tokens[index].timestamp <= segment.end);
-            let segment_events: Vec<_> = self.history_cache.day_token_indices[lo..hi]
-                .iter()
-                .map(|&index| &tokens[index])
-                .collect();
+            let segment_owned: Vec<TokenEvent>;
+            let segment_events: Vec<&TokenEvent>;
+            if self.tokens.database.is_some() {
+                segment_owned = loaded_segment;
+                segment_events = segment_owned.iter().collect();
+            } else {
+                let lo = self
+                    .history_cache
+                    .day_token_indices
+                    .partition_point(|&index| tokens[index].timestamp <= segment.start);
+                let hi = self
+                    .history_cache
+                    .day_token_indices
+                    .partition_point(|&index| tokens[index].timestamp <= segment.end);
+                segment_events = self.history_cache.day_token_indices[lo..hi]
+                    .iter()
+                    .map(|&index| &tokens[index])
+                    .collect();
+                segment_owned = Vec::new();
+            }
             let models = intervals::model_usage(segment_events.iter().copied());
             let task_counts = interval_task_counts(&segment_events);
-            let cost = self.tokens.cost_index.observed(segment.start, segment.end);
+            let cost = if self.tokens.database.is_some() {
+                accounting::CostIndex::new(&segment_owned).observed(segment.start, segment.end)
+            } else {
+                self.tokens.cost_index.observed(segment.start, segment.end)
+            };
             let presentation = segment.event.as_ref().map_or_else(
                 || active_segment_presentation(segment.change.clone(), segment.start, cost),
                 |event| interval_views::recovered_observation(event, segment.start, cost),
@@ -3013,17 +3047,22 @@ impl WidgetApp {
     }
     fn completed_intervals_table(&mut self, ui: &mut egui::Ui) {
         if self.history_cache.table_rows.is_empty() {
-            if self.history_cache.work_key.is_some() {
+            if let Some(error) = &self.history_cache.calculation_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            } else if self.history_cache.work_key.is_some() {
                 ui.label("正在計算今日分段");
             } else {
                 ui.label("已完成區間：0");
             }
             return;
         }
+        if let Some(error) = &self.history_cache.calculation_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
         let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
-        const X: [f32; 6] = [0., 78., 272., 382., 492., 602.];
-        const WIDTH: [f32; 6] = [72., 188., 104., 104., 104., 104.];
-        const TABLE_WIDTH: f32 = 710.;
+        const X: [f32; 6] = [0., 100., 375., 560., 745., 930.];
+        const WIDTH: [f32; 6] = [95., 265., 175., 175., 175., 160.];
+        const TABLE_WIDTH: f32 = 1095.;
         egui::ScrollArea::horizontal()
             .id_salt("interval-table-horizontal")
             .show(ui, |ui| {
@@ -3035,8 +3074,8 @@ impl WidgetApp {
                 for (i, title) in [
                     "額度變化",
                     "變化時間（UTC+08）",
-                    "Sol",
                     "Luna",
+                    "Sol",
                     "Astra",
                     "Total",
                 ]
@@ -3085,33 +3124,25 @@ impl WidgetApp {
                                     view.end.clone()
                                 };
                                 change_time = change_time.replace(" +08:00", "");
-                                let families =
-                                    [("sol", "Sol"), ("luna", "Luna"), ("astra", "Astra")];
+                                let families = [
+                                    ("luna", "Luna", 1),
+                                    ("sol", "Sol", 0),
+                                    ("astra", "Astra", 2),
+                                ];
                                 let family_models: Vec<_> = families
                                     .iter()
-                                    .map(|(family, _)| model_family_usage(&row.models, family))
+                                    .map(|(family, _, _)| model_family_usage(&row.models, family))
                                     .collect();
                                 let total = total_model_usage(&row.models);
-                                let no_token_records = row.models.is_empty();
                                 let family_cell = |family_index: usize,
                                                    usage: Option<
                                     &intervals::ModelIntervalUsage,
                                 >| {
                                     usage.map_or_else(
-                                        || {
-                                            format!(
-                                                "{} 個 Task\n{}",
-                                                row.task_counts[family_index],
-                                                if no_token_records {
-                                                    "未知"
-                                                } else {
-                                                    "$0.0000"
-                                                }
-                                            )
-                                        },
+                                        || format!("{}次\n$0.0000", row.task_counts[family_index]),
                                         |model| {
                                             format!(
-                                                "{} 個 Task\n{}",
+                                                "{}次\n{}",
                                                 row.task_counts[family_index],
                                                 interval_model_cost(model)
                                             )
@@ -3121,59 +3152,38 @@ impl WidgetApp {
                                 let cells = [
                                     view.change.clone(),
                                     change_time,
-                                    family_cell(0, family_models[0].as_ref()),
-                                    family_cell(1, family_models[1].as_ref()),
+                                    family_cell(1, family_models[0].as_ref()),
+                                    family_cell(0, family_models[1].as_ref()),
                                     family_cell(2, family_models[2].as_ref()),
                                     format!(
-                                        "{} 個 Task\n{}",
+                                        "{}次\n{}",
                                         row.task_counts[3],
-                                        if no_token_records {
-                                            "未知".to_string()
-                                        } else {
-                                            interval_model_cost(&total)
-                                        }
+                                        interval_model_cost(&total)
                                     ),
                                 ];
-                                let no_token_hint = "無 Token 記錄，費用未知".to_string();
                                 let hints = [
                                     view.tooltip.clone(),
                                     view.tooltip.clone(),
-                                    if no_token_records {
-                                        no_token_hint.clone()
-                                    } else {
-                                        model_usage_tooltip(
-                                            "Sol（所有版本合併）",
-                                            family_models[0].as_ref(),
-                                            row.task_counts[0],
-                                        )
-                                    },
-                                    if no_token_records {
-                                        no_token_hint.clone()
-                                    } else {
-                                        model_usage_tooltip(
-                                            "Luna（所有版本合併）",
-                                            family_models[1].as_ref(),
-                                            row.task_counts[1],
-                                        )
-                                    },
-                                    if no_token_records {
-                                        no_token_hint.clone()
-                                    } else {
-                                        model_usage_tooltip(
-                                            "Astra（所有版本合併）",
-                                            family_models[2].as_ref(),
-                                            row.task_counts[2],
-                                        )
-                                    },
-                                    if no_token_records {
-                                        no_token_hint
-                                    } else {
-                                        model_usage_tooltip(
-                                            "所有模型總計",
-                                            Some(&total),
-                                            row.task_counts[3],
-                                        )
-                                    },
+                                    model_usage_tooltip(
+                                        "Luna（所有版本合併）",
+                                        family_models[0].as_ref(),
+                                        row.task_counts[1],
+                                    ),
+                                    model_usage_tooltip(
+                                        "Sol（所有版本合併）",
+                                        family_models[1].as_ref(),
+                                        row.task_counts[0],
+                                    ),
+                                    model_usage_tooltip(
+                                        "Astra（所有版本合併）",
+                                        family_models[2].as_ref(),
+                                        row.task_counts[2],
+                                    ),
+                                    model_usage_tooltip(
+                                        "所有模型總計",
+                                        Some(&total),
+                                        row.task_counts[3],
+                                    ),
                                 ];
                                 for i in 0..cells.len() {
                                     ui.put(
