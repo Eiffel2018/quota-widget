@@ -191,7 +191,12 @@ struct HistoryCache {
     rows: Vec<(HistoryEvent, Option<f64>, bool)>,
     weighted: Option<f64>,
     interval_indices: Vec<usize>,
-    table_rows: Vec<(Option<usize>, IntervalPresentation)>,
+    table_rows: Vec<TableIntervalRow>,
+}
+struct TableIntervalRow {
+    interval_index: Option<usize>,
+    presentation: IntervalPresentation,
+    models: Vec<quota_widget::intervals::ModelIntervalUsage>,
 }
 struct WidgetApp {
     settings: Settings,
@@ -300,6 +305,63 @@ fn canonical_interval_cost(interval: Option<&CompletedInterval>) -> (Option<f64>
         )
     })
 }
+fn recovered_history_presentations(
+    history: &[HistoryEvent],
+    costs: &accounting::CostIndex,
+    token_events: &[TokenEvent],
+) -> BTreeMap<
+    String,
+    (
+        i64,
+        IntervalPresentation,
+        Vec<quota_widget::intervals::ModelIntervalUsage>,
+    ),
+> {
+    let visible = quota_widget::history::visible_observations(history);
+    let mut previous: BTreeMap<(String, String, i64, String), i64> = BTreeMap::new();
+    let mut recovered = BTreeMap::new();
+    for event in visible {
+        if event.kind != quota_widget::model::HistoryKind::QuotaDecrease {
+            continue;
+        }
+        let reset = event.evidence.as_ref().and_then(|e| e.reset_at);
+        let window = event.window_key.clone();
+        if let (Some(reset), Some(window)) = (reset, window) {
+            let scope = (event.source_key.clone(), window, reset);
+            let start_key = (
+                scope.0.clone(),
+                scope.1.clone(),
+                scope.2,
+                event.before.clone(),
+            );
+            if let Some(start) = previous.get(&start_key).copied().filter(|start| {
+                *start < event.observed_at_unix
+                    && event.observed_at_unix.saturating_sub(*start) <= 6 * 60 * 60
+            }) {
+                let cost = costs.observed(start, event.observed_at_unix);
+                if cost.events > 0 {
+                    let models =
+                        quota_widget::intervals::model_usage(token_events.iter().filter(|token| {
+                            token.timestamp > start && token.timestamp <= event.observed_at_unix
+                        }));
+                    recovered.insert(
+                        intervals::history_event_key(&event),
+                        (
+                            start,
+                            interval_views::recovered_observation(&event, start, cost),
+                            models,
+                        ),
+                    );
+                }
+            }
+            previous.insert(
+                (scope.0, scope.1, scope.2, event.after.clone()),
+                event.observed_at_unix,
+            );
+        }
+    }
+    recovered
+}
 fn progress_label(stage: ProgressStage) -> &'static str {
     match stage {
         ProgressStage::Loading => "正在載入已儲存紀錄",
@@ -344,6 +406,84 @@ fn interval_model_cost(model: &intervals::ModelIntervalUsage) -> String {
             }
         )
     }
+}
+fn model_family_usage(
+    models: &[intervals::ModelIntervalUsage],
+    family: &str,
+) -> Option<intervals::ModelIntervalUsage> {
+    let mut rows = models.iter().filter(|model| {
+        model
+            .model
+            .to_ascii_lowercase()
+            .ends_with(&format!("-{family}"))
+    });
+    let first = rows.next()?;
+    let mut total = first.clone();
+    total.model = family.into();
+    for model in rows {
+        total.input = total.input.saturating_add(model.input);
+        total.cached = total.cached.saturating_add(model.cached);
+        total.uncached = total.uncached.saturating_add(model.uncached);
+        total.output = total.output.saturating_add(model.output);
+        total.known_usd += model.known_usd;
+        total.unknown_cost_events += model.unknown_cost_events;
+        total.events += model.events;
+        total.assumed_model_events += model.assumed_model_events;
+        total.model_assumed |= model.model_assumed;
+        total.partial_events += model.partial_events;
+        total.coverage_gap_events += model.coverage_gap_events;
+    }
+    total.reasoning = 0;
+    Some(total)
+}
+fn total_model_usage(models: &[intervals::ModelIntervalUsage]) -> intervals::ModelIntervalUsage {
+    let mut total = intervals::ModelIntervalUsage {
+        model: "total".into(),
+        input: 0,
+        cached: 0,
+        uncached: 0,
+        output: 0,
+        reasoning: 0,
+        known_usd: 0.0,
+        unknown_cost_events: 0,
+        events: 0,
+        assumed_model_events: 0,
+        model_assumed: false,
+        partial_events: 0,
+        coverage_gap_events: 0,
+    };
+    for model in models {
+        total.input = total.input.saturating_add(model.input);
+        total.cached = total.cached.saturating_add(model.cached);
+        total.uncached = total.uncached.saturating_add(model.uncached);
+        total.output = total.output.saturating_add(model.output);
+        total.known_usd += model.known_usd;
+        total.unknown_cost_events += model.unknown_cost_events;
+        total.events += model.events;
+        total.assumed_model_events += model.assumed_model_events;
+        total.model_assumed |= model.model_assumed;
+        total.partial_events += model.partial_events;
+        total.coverage_gap_events += model.coverage_gap_events;
+    }
+    total
+}
+fn model_usage_tooltip(label: &str, model: Option<&intervals::ModelIntervalUsage>) -> String {
+    let Some(model) = model else {
+        return format!("{label}\n0 筆 · $0.0000");
+    };
+    format!(
+        "{label}\n記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
+        model.events,
+        interval_model_cost(model),
+        model.input,
+        model.cached,
+        model.output,
+        if model.unknown_cost_events > 0 {
+            format!("\n價格未設定：{} 筆", model.unknown_cost_events)
+        } else {
+            String::new()
+        }
+    )
 }
 fn now() -> i64 {
     Utc::now().timestamp()
@@ -867,7 +1007,10 @@ impl WidgetApp {
         accessibility::configure_style(
             &mut style,
             self.settings.dark,
-            accessibility::minimum_font(self.settings.size[0]),
+            accessibility::scaled_minimum_font(
+                self.settings.size[0],
+                self.settings.font_scale_percent,
+            ),
         );
         ctx.set_style(style);
     }
@@ -970,6 +1113,7 @@ impl WidgetApp {
         self.import_error =
             Some("本機歷史背景處理已中斷；請重新啟動程式。畫面保留已載入資料。".into());
     }
+    #[cfg(test)]
     fn account_changed(&mut self) {
         self.quota.account_changed();
         self.boundary_after = Some(now());
@@ -1127,25 +1271,36 @@ impl WidgetApp {
                 self.quota_error = None;
             }
             BridgeEvent::Connected => self.status = "CONNECTED · 等待額度".into(),
-            BridgeEvent::RateLimits(v) => match self.quota.ingest_json(&v, now()) {
-                Ok(_) => {
-                    self.status = "LIVE".into();
-                    self.quota_error = None;
-                    if !self.quota.history.is_empty() {
-                        let events = std::mem::take(&mut self.quota.history);
-                        self.send_work(WorkCommand::MergeHistory {
-                            events,
-                            save_path: self.save_path("history.json"),
-                        });
+            BridgeEvent::RateLimits(v) => {
+                let previous_account = self.quota.account_id().map(str::to_owned);
+                match self.quota.ingest_json(&v, now()) {
+                    Ok(_) => {
+                        let account_changed = previous_account
+                            .as_ref()
+                            .zip(self.quota.account_id())
+                            .is_some_and(|(previous, current)| previous != current);
+                        if account_changed {
+                            self.boundary_after = Some(now());
+                            self.main_cache.key = None;
+                            self.history_cache.key = None;
+                            self.status = "帳戶已變更".into();
+                        }
+                        self.status = "LIVE".into();
+                        self.quota_error = None;
+                        if !self.quota.history.is_empty() {
+                            let events = std::mem::take(&mut self.quota.history);
+                            self.send_work(WorkCommand::MergeHistory {
+                                events,
+                                save_path: self.save_path("history.json"),
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        self.status = "資料格式不支援".into();
+                        self.quota_error =
+                            Some("CLI 回傳的額度格式不支援；請在設定檢查來源。".into());
                     }
                 }
-                Err(_) => {
-                    self.status = "資料格式不支援".into();
-                    self.quota_error = Some("CLI 回傳的額度格式不支援；請在設定檢查來源。".into());
-                }
-            },
-            BridgeEvent::AccountChanged => {
-                self.account_changed();
             }
             BridgeEvent::Error(e) => {
                 self.status = "OFFLINE".into();
@@ -1490,6 +1645,8 @@ impl WidgetApp {
         }
         let all = self.matching_history();
         let visible = quota_widget::history::visible_observations(&all);
+        let recovered_rows =
+            recovered_history_presentations(&all, &self.tokens.cost_index, self.tokens.events());
         let recent_events: Vec<_> = visible
             .iter()
             .rev()
@@ -1507,25 +1664,26 @@ impl WidgetApp {
             recent_tooltip.push_str("已完成區間：0\n");
         }
         for event in &recent_events {
-            if let Some(&index) = self
-                .interval_lookup
-                .get(&intervals::history_event_key(event))
-            {
-                let row = &self.interval_presentations[index];
-                recent_tooltip.push_str(&format!(
-                    "\n{} · {}\n估算 USD {} · 每% {} · {}\n區間 Token 小計 {}\n",
-                    row.change,
-                    row.end,
-                    row.total,
-                    row.per_point.replace("/百分點", ""),
-                    row.status,
-                    row.observed_total
-                ));
-            } else {
-                let row = interval_views::unconfirmed_observation(event);
-                recent_tooltip
-                    .push_str(&format!("\n{} · {}\n{}\n", row.change, row.end, row.status));
-            }
+            let key = intervals::history_event_key(event);
+            let canonical = self.interval_lookup.get(&key).copied();
+            let recovered = recovered_rows.get(&key);
+            let row = recovered
+                .filter(|(start, _, _)| {
+                    event.reconciliation.is_some()
+                        || canonical.is_none_or(|i| self.intervals[i].start != Some(*start))
+                })
+                .map(|(_, row, _)| row.clone())
+                .or_else(|| canonical.map(|i| self.interval_presentations[i].clone()))
+                .unwrap_or_else(|| interval_views::unconfirmed_observation(event));
+            recent_tooltip.push_str(&format!(
+                "\n{} · {}\n估算 USD {} · 每% {} · {}\n區間 Token 小計 {}\n",
+                row.change,
+                row.end,
+                row.total,
+                row.per_point.replace(" / 百分點", ""),
+                row.status,
+                row.observed_total
+            ));
         }
         let boundary = all
             .iter()
@@ -1710,7 +1868,9 @@ impl WidgetApp {
             palette.text,
         );
         let root_width = ctx.screen_rect().width();
-        let font_size = accessibility::minimum_font(root_width);
+        let font_multiplier = self.settings.font_scale_percent as f32 / 100.0;
+        let font_size =
+            accessibility::scaled_minimum_font(root_width, self.settings.font_scale_percent);
         if (ctx.style().text_styles[&egui::TextStyle::Body].size - font_size).abs() > 0.1 {
             let mut style = (*ctx.style()).clone();
             accessibility::configure_style(&mut style, dark, font_size);
@@ -1757,7 +1917,7 @@ impl WidgetApp {
                         pt(x, y),
                         Align2::LEFT_TOP,
                         text,
-                        FontId::proportional((size * scale).max(font_size)),
+                        FontId::proportional((size * scale * font_multiplier).max(font_size)),
                         color,
                     );
                 };
@@ -1803,12 +1963,24 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            "每週額度".into()
+                            format!(
+                                "每週額度 V {}",
+                                env!("CARGO_PKG_VERSION")
+                                    .strip_prefix("0.")
+                                    .unwrap_or(env!("CARGO_PKG_VERSION"))
+                            )
                         } else {
                             v.window_label.clone()
                         }
                     })
-                    .unwrap_or_else(|| "每週額度".into());
+                    .unwrap_or_else(|| {
+                        format!(
+                            "每週額度 V {}",
+                            env!("CARGO_PKG_VERSION")
+                                .strip_prefix("0.")
+                                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                        )
+                    });
                 painter.circle_filled(
                     pt(22., 24.),
                     3.2 * scale,
@@ -1818,7 +1990,14 @@ impl WidgetApp {
                         muted
                     },
                 );
-                txt(34., 14., title, 14., fg);
+                let title_size = (12. * scale * font_multiplier).clamp(10., 16.);
+                painter.with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(147., 36.))).text(
+                    pt(34., 14.),
+                    Align2::LEFT_TOP,
+                    title,
+                    FontId::proportional(title_size),
+                    fg,
+                );
                 if ui
                     .put(
                         Rect::from_min_max(pt(148., 12.), pt(220., 37.)),
@@ -1861,7 +2040,11 @@ impl WidgetApp {
                     .unwrap_or_else(|| "—".into());
                 txt(20., 57., percent.clone(), 76., fg);
                 let percent_width = painter
-                    .layout_no_wrap(percent.clone(), FontId::proportional(76. * scale), fg)
+                    .layout_no_wrap(
+                        percent.clone(),
+                        FontId::proportional(76. * scale * font_multiplier),
+                        fg,
+                    )
                     .size()
                     .x;
                 let percent_x = 20. + percent_width / sx + 5.;
@@ -2155,7 +2338,7 @@ impl WidgetApp {
                 "DEMO",
             );
         }
-        ui.label("香港時間 UTC+08:00 · 估算 USD");
+        ui.label("時間 UTC+08:00 · Token 成本估算 USD");
         if self.history_cache.sources_generation != Some(self.history_generation) {
             self.history_cache.sources = self
                 .history
@@ -2246,6 +2429,11 @@ impl WidgetApp {
         );
         if self.history_cache.key.as_ref() != Some(&key) {
             let all = self.browsed_history();
+            let recovered_rows = recovered_history_presentations(
+                &all,
+                &self.tokens.cost_index,
+                self.tokens.events(),
+            );
             let visible: BTreeSet<_> = quota_widget::history::visible_observations(&all)
                 .iter()
                 .map(intervals::history_event_key)
@@ -2277,21 +2465,44 @@ impl WidgetApp {
             self.history_cache.interval_indices.clear();
             self.history_cache.table_rows.clear();
             for (event, _, _) in &self.history_cache.rows {
-                if !visible.contains(&intervals::history_event_key(event)) {
+                let event_key = intervals::history_event_key(event);
+                if !visible.contains(&event_key) {
                     continue;
                 }
-                if let Some(&index) = self
-                    .interval_lookup
-                    .get(&intervals::history_event_key(event))
-                {
+                let index = self.interval_lookup.get(&event_key).copied();
+                let recovered = recovered_rows.get(&event_key);
+                let should_recover = recovered.is_some_and(|(start, _, _)| {
+                    event.reconciliation.is_some()
+                        || index.is_none_or(|i| self.intervals[i].start != Some(*start))
+                });
+                if should_recover {
+                    let (start, presentation, models) = recovered.unwrap();
+                    let _ = start;
+                    if let Some(index) = index {
+                        self.history_cache.interval_indices.push(index);
+                    }
+                    self.history_cache.table_rows.push(TableIntervalRow {
+                        interval_index: None,
+                        presentation: presentation.clone(),
+                        models: models.clone(),
+                    });
+                } else if let Some(index) = index {
                     self.history_cache.interval_indices.push(index);
-                    self.history_cache
-                        .table_rows
-                        .push((Some(index), self.interval_presentations[index].clone()));
+                    self.history_cache.table_rows.push(TableIntervalRow {
+                        interval_index: Some(index),
+                        presentation: self.interval_presentations[index].clone(),
+                        models: self.intervals[index].models.clone(),
+                    });
                 } else if drop_event(event) && event.reconciliation.is_some() {
-                    self.history_cache
-                        .table_rows
-                        .push((None, interval_views::unconfirmed_observation(event)));
+                    self.history_cache.table_rows.push(TableIntervalRow {
+                        interval_index: None,
+                        presentation: recovered
+                            .map(|(_, row, _)| row.clone())
+                            .unwrap_or_else(|| interval_views::unconfirmed_observation(event)),
+                        models: recovered
+                            .map(|(_, _, models)| models.clone())
+                            .unwrap_or_default(),
+                    });
                 }
             }
             let estimates = self
@@ -2471,36 +2682,30 @@ impl WidgetApp {
                         egui::Grid::new("interval-model-breakdown")
                             .striped(true)
                             .show(ui, |ui| {
-                                for label in [
-                                    "模型",
-                                    "筆數",
-                                    "Input",
-                                    "Cached",
-                                    "Uncached",
-                                    "Output",
-                                    "Reasoning",
-                                    "估算 USD",
-                                ] {
+                                for label in
+                                    ["模型家族", "筆數", "Input", "Cached", "Output", "USD"]
+                                {
                                     ui.strong(label);
                                 }
                                 ui.end_row();
-                                for model in &interval.models {
-                                    ui.label(format!(
-                                        "{}{}",
-                                        model.model,
-                                        if model.assumed_model_events > 0 {
-                                            "（含假設）"
-                                        } else {
-                                            ""
-                                        }
-                                    ));
+                                let families =
+                                    [("sol", "Sol"), ("luna", "Luna"), ("astra", "Astra")];
+                                let mut grouped = Vec::new();
+                                for (family, label) in families {
+                                    if let Some(model) =
+                                        model_family_usage(&interval.models, family)
+                                    {
+                                        grouped.push((label, model));
+                                    }
+                                }
+                                grouped.push(("Total", total_model_usage(&interval.models)));
+                                for (label, model) in grouped {
+                                    ui.label(label);
                                     ui.label(model.events.to_string());
                                     ui.label(model.input.to_string());
                                     ui.label(model.cached.to_string());
-                                    ui.label(model.uncached.to_string());
                                     ui.label(model.output.to_string());
-                                    ui.label(model.reasoning.to_string());
-                                    ui.label(interval_model_cost(model));
+                                    ui.label(interval_model_cost(&model));
                                     ui.end_row();
                                 }
                             });
@@ -2540,20 +2745,24 @@ impl WidgetApp {
             return;
         }
         let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
-        const X: [f32; 5] = [0., 90., 260., 430., 525.];
-        const WIDTH: [f32; 5] = [80., 160., 160., 85., 140.];
+        const X: [f32; 6] = [0., 115., 365., 545., 725., 905.];
+        const WIDTH: [f32; 6] = [105., 240., 170., 170., 170., 150.];
+        const TABLE_WIDTH: f32 = 1075.;
         egui::ScrollArea::horizontal()
             .id_salt("interval-table-horizontal")
             .show(ui, |ui| {
-                ui.set_min_width(675. * scale);
-                let (header, _) =
-                    ui.allocate_exact_size(Vec2::new(675. * scale, 26. * scale), Sense::hover());
+                ui.set_min_width(TABLE_WIDTH * scale);
+                let (header, _) = ui.allocate_exact_size(
+                    Vec2::new(TABLE_WIDTH * scale, 26. * scale),
+                    Sense::hover(),
+                );
                 for (i, title) in [
                     "額度變化",
-                    "開始（香港）",
-                    "結束（香港）",
-                    "歷時",
-                    "估算 USD",
+                    "區間時間（UTC+08）",
+                    "Sol",
+                    "Luna",
+                    "Astra",
+                    "Total USD",
                 ]
                 .iter()
                 .enumerate()
@@ -2571,52 +2780,92 @@ impl WidgetApp {
                     .id_salt("interval-table-rows")
                     .show_rows(
                         ui,
-                        42. * scale,
+                        46. * scale,
                         self.history_cache.table_rows.len(),
                         |ui, range| {
                             for row_index in range {
-                                let (index, view) = &self.history_cache.table_rows[row_index];
+                                let row = &self.history_cache.table_rows[row_index];
+                                let view = &row.presentation;
                                 let (rect, response) = ui.allocate_exact_size(
-                                    Vec2::new(675. * scale, 42. * scale),
+                                    Vec2::new(TABLE_WIDTH * scale, 46. * scale),
                                     Sense::click(),
                                 );
                                 if response
-                                    .on_hover_text(if index.is_some() {
+                                    .on_hover_text(if row.interval_index.is_some() {
                                         format!("{}\n點擊查看詳情", view.tooltip)
                                     } else {
                                         view.tooltip.clone()
                                     })
                                     .clicked()
                                 {
-                                    if let Some(index) = index {
+                                    if let Some(index) = row.interval_index {
                                         self.selected_interval =
-                                            Some(self.intervals[*index].history_event_key.clone());
+                                            Some(self.intervals[index].history_event_key.clone());
                                     }
                                 }
+                                let mut time_range = if view.start == "—" {
+                                    "—".into()
+                                } else {
+                                    format!("{} – {}", view.start, view.end)
+                                };
+                                time_range = time_range.replace(" +08:00", "");
+                                let families =
+                                    [("sol", "Sol"), ("luna", "Luna"), ("astra", "Astra")];
+                                let family_models: Vec<_> = families
+                                    .iter()
+                                    .map(|(family, _)| model_family_usage(&row.models, family))
+                                    .collect();
+                                let total = total_model_usage(&row.models);
                                 let cells = [
-                                    &view.change,
-                                    &view.start,
-                                    &view.end,
-                                    &view.duration,
-                                    &view.total,
+                                    view.change.clone(),
+                                    time_range,
+                                    family_models[0].as_ref().map_or_else(
+                                        || "0 次 · $0.0000".into(),
+                                        |m| format!("{} 次 · {}", m.events, interval_model_cost(m)),
+                                    ),
+                                    family_models[1].as_ref().map_or_else(
+                                        || "0 次 · $0.0000".into(),
+                                        |m| format!("{} 次 · {}", m.events, interval_model_cost(m)),
+                                    ),
+                                    family_models[2].as_ref().map_or_else(
+                                        || "0 次 · $0.0000".into(),
+                                        |m| format!("{} 次 · {}", m.events, interval_model_cost(m)),
+                                    ),
+                                    format!(
+                                        "{} 次 · {}",
+                                        total.events,
+                                        interval_model_cost(&total)
+                                    ),
                                 ];
-                                for (i, text) in cells.iter().enumerate() {
+                                let hints = [
+                                    view.tooltip.clone(),
+                                    view.tooltip.clone(),
+                                    model_usage_tooltip(
+                                        "Sol（所有版本合併）",
+                                        family_models[0].as_ref(),
+                                    ),
+                                    model_usage_tooltip(
+                                        "Luna（所有版本合併）",
+                                        family_models[1].as_ref(),
+                                    ),
+                                    model_usage_tooltip(
+                                        "Astra（所有版本合併）",
+                                        family_models[2].as_ref(),
+                                    ),
+                                    model_usage_tooltip("所有模型總計", Some(&total)),
+                                ];
+                                for i in 0..cells.len() {
                                     ui.put(
                                         Rect::from_min_size(
                                             rect.min + Vec2::new(X[i] * scale, 0.),
                                             Vec2::new(WIDTH[i] * scale, 34. * scale),
                                         ),
-                                        egui::Label::new(
-                                            RichText::new(
-                                                text.strip_suffix(" +08:00").unwrap_or(text),
-                                            )
-                                            .size(
-                                                ui.style().text_styles[&egui::TextStyle::Body].size,
-                                            ),
-                                        )
+                                        egui::Label::new(RichText::new(&cells[i]).size(
+                                            ui.style().text_styles[&egui::TextStyle::Body].size,
+                                        ))
                                         .truncate(),
                                     )
-                                    .on_hover_text(&view.tooltip);
+                                    .on_hover_text(&hints[i]);
                                 }
                                 ui.painter().hline(
                                     rect.x_range(),
@@ -2718,7 +2967,7 @@ impl WidgetApp {
             self.token_group,
             self.show_excluded_records,
         );
-        ui.heading("Token 明細 · 香港時間 UTC+08:00");
+        ui.heading("Token 明細 · UTC+08:00");
         if self.demo {
             ui.colored_label(
                 if self.settings.dark {
@@ -2993,6 +3242,29 @@ impl WidgetApp {
             {
                 self.dirty = true;
             }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("介面字體大小");
+            if ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.settings.font_scale_percent,
+                        accessibility::MIN_FONT_SCALE_PERCENT
+                            ..=accessibility::MAX_FONT_SCALE_PERCENT,
+                    )
+                    .step_by(5.0)
+                    .suffix("%"),
+                )
+                .changed()
+            {
+                self.settings.font_scale_percent = self.settings.font_scale_percent.clamp(
+                    accessibility::MIN_FONT_SCALE_PERCENT,
+                    accessibility::MAX_FONT_SCALE_PERCENT,
+                );
+                self.apply_theme(ctx);
+                self.dirty = true;
+            }
+            ui.label("Aa 中文預覽");
         });
         ui.separator();
         ui.strong("官方 Codex CLI（唯讀）");

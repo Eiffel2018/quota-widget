@@ -6,6 +6,9 @@
 use eframe::egui::{self, Color32, FontFamily, FontId, Stroke, TextStyle, Vec2};
 
 pub const REFERENCE_MINIMUM_FONT: f32 = 18.0;
+pub const MINIMUM_CONFIGURABLE_FONT: f32 = 12.0;
+pub const MIN_FONT_SCALE_PERCENT: u32 = 70;
+pub const MAX_FONT_SCALE_PERCENT: u32 = 150;
 pub const MINIMUM_ROOT_WIDTH: f32 = 430.0;
 pub const MAXIMUM_ROOT_WIDTH: f32 = 1000.0;
 pub const MAXIMUM_MAIN_SCALE: f32 = 2.5;
@@ -20,6 +23,12 @@ pub fn minimum_font(root_width: f32) -> f32 {
         root_width.clamp(MINIMUM_ROOT_WIDTH, MAXIMUM_ROOT_WIDTH)
     };
     REFERENCE_MINIMUM_FONT.max(13.0 * (width / 310.0).min(MAXIMUM_MAIN_SCALE))
+}
+
+/// Apply the user's percentage preference to the responsive font baseline.
+pub fn scaled_minimum_font(root_width: f32, percent: u32) -> f32 {
+    let percent = percent.clamp(MIN_FONT_SCALE_PERCENT, MAX_FONT_SCALE_PERCENT);
+    (minimum_font(root_width) * percent as f32 / 100.0).max(MINIMUM_CONFIGURABLE_FONT)
 }
 
 /// Opaque colors shared by styled controls and explicitly painted text.
@@ -76,14 +85,14 @@ pub fn palette(dark: bool) -> Palette {
 
 /// Configure standard text and controls without flattening explicit RichText
 /// sizes or semantic colors. Call for each viewport using the root window's
-/// `minimum_font`, so detached windows and tooltips share the same readable floor.
+/// `scaled_minimum_font`, so detached windows and tooltips share the selected size.
 ///
 /// Standard styles and spacing are assigned from the supplied size, rather than
 /// multiplied by their previous values. Reapplying this function is idempotent
 /// and shrinking a window restores the appropriate size without cumulative zoom.
 pub fn configure_style(style: &mut egui::Style, dark: bool, font_size: f32) {
     let font_size = if font_size.is_finite() {
-        font_size.max(REFERENCE_MINIMUM_FONT)
+        font_size.max(MINIMUM_CONFIGURABLE_FONT)
     } else {
         REFERENCE_MINIMUM_FONT
     };

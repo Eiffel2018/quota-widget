@@ -1,8 +1,8 @@
-# Quota Widget 0.3.14
+# Quota Widget 0.3.15
 
-每個扣額區間獨立以「本段有價 Token 成本 ÷ 本段百分點」估算，保留區間間的成本差異；頁面摘要顯示所列區間的加權平均。資料覆蓋不完整時標示下限，缺少可用 Token 記錄時顯示未知。
+每個扣額區間獨立以本段 Token 成本按百分點估算，並由歷史百分比下降時間重建區間；模型表按 Sol、Luna、Astra 家族合併各版本，顯示記錄數、USD、Input、Cached、Output。啟動通知不會清除既有統計起點。設定可調整字體 70–150%，主視窗標題顯示 `V 3.15`。
 
-[更新說明](docs/RELEASE-0.3.14.md) · [Windows 驗證](VALIDATION-0.3.14.md)
+[更新說明](docs/RELEASE-0.3.15.md) · [Windows 驗證](VALIDATION-0.3.15.md)
 
 ## 0.3.10
 

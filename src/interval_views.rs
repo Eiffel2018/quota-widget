@@ -1,8 +1,7 @@
-//! Read-only presentation of canonical completed quota intervals.
+//! Read-only presentation of completed and explicitly partial quota intervals.
 //!
-//! These helpers never select token events, recompute prices, split observed
-//! decrements, or change exported accounting. The table and latest-five tooltip
-//! can share the same strings and ordering without maintaining another ledger.
+//! Partial recovered rows are presentation-only; they do not change canonical
+//! accounting or exported data.
 use crate::{
     display_time,
     intervals::{CompletedInterval, StartBoundaryKind},
@@ -207,5 +206,48 @@ pub fn unconfirmed_observation(event: &crate::model::HistoryEvent) -> IntervalPr
         duration: "—".into(), total: "待確認".into(), observed_total: "未能確認歸屬".into(),
         per_point: "未知".into(), status: "日誌補回 · 未確認".into(),
         tooltip: "日誌記錄的額度下降；帳戶或週期邊界未能確認。時間為日誌觀察時間，未計入扣額或單價校準，原始 Token 記錄保留。".into(),
+    }
+}
+
+/// Present a consecutive historical observation with the token subtotal in its
+/// bounded time window. Imported quota evidence remains explicitly approximate.
+pub fn recovered_observation(
+    event: &crate::model::HistoryEvent,
+    start: i64,
+    cost: crate::accounting::ObservedCost,
+) -> IntervalPresentation {
+    let seconds = event.observed_at_unix.saturating_sub(start);
+    let points = event
+        .before
+        .parse::<f64>()
+        .ok()
+        .zip(event.after.parse::<f64>().ok())
+        .map(|(before, after)| (before - after).abs());
+    let lower_bound = cost.unknown_events > 0 || cost.partial;
+    let amount = format!(
+        "{}{}",
+        if lower_bound { "≥ " } else { "≈ " },
+        money(cost.known_usd)
+    );
+    let per_point = points
+        .filter(|points| *points > 0.0)
+        .map(|points| {
+            format!(
+                "{}{} / 百分點",
+                if lower_bound { "≥ " } else { "≈ " },
+                money(cost.known_usd / points)
+            )
+        })
+        .unwrap_or_else(|| "未知".into());
+    IntervalPresentation {
+        change: format!("{}% → {}%", event.before, event.after),
+        start: display_time::datetime(start).unwrap_or_else(|| "未知".into()),
+        end: display_time::datetime(event.observed_at_unix).unwrap_or_else(|| "未知".into()),
+        duration: elapsed(seconds),
+        total: amount.clone(),
+        observed_total: amount,
+        per_point,
+        status: "歷史 Token 估算 · 額度部分未確認".into(),
+        tooltip: "按相鄰歷史百分比下降時間統計本機 Token 紀錄；額度快照的帳戶／連續性未完全確認，金額只作估算。".into(),
     }
 }

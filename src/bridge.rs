@@ -42,8 +42,6 @@ pub enum BridgeEvent {
     Connected,
     /// Complete `account/rateLimits/read` result, not a sparse notification.
     RateLimits(Value),
-    /// Discard rates and any prior account's observations immediately.
-    AccountChanged,
     Error(BridgeError),
     Stopped,
 }
@@ -702,7 +700,6 @@ fn run(
                         "account/updated" => {
                             epoch = epoch.wrapping_add(1);
                             refresh_pending = true;
-                            let _ = events.send(BridgeEvent::AccountChanged);
                         }
                         "account/rateLimits/updated" => refresh_pending = true,
                         _ => {}
@@ -1195,9 +1192,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn account_change_discards_in_flight_prior_account_data() {
+    fn account_update_refreshes_rates_without_claiming_identity_changed() {
         let mock = Mock::spawn("switch", Duration::from_secs(2), Duration::from_secs(30));
-        let mut changed = false;
         loop {
             match mock
                 .bridge
@@ -1205,9 +1201,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
             {
-                BridgeEvent::AccountChanged => changed = true,
                 BridgeEvent::RateLimits(value) => {
-                    assert!(changed);
                     assert_eq!(value["rateLimits"]["primary"]["usedPercent"], 2);
                     break;
                 }
