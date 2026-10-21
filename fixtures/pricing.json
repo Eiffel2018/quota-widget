@@ -1,0 +1,1 @@
+{"rates":{"gpt-6.1-sol":{"uncached_input_per_million":2.0,"cached_input_per_million":0.10,"output_per_million":10.0},"gpt-6-luna":{"uncached_input_per_million":0.10,"cached_input_per_million":0.01,"output_per_million":0.50}},"model_override":null,"assumed_model":"gpt-6.1-sol","tier_label":"Standard（假設）","apply_long_context":true,"verified_at":"2026-10-17"}

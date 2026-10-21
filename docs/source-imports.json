@@ -1,0 +1,14 @@
+[
+  {
+    "version": "0.3.0",
+    "archive": "quota-widget-0.3.0-full-source.zip",
+    "sha256": "617a1ce86724697b03b4395790e714a81e16c99d49f1e052651dd08f4f10987d",
+    "files": 37,
+    "excluded": [
+      "validation output",
+      "build output",
+      "packaging manifests"
+    ],
+    "source_modified": false
+  }
+]
