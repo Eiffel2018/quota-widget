@@ -1,3 +1,7 @@
+# Quota Widget 0.3.6
+
+Reconnect recovery and cooperative responsive shutdown. See [release notes](docs/RELEASE-0.3.6.md) and [validation](VALIDATION-0.3.6.md). Windows x64 is cross-built; native Windows runtime is unverified. Original CLI failure cause remains unknown.
+
 # Quota Widget 0.3.5
 
 原生 Rust + eframe 桌面小工具，重建自 0.2.1 的畫面、已恢復字型／圖示、格式與行為證據。本專案是新的可維護實作，不是聲稱找回遺失的原始碼。沒有 Electron、WebView、Node 或 Python 常駐服務。

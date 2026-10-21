@@ -10,6 +10,7 @@ use quota_widget::{
         ProgressStage, Snapshot, Worker,
     },
     bridge::{Bridge, BridgeCommand, BridgeEvent},
+    cancellation::{self, CancellationToken},
     db_view::ViewRequest,
     display_time,
     interval_views::{self, IntervalPresentation},
@@ -209,6 +210,7 @@ struct WidgetApp {
     layout: LayoutConvergence,
     bridge: Option<Bridge>,
     status: String,
+    quota_error: Option<String>,
     history_open: bool,
     history_selection: Option<(String, Option<String>, String)>,
     tokens_open: bool,
@@ -228,6 +230,9 @@ struct WidgetApp {
     import_warnings: Vec<String>,
     export_rx: Option<mpsc::Receiver<String>>,
     export_join: Option<std::thread::JoinHandle<()>>,
+    export_cancel: Option<CancellationToken>,
+    closing_since: Option<Instant>,
+    close_ready: bool,
     last_import: Instant,
     last_save: Instant,
     last_topmost: Instant,
@@ -694,6 +699,7 @@ impl WidgetApp {
             layout: LayoutConvergence::default(),
             bridge: None,
             status: "OFFLINE".into(),
+            quota_error: None,
             history_selection: None,
             history_open: args.iter().any(|s| s == "--show-history"),
             tokens_open: args.iter().any(|s| s == "--show-tokens"),
@@ -713,6 +719,9 @@ impl WidgetApp {
             import_warnings: Vec::new(),
             export_rx: None,
             export_join: None,
+            export_cancel: None,
+            closing_since: None,
+            close_ready: false,
             last_import: Instant::now() - Duration::from_secs(60),
             last_save: Instant::now(),
             last_topmost: Instant::now(),
@@ -848,6 +857,47 @@ impl WidgetApp {
                 .then(|| PathBuf::from(self.settings.codex_path.trim())),
         ));
         self.status = "CONNECTING".into();
+        self.quota_error = None;
+    }
+    /// A completed bridge leaves a disconnected sender. A user refresh must
+    /// reconnect that source instead of silently sending into a dead channel.
+    fn refresh_quota(&mut self) {
+        if self.demo {
+            return;
+        }
+        self.offline = false;
+        if self
+            .bridge
+            .as_ref()
+            .is_none_or(|bridge| bridge.commands.send(BridgeCommand::Refresh).is_err())
+        {
+            self.connect();
+        }
+    }
+    fn quota_diagnostic_text(&self) -> String {
+        let mut text = format!("額度來源狀態：{}", self.status);
+        if let Some(error) = &self.quota_error {
+            text.push_str(&format!("\n{error}"));
+        }
+        text.push_str("\n額度使用官方 CLI 獨立連線；Token 掃描進度不代表額度已連線。\n按更新額度會在連線已結束時重新連線。設定／連接可檢查 CLI 路徑。");
+        text
+    }
+    fn compact_status_text(&self) -> Option<String> {
+        if !self.demo && self.quota_error.is_some() {
+            Some("額度連線有問題 · 點此檢查".into())
+        } else if !self.demo && self.selected().is_none() {
+            Some(
+                match self.status.as_str() {
+                    "CONNECTING" => "正在連接額度來源…",
+                    "CONNECTED · 等待額度" => "已連線 · 等待額度資料…",
+                    "OFFLINE" => "額度未連線 · 點此設定",
+                    _ => "尚未取得額度 · 點此檢查",
+                }
+                .into(),
+            )
+        } else {
+            self.compact_progress_text()
+        }
     }
     fn start_import(&mut self) {
         if self.demo
@@ -1046,6 +1096,45 @@ impl WidgetApp {
             ui.small("警告最多保留 20 項；只顯示檔案及格式診斷，不顯示原始對話。");
         });
     }
+    fn handle_bridge_event(&mut self, event: BridgeEvent) {
+        match event {
+            BridgeEvent::Connecting => {
+                self.status = "CONNECTING".into();
+                self.quota_error = None;
+            }
+            BridgeEvent::Connected => self.status = "CONNECTED · 等待額度".into(),
+            BridgeEvent::RateLimits(v) => match self.quota.ingest_json(&v, now()) {
+                Ok(_) => {
+                    self.status = "LIVE".into();
+                    self.quota_error = None;
+                    if !self.quota.history.is_empty() {
+                        let events = std::mem::take(&mut self.quota.history);
+                        self.send_work(WorkCommand::MergeHistory {
+                            events,
+                            save_path: self.save_path("history.json"),
+                        });
+                    }
+                }
+                Err(_) => {
+                    self.status = "資料格式不支援".into();
+                    self.quota_error = Some("CLI 回傳的額度格式不支援；請在設定檢查來源。".into());
+                }
+            },
+            BridgeEvent::AccountChanged => {
+                self.account_changed();
+            }
+            BridgeEvent::Error(e) => {
+                self.status = "OFFLINE".into();
+                self.quota_error = Some(format!("CLI：{e}"));
+                self.notice = self.quota_error.clone().unwrap();
+                self.quota.reset_continuity();
+            }
+            BridgeEvent::Stopped => {
+                self.status = "OFFLINE".into();
+                self.bridge = None;
+            }
+        }
+    }
     fn pump(&mut self) {
         let messages: Vec<_> = self
             .bridge
@@ -1053,32 +1142,7 @@ impl WidgetApp {
             .map(|b| b.events.try_iter().collect())
             .unwrap_or_default();
         for event in messages {
-            match event {
-                BridgeEvent::Connecting => self.status = "CONNECTING".into(),
-                BridgeEvent::Connected => self.status = "CONNECTED · 等待額度".into(),
-                BridgeEvent::RateLimits(v) => match self.quota.ingest_json(&v, now()) {
-                    Ok(_) => {
-                        self.status = "LIVE".into();
-                        if !self.quota.history.is_empty() {
-                            let events = std::mem::take(&mut self.quota.history);
-                            self.send_work(WorkCommand::MergeHistory {
-                                events,
-                                save_path: self.save_path("history.json"),
-                            });
-                        }
-                    }
-                    Err(_) => self.status = "資料格式不支援".into(),
-                },
-                BridgeEvent::AccountChanged => {
-                    self.account_changed();
-                }
-                BridgeEvent::Error(e) => {
-                    self.status = "OFFLINE".into();
-                    self.notice = format!("CLI：{e}");
-                    self.quota.reset_continuity();
-                }
-                BridgeEvent::Stopped => self.status = "OFFLINE".into(),
-            }
+            self.handle_bridge_event(event);
         }
         loop {
             match self.worker.try_recv() {
@@ -1611,8 +1675,9 @@ impl WidgetApp {
                     Sense::click_and_drag(),
                 );
                 let title_drag=ui.interact(Rect::from_min_max(pt(4.,4.),pt(155.,39.)),ui.id().with("title-drag"),Sense::click_and_drag());
-                if (drag.is_pointer_button_down_on() || title_drag.is_pointer_button_down_on())
-                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+                // Wait for a real drag. Beginning native window dragging on
+                // pointer-down steals clicks from the diagnostic status strip.
+                if drag.drag_started() || title_drag.drag_started()
                 {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
@@ -1622,9 +1687,7 @@ impl WidgetApp {
                         ui.close();
                     }
                     if ui.button("更新額度").clicked() {
-                        if let Some(b) = &self.bridge {
-                            let _ = b.commands.send(BridgeCommand::Refresh);
-                        }
+                        self.refresh_quota();
                         ui.close();
                     }
                     if ui.checkbox(&mut self.settings.dark, "深色外觀").changed() {
@@ -1639,7 +1702,8 @@ impl WidgetApp {
                         self.dirty = true;
                     }
                     if ui.button("關閉小工具").clicked() {
-                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                        self.begin_close();
+                        ctx.request_repaint();
                     }
                 });
                 let view = self.selected();
@@ -1681,14 +1745,14 @@ impl WidgetApp {
                 {
                     self.tokens_open = true;
                 }
-                if let Some(progress) = self.compact_progress_text() {
+                if let Some(progress) = self.compact_status_text() {
                     let progress_rect = Rect::from_min_max(pt(21., 39.), pt(289., 51.));
                     painter.with_clip_rect(progress_rect).text(
                         progress_rect.min, Align2::LEFT_TOP, progress,
                         FontId::proportional(9. * scale), muted,
                     );
                     if ui.interact(progress_rect, ui.id().with("import-progress"), Sense::click())
-                        .on_hover_text(self.import_diagnostic_text()).clicked()
+                        .on_hover_text(format!("{}\n\n{}", self.quota_diagnostic_text(), self.import_diagnostic_text())).clicked()
                     {
                         self.settings_open = true;
                     }
@@ -2732,6 +2796,7 @@ impl WidgetApp {
         ui.small("最上層在恢復／焦點生命週期及低頻檢查重套用，不呼叫啟用或搶焦點。其他 App 的全螢幕／安全桌面仍受 OS 規則限制。");
         ui.separator();
         ui.strong("官方 Codex CLI（唯讀）");
+        ui.label(self.quota_diagnostic_text());
         ui.label("留空自動尋找原生 CLI。只讀取帳戶額度；不登入、不執行工作、不讀取憑證。");
         if ui
             .text_edit_singleline(&mut self.settings.codex_path)
@@ -2749,12 +2814,11 @@ impl WidgetApp {
                     self.bridge = None;
                     self.offline = true;
                     self.status = "OFFLINE".into();
+                    self.quota_error = None;
                     self.quota.reset_continuity();
                 }
                 if ui.button("更新額度").clicked() {
-                    if let Some(b) = &self.bridge {
-                        let _ = b.commands.send(BridgeCommand::Refresh);
-                    }
+                    self.refresh_quota();
                 }
             });
         });
@@ -2985,9 +3049,12 @@ impl WidgetApp {
         let (tx, rx) = mpsc::channel();
         self.export_rx = Some(rx);
         self.notice = "正在背景匯出…".into();
+        let export_cancel = CancellationToken::new();
+        self.export_cancel = Some(export_cancel.clone());
         let spawned = std::thread::Builder::new()
             .name("quota-export".into())
-            .spawn(move || {
+            .spawn(move || export_cancel.scope(|| {
+                if cancellation::check().is_err() { return; }
                 let kind = if audit_excluded {"tokens-excluded"}else if tokens { "tokens" } else { "quota" };
                 // Export the entire selected day from a separate read-only
                 // connection. The GUI snapshot contains only a bounded page
@@ -3101,6 +3168,7 @@ impl WidgetApp {
                         .collect()
                 };
                 for event in &mut events {
+                    if cancellation::check().is_err() { return; }
                     let timestamp = event[if tokens {
                         "timestamp"
                     } else {
@@ -3118,6 +3186,7 @@ impl WidgetApp {
                     annotate_long_context_export(event, &pricing);
                 }
                 let result = (|| -> std::io::Result<()> {
+                    cancellation::check()?;
                     std::fs::create_dir_all(&folder)?;
                     if json {
                         let mut exported = serde_json::json!({
@@ -3147,7 +3216,7 @@ impl WidgetApp {
                                 } else { None }
                             });
                         display_time::annotate_timestamps(&mut exported);
-                        storage::save_json(&path,&exported)
+                        save_export(&path, |writer| serde_json::to_writer_pretty(writer, &exported).map_err(std::io::Error::other))
                     } else {
                         let columns: Vec<String> = if tokens {
                             vec![
@@ -3223,6 +3292,7 @@ impl WidgetApp {
                         let mut out = columns.join(",");
                         out.push('\n');
                         for e in &events {
+                            cancellation::check()?;
                             let row: Vec<_> = columns
                                 .iter()
                                 .map(|k| {
@@ -3246,15 +3316,15 @@ impl WidgetApp {
                             out.push_str(&row.join(","));
                             out.push('\n');
                         }
-                        std::fs::write(&path, out)?;
+                        save_export(&path, |writer| std::io::Write::write_all(writer, out.as_bytes()))?;
                         if !tokens {
                             let model_path = path.with_file_name(format!("{}-models.csv", path.file_stem().unwrap_or_default().to_string_lossy()));
                             let mut models_csv=String::from("interval_key,start_utc_unix,end_utc_unix,start_hk,end_hk,display_timezone,percentage_points,interval_known_usd,interval_cost_per_point,comparable,partial,reasons,model,events,input,cached,uncached,output,reasoning,model_known_usd,unknown_cost_events,assumed_model_events\n");
-                            for interval in &completed_export {for model in &interval.models {
+                            for interval in &completed_export { cancellation::check()?; for model in &interval.models {
                                 let values=vec![interval.history_event_key.clone(),interval.start.map(|v|v.to_string()).unwrap_or_default(),interval.end.to_string(),interval.start.and_then(display_time::datetime).unwrap_or_default(),display_time::datetime(interval.end).unwrap_or_default(),display_time::OFFSET_LABEL.into(),interval.percentage_points.to_string(),interval.known_usd.to_string(),interval.cost_per_point.map(|v|v.to_string()).unwrap_or_default(),interval.comparable.to_string(),interval.partial.to_string(),interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join("; "),model.model.clone(),model.events.to_string(),model.input.to_string(),model.cached.to_string(),model.uncached.to_string(),model.output.to_string(),model.reasoning.to_string(),model.known_usd.to_string(),model.unknown_cost_events.to_string(),model.assumed_model_events.to_string()];
                                 models_csv.push_str(&values.into_iter().map(|mut value|{if value.starts_with(['=','+','-','@','\t','\r']){value.insert(0,'\'');}format!("\"{}\"",value.replace('"',"\"\""))}).collect::<Vec<_>>().join(",")); models_csv.push('\n');
                             }}
-                            std::fs::write(model_path,models_csv)?;
+                            save_export(&model_path, |writer| std::io::Write::write_all(writer, models_csv.as_bytes()))?;
                         }
                         Ok(())
                     }
@@ -3265,7 +3335,7 @@ impl WidgetApp {
                     "匯出失敗；請檢查資料夾權限。".into()
                 };
                 let _ = tx.send(message);
-            });
+            }));
         match spawned {
             Ok(join) => self.export_join = Some(join),
             Err(error) => {
@@ -3273,6 +3343,43 @@ impl WidgetApp {
                 self.notice = format!("無法啟動背景匯出：{error}");
             }
         }
+    }
+    /// Request stop without joining or doing filesystem work on the GUI thread.
+    /// The writer lock remains held until all workers are actually finished.
+    fn begin_close(&mut self) {
+        if self.closing_since.is_some() {
+            return;
+        }
+        self.closing_since = Some(Instant::now());
+        // Drain already-received quota observations before enqueuing the final
+        // history/settings writes. No new polling/import is started from here.
+        let pending: Vec<_> = self
+            .bridge
+            .as_ref()
+            .map(|b| b.events.try_iter().collect())
+            .unwrap_or_default();
+        for event in pending {
+            self.handle_bridge_event(event);
+        }
+        self.save_state();
+        if let Some(bridge) = &self.bridge {
+            bridge.request_stop();
+        }
+        if let Some(cancel) = &self.export_cancel {
+            cancel.cancel();
+        }
+        self.worker.request_cancel_shutdown();
+        self.history_open = false;
+        self.tokens_open = false;
+        self.settings_open = false;
+    }
+    fn close_finished(&self) -> bool {
+        self.worker.is_finished()
+            && self.bridge.as_ref().is_none_or(Bridge::is_finished)
+            && self
+                .export_join
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
     }
     fn make_demo(&mut self) {
         self.status = "DEMO".into();
@@ -3296,8 +3403,81 @@ impl WidgetApp {
         )));
     }
 }
+/// Commit a new user export only after successful, uncancelled serialization.
+/// Writes use bounded chunks and an adjacent create-new temporary file. Existing
+/// exports are never replaced, including a same-millisecond name collision.
+fn save_export(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    cancellation::check()?;
+    let tmp = path.with_extension(format!(
+        "export-tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    struct Pending(std::path::PathBuf);
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    struct Checked<'a>(&'a mut std::fs::File);
+    impl Write for Checked<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // write_all retries Interrupted; use Other internally, then restore
+            // cancellation classification after serialization has unwound.
+            cancellation::check().map_err(std::io::Error::other)?;
+            self.0.write(&bytes[..bytes.len().min(64 * 1024)])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let _pending = Pending(tmp.clone());
+    let result = write(&mut Checked(&mut file));
+    cancellation::check()?;
+    result?;
+    file.sync_all()?;
+    drop(file);
+    cancellation::check()?;
+    std::fs::hard_link(&tmp, path)?;
+    Ok(())
+}
+
 impl eframe::App for WidgetApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_ready {
+            self.begin_close();
+        }
+        if self.closing_since.is_some() && !self.close_ready {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.close_ready = self.close_finished();
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("正在關閉…");
+                ui.label("已停止新增工作，正在安全結束讀取及儲存。");
+                ui.label(format!(
+                    "{} 秒",
+                    self.closing_since.unwrap().elapsed().as_secs()
+                ));
+                ui.spinner();
+            });
+            if self.close_ready {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        if self.close_ready {
+            return;
+        }
         self.pump();
         let (focus, minimized) = ctx.input(|i| {
             (
@@ -3346,7 +3526,7 @@ impl eframe::App for WidgetApp {
         [0., 0., 0., 0.]
     }
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
-        self.save_state();
+        self.begin_close();
         self.bridge = None;
         if let Some(join) = self.export_join.take() {
             let _ = join.join();
@@ -3357,6 +3537,7 @@ impl eframe::App for WidgetApp {
 
 impl Drop for WidgetApp {
     fn drop(&mut self) {
+        self.begin_close();
         if let Some(join) = self.export_join.take() {
             let _ = join.join();
         }
@@ -3472,19 +3653,23 @@ mod async_export_tests {
     }
 
     #[test]
-    fn async_export_is_joined_before_app_drop_finishes() {
+    fn async_export_close_joins_and_leaves_only_a_complete_or_cancelled_export() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = synthetic_export_app(temp.path().to_path_buf());
         app.export_day(true, true);
         drop(app);
         let files: Vec<_> = std::fs::read_dir(temp.path().join("exports"))
-            .unwrap()
+            .into_iter()
+            .flatten()
             .map(|entry| entry.unwrap().path())
             .collect();
-        assert_eq!(files.len(), 1);
-        let data: serde_json::Value = storage::load_json(&files[0]).unwrap();
-        assert_eq!(data["kind"], "tokens");
-        assert!(!data["events"].as_array().unwrap().is_empty());
+        assert!(files.len() <= 1);
+        if let Some(path) = files.first() {
+            assert_eq!(path.extension().unwrap(), "json");
+            let data: serde_json::Value = storage::load_json(path).unwrap();
+            assert_eq!(data["kind"], "tokens");
+            assert!(!data["events"].as_array().unwrap().is_empty());
+        }
     }
 }
 
@@ -5352,5 +5537,217 @@ mod database_display_tests {
                 .size,
             Some(Vec2::new(450., 530.))
         );
+    }
+}
+
+#[cfg(test)]
+mod quota_connection_recovery_tests {
+    use super::*;
+    use quota_widget::bridge::BridgeError;
+    fn app(root: &std::path::Path) -> WidgetApp {
+        let settings = Settings {
+            codex_path: root
+                .join("missing-synthetic-codex")
+                .to_string_lossy()
+                .into(),
+            sessions_path: root.join("synthetic-logs").to_string_lossy().into(),
+            import_enabled: false,
+            ..Settings::default()
+        };
+        WidgetApp::new(settings, root.into(), false, false, true, vec![])
+    }
+    #[test]
+    fn quota_refresh_reconnects_a_dead_sender_instead_of_silently_ignoring_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.connect();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app
+            .bridge
+            .as_ref()
+            .unwrap()
+            .commands
+            .send(BridgeCommand::Refresh)
+            .is_ok()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.status = "SYNTHETIC DEAD BRIDGE".into();
+        app.quota_error = Some("synthetic failed connection".into());
+        app.refresh_quota();
+        assert_eq!(app.status, "CONNECTING");
+        assert!(app.bridge.is_some());
+        assert!(!app.offline);
+        assert!(app.quota_error.is_none());
+    }
+    #[test]
+    fn quota_stopped_clears_the_bridge_and_refresh_starts_a_new_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.connect();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.bridge.is_some() {
+            app.pump();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.status, "OFFLINE");
+        assert!(app.quota_error.is_some());
+        app.refresh_quota();
+        assert!(app.bridge.is_some());
+        assert_eq!(app.status, "CONNECTING");
+    }
+    #[test]
+    fn quota_failure_remains_visible_during_token_scan_and_unrelated_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.handle_bridge_event(BridgeEvent::Error(BridgeError::NotFound));
+        app.handle_bridge_event(BridgeEvent::Stopped);
+        app.work_progress = Some((
+            WorkProgress {
+                operation: Operation::Import,
+                stage: ProgressStage::Import(ImportPhase::Reading),
+                elapsed: Duration::from_secs(9),
+                files_done: 3237,
+                files_total: 3257,
+                lines_read: 10,
+                observations: 1,
+                events: 1,
+            },
+            Instant::now(),
+        ));
+        app.notice = "another storage notice".into();
+        assert!(app.compact_progress_text().unwrap().contains("3237/3257"));
+        assert!(app
+            .compact_status_text()
+            .unwrap()
+            .contains("額度連線有問題"));
+        assert!(app
+            .quota_diagnostic_text()
+            .contains("Standalone Codex CLI not found"));
+        assert!(!app
+            .quota_diagnostic_text()
+            .contains("another storage notice"));
+    }
+    #[test]
+    fn quota_reading_arrives_while_token_load_and_scan_are_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.import_pending = true;
+        app.load_pending = true;
+        app.quota_error = Some("previous error".into());
+        app.handle_bridge_event(BridgeEvent::RateLimits(serde_json::json!({
+            "rateLimits": {"limitId":"codex", "primary": {
+                "usedPercent":14, "windowDurationMins":10080, "resetsAt":now()+86400
+            }}
+        })));
+        assert_eq!(app.status, "LIVE");
+        assert_eq!(app.selected().unwrap().remaining_percent, Some(86.));
+        assert!(app.quota_error.is_none());
+        assert!(app.import_pending && app.load_pending);
+    }
+    #[test]
+    fn demo_refresh_does_not_start_cli_or_change_offline_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.demo = true;
+        app.refresh_quota();
+        assert!(app.bridge.is_none());
+        assert!(app.offline);
+    }
+}
+
+#[cfg(test)]
+mod responsive_close_tests {
+    use super::*;
+    fn app(root: &std::path::Path) -> WidgetApp {
+        WidgetApp::new(
+            Settings {
+                import_enabled: false,
+                sessions_path: root.join("synthetic-logs").display().to_string(),
+                codex_path: root.join("missing-synthetic-codex").display().to_string(),
+                ..Settings::default()
+            },
+            root.into(),
+            true,
+            false,
+            true,
+            vec![],
+        )
+    }
+    #[test]
+    fn close_request_does_not_join_an_active_export_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let token = CancellationToken::new();
+        app.export_cancel = Some(token.clone());
+        app.export_join = Some(std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        ready_rx.recv().unwrap();
+        let start = Instant::now();
+        app.begin_close();
+        app.begin_close();
+        assert!(start.elapsed() < Duration::from_millis(200));
+        assert!(token.is_cancelled());
+        assert!(!app.close_finished());
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.close_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.closing_since.is_some());
+    }
+    #[test]
+    fn close_flushes_final_settings_and_keeps_writer_lock_until_finished() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app._lock = Some(DataLock::acquire(root.path()).unwrap());
+        app.settings.dark = false;
+        app.dirty = true;
+        app.begin_close();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.close_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(DataLock::acquire(root.path()).is_err());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["dark"], false);
+        drop(app);
+        assert!(DataLock::acquire(root.path()).is_ok());
+    }
+    #[test]
+    fn cancelled_export_leaves_no_partial_target_or_temp_file() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("day.csv");
+        let token = CancellationToken::new();
+        let result = token.scope(|| {
+            save_export(&target, |writer| {
+                writer.write_all(b"first complete row\n")?;
+                token.cancel();
+                writer.write_all(b"must not publish\n")
+            })
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn complete_export_never_replaces_an_existing_export() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("day.csv");
+        std::fs::write(&target, b"original").unwrap();
+        let result = save_export(&target, |writer| writer.write_all(b"replacement"));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

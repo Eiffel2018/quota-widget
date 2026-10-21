@@ -26,6 +26,7 @@ const LOOP_INTERVAL: Duration = Duration::from_millis(40);
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const FRAME_QUEUE_CAPACITY: usize = 32;
+const WRITE_QUEUE_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeCommand {
@@ -104,6 +105,7 @@ pub struct Bridge {
     pub commands: Sender<BridgeCommand>,
     pub events: Receiver<BridgeEvent>,
     worker: Option<JoinHandle<()>>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl Bridge {
@@ -127,12 +129,19 @@ impl Bridge {
     {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_requested);
         let worker = thread::Builder::new()
             .name("quota-read-only-bridge".into())
             .spawn(move || {
                 let _ = event_tx.send(BridgeEvent::Connecting);
-                let outcome =
-                    make_command().and_then(|command| run(command, &command_rx, &event_tx, timing));
+                let outcome = if worker_stop.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    make_command().and_then(|command| {
+                        run(command, &command_rx, &event_tx, &worker_stop, timing)
+                    })
+                };
                 if let Err(error) = outcome {
                     let _ = event_tx.send(BridgeEvent::Error(error));
                 }
@@ -143,6 +152,7 @@ impl Bridge {
                 commands,
                 events,
                 worker: Some(worker),
+                stop_requested,
             },
             Err(_) => {
                 // Thread failure must also be visible, without exposing OS details.
@@ -153,18 +163,37 @@ impl Bridge {
                     commands,
                     events,
                     worker: None,
+                    stop_requested,
                 }
             }
         }
     }
 
     pub fn refresh(&self) {
-        let _ = self.commands.send(BridgeCommand::Refresh);
+        if !self.stop_requested.load(Ordering::Acquire) {
+            let _ = self.commands.send(BridgeCommand::Refresh);
+        }
     }
 
-    /// Idempotent. This never sends logout or terminates an unrelated process.
+    /// Signals cancellation without joining. Safe to call from the UI thread.
+    /// The atomic flag takes priority over any queued refresh commands.
+    pub fn request_stop(&self) {
+        if !self.stop_requested.swap(true, Ordering::AcqRel) {
+            let _ = self.commands.send(BridgeCommand::Stop);
+        }
+    }
+
+    /// A finished worker has already killed and reaped its exact owned child.
+    /// No handle also means finished, including after spawn failure or stop().
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Idempotent blocking join, also used by Drop as a final cleanup safeguard.
+    /// UI callers should request_stop(), poll is_finished(), then call stop().
+    /// This never sends logout or terminates an unrelated process.
     pub fn stop(&mut self) {
-        let _ = self.commands.send(BridgeCommand::Stop);
+        self.request_stop();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -501,6 +530,46 @@ fn write_json(writer: &mut impl Write, message: &Value) -> Result<(), BridgeErro
         .map_err(|_| BridgeError::Transport)
 }
 
+/// Pipe writes must never hold up cancellation or the request timeout. A child
+/// can keep stdout open while ceasing to read stdin, filling its input pipe.
+/// This bounded queue leaves the supervising worker free to kill/reap it.
+struct PipeWriter {
+    messages: SyncSender<Value>,
+    failed: Arc<AtomicBool>,
+}
+
+impl PipeWriter {
+    fn spawn(mut writer: impl Write + Send + 'static) -> Result<Self, BridgeError> {
+        let (messages, requests) = mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
+        let failed = Arc::new(AtomicBool::new(false));
+        let thread_failed = Arc::clone(&failed);
+        // Like the reader, this thread owns only a pipe. Killing the owned child
+        // releases normal blocked writes. Do not join pipe threads: an unrelated
+        // descendant that inherited a pipe must not delay the supervisor's stop.
+        let _writer = thread::Builder::new()
+            .name("quota-protocol-writer".into())
+            .spawn(move || {
+                while let Ok(message) = requests.recv() {
+                    if write_json(&mut writer, &message).is_err() {
+                        thread_failed.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| BridgeError::StartFailed)?;
+        Ok(Self { messages, failed })
+    }
+
+    fn send(&self, message: Value) -> Result<(), BridgeError> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(BridgeError::Transport);
+        }
+        self.messages
+            .try_send(message)
+            .map_err(|_| BridgeError::Transport)
+    }
+}
+
 fn initialize() -> Value {
     json!({"id": 1, "method": "initialize", "params": {
         "clientInfo": {"name": "quota_widget", "title": "Quota Widget", "version": env!("CARGO_PKG_VERSION")}
@@ -530,8 +599,13 @@ fn run(
     mut command: Command,
     commands: &Receiver<BridgeCommand>,
     events: &Sender<BridgeEvent>,
+    stop_requested: &AtomicBool,
     timing: Timing,
 ) -> Result<(), BridgeError> {
+    // Discovery may have been underway when the UI asked to close/reconnect.
+    if stop_requested.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let work = WorkingDirectory::create()?;
     command
         .current_dir(&work.0)
@@ -543,8 +617,14 @@ fn run(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    if stop_requested.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let mut child = OwnedChild(command.spawn().map_err(|_| BridgeError::StartFailed)?);
-    let mut input = child.0.stdin.take().ok_or(BridgeError::Transport)?;
+    if stop_requested.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let input = child.0.stdin.take().ok_or(BridgeError::Transport)?;
     let output = child.0.stdout.take().ok_or(BridgeError::Transport)?;
     let (line_tx, lines) = mpsc::sync_channel(FRAME_QUEUE_CAPACITY);
     let overflow = Arc::new(AtomicBool::new(false));
@@ -555,7 +635,8 @@ fn run(
         .name("quota-protocol-reader".into())
         .spawn(move || read_frames(output, line_tx, reader_overflow))
         .map_err(|_| BridgeError::StartFailed)?;
-    write_json(&mut input, &initialize())?;
+    let input = PipeWriter::spawn(input)?;
+    input.send(initialize())?;
     let mut pending = Some(Pending {
         id: 1,
         since: Instant::now(),
@@ -568,6 +649,9 @@ fn run(
     let mut last_sent = Instant::now();
     let mut next_poll = last_sent + timing.poll;
     loop {
+        if stop_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
         // Bound each batch so a flood of Refresh cannot starve Stop or I/O.
         for _ in 0..256 {
             match commands.try_recv() {
@@ -579,6 +663,9 @@ fn run(
         if overflow.load(Ordering::Acquire) {
             return Err(BridgeError::Protocol);
         }
+        if input.failed.load(Ordering::Acquire) {
+            return Err(BridgeError::Transport);
+        }
         if let Some(request) = pending {
             if request.since.elapsed() >= timing.timeout {
                 return Err(BridgeError::Timeout);
@@ -589,7 +676,7 @@ fn run(
             && (Instant::now() >= next_poll || refresh_pending)
             && last_sent.elapsed() >= timing.refresh_floor
         {
-            write_json(&mut input, &quota_request(next_id))?;
+            input.send(quota_request(next_id))?;
             last_sent = Instant::now();
             pending = Some(Pending {
                 id: next_id,
@@ -641,7 +728,7 @@ fn run(
                     if !result.is_object() {
                         return Err(BridgeError::Protocol);
                     }
-                    write_json(&mut input, &json!({"method": "initialized", "params": {}}))?;
+                    input.send(json!({"method": "initialized", "params": {}}))?;
                     initialized = true;
                     let _ = events.send(BridgeEvent::Connected);
                     // First quota read need not wait for the refresh click floor.
@@ -789,6 +876,90 @@ mod tests {
         assert!(!is_quota_result(&json!({"unexpected": 100})));
     }
 
+    #[test]
+    fn missing_worker_handle_is_finished_and_repeated_stop_is_safe() {
+        let (commands, _) = mpsc::channel();
+        let (_, events) = mpsc::channel();
+        let mut bridge = Bridge {
+            commands,
+            events,
+            worker: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(bridge.is_finished());
+        bridge.request_stop();
+        bridge.request_stop();
+        bridge.stop();
+        bridge.stop();
+        assert!(bridge.is_finished());
+    }
+
+    #[test]
+    fn blocked_pipe_writes_have_bounded_nonblocking_backpressure() {
+        struct BlockedWriter {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl Write for BlockedWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.entered.send(()).unwrap();
+                let _ = self.release.recv();
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (entered, writing) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let writer = PipeWriter::spawn(BlockedWriter {
+            entered,
+            release: blocked,
+        })
+        .unwrap();
+        writer.send(initialize()).unwrap();
+        writing.recv_timeout(Duration::from_secs(1)).unwrap();
+        for id in 0..WRITE_QUEUE_CAPACITY {
+            writer.send(quota_request(id as u64)).unwrap();
+        }
+        let start = Instant::now();
+        let outcome = writer.send(quota_request(100));
+        let elapsed = start.elapsed();
+        release.send(()).unwrap();
+        assert_eq!(outcome, Err(BridgeError::Transport));
+        assert!(elapsed < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stop_during_command_preparation_is_nonblocking_and_never_spawns() {
+        let (entered, preparing) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let mut bridge = Bridge::spawn_worker(
+            move || {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                // Deliberately nonexistent: reaching spawn would report StartFailed.
+                Ok(Command::new("/synthetic/no-cli-may-be-started"))
+            },
+            Timing::default(),
+        );
+        preparing.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        bridge.request_stop();
+        bridge.request_stop();
+        let elapsed = start.elapsed();
+        let finished_while_preparing = bridge.is_finished();
+        release.send(()).unwrap();
+        bridge.stop();
+        assert!(elapsed < Duration::from_millis(100));
+        assert!(!finished_while_preparing);
+        assert!(bridge.is_finished());
+        assert!(bridge
+            .events
+            .try_iter()
+            .all(|event| !matches!(event, BridgeEvent::Error(_))));
+    }
+
     #[cfg(unix)]
     struct Mock {
         bridge: Bridge,
@@ -879,6 +1050,48 @@ mod tests {
             }
             panic!("mock error timeout")
         }
+
+        fn wait_request(&self, method: &str) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if fs::read_to_string(&self.transcript)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|request| request["method"] == method)
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("mock request timeout");
+        }
+
+        fn assert_reaped(&self) {
+            #[cfg(target_os = "linux")]
+            {
+                let pid = fs::read_to_string(&self.pidfile).unwrap();
+                assert!(
+                    !Path::new("/proc").join(pid.trim()).exists(),
+                    "mock child was not reaped"
+                );
+            }
+        }
+
+        fn stop_responsively(&mut self) {
+            let start = Instant::now();
+            self.bridge.request_stop();
+            self.bridge.request_stop();
+            assert!(start.elapsed() < Duration::from_millis(100));
+            while !self.bridge.is_finished() && start.elapsed() < Duration::from_secs(1) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(self.bridge.is_finished(), "bridge cleanup took too long");
+            self.bridge.stop();
+            self.bridge.stop();
+            assert!(self.bridge.is_finished());
+            self.assert_reaped();
+        }
     }
 
     #[cfg(unix)]
@@ -929,14 +1142,7 @@ mod tests {
         assert_eq!(requests[0]["method"], "initialize");
         assert_eq!(requests[1]["method"], "initialized");
         assert_eq!(requests[2]["method"], "account/rateLimits/read");
-        #[cfg(target_os = "linux")]
-        {
-            let pid = fs::read_to_string(&mock.pidfile).unwrap();
-            assert!(
-                !Path::new("/proc").join(pid.trim()).exists(),
-                "mock child was not reaped"
-            );
-        }
+        mock.assert_reaped();
     }
 
     #[cfg(unix)]
@@ -1041,6 +1247,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unavailable_quota_keeps_bridge_alive_and_refresh_retries_the_read() {
+        let mut mock = Mock::spawn("error", Duration::from_secs(2), Duration::from_secs(30));
+        assert_eq!(mock.wait_error(), BridgeError::Unavailable);
+        assert!(!mock.bridge.is_finished());
+        mock.bridge.commands.send(BridgeCommand::Refresh).unwrap();
+        assert_eq!(mock.wait_error(), BridgeError::Unavailable);
+        assert!(!mock.bridge.is_finished());
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|request| request["method"] == "account/rateLimits/read")
+                .count(),
+            2
+        );
+        mock.stop_responsively();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_transport_errors_disconnect_refresh_sender_after_reaping() {
+        for (mode, expected) in [
+            ("timeout", BridgeError::Timeout),
+            ("read_timeout", BridgeError::Timeout),
+            ("malformed", BridgeError::Protocol),
+            ("server_request", BridgeError::UnsupportedRequest),
+        ] {
+            let mut mock = Mock::spawn(mode, Duration::from_millis(160), Duration::from_secs(30));
+            assert_eq!(mock.wait_error(), expected);
+            // Errors are emitted only after run() has returned and reaped its
+            // child. Join completes the epilogue without requesting a retry.
+            mock.bridge.worker.take().unwrap().join().unwrap();
+            assert!(mock.bridge.is_finished());
+            assert!(mock.bridge.commands.send(BridgeCommand::Refresh).is_err());
+            assert!(mock
+                .bridge
+                .events
+                .try_iter()
+                .any(|event| matches!(event, BridgeEvent::Stopped)));
+            mock.assert_reaped();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timeout_also_applies_to_quota_reads_after_handshake() {
         let mock = Mock::spawn(
             "read_timeout",
@@ -1060,10 +1310,33 @@ mod tests {
         );
         assert_eq!(mock.wait_error(), BridgeError::Timeout);
         mock.bridge.stop();
+        mock.assert_reaped();
+        for (mode, method) in [
+            ("timeout", "initialize"),
+            ("read_timeout", "account/rateLimits/read"),
+        ] {
+            let mut mock = Mock::spawn(mode, Duration::from_secs(20), Duration::from_secs(30));
+            mock.wait_request(method);
+            mock.stop_responsively();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_while_waiting_for_poll_reaps_child() {
+        let mut mock = Mock::spawn("normal", Duration::from_secs(20), Duration::from_secs(30));
+        mock.next_quota();
+        mock.stop_responsively();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_takes_priority_over_refresh_backlog() {
         let mut mock = Mock::spawn("timeout", Duration::from_secs(20), Duration::from_secs(30));
-        thread::sleep(Duration::from_millis(80));
-        let start = Instant::now();
-        mock.bridge.stop();
-        assert!(start.elapsed() < Duration::from_secs(1));
+        mock.wait_request("initialize");
+        for _ in 0..100_000 {
+            mock.bridge.refresh();
+        }
+        mock.stop_responsively();
     }
 }

@@ -5,6 +5,7 @@
 //! the data-directory writer lock for every migration/import. Read-only opens do
 //! not create a database. Full-range queries are available for compatibility;
 //! paged queries do not hydrate historical audit shards.
+use crate::cancellation::{self, CancellationToken};
 use crate::tokens::{
     self, DirtyExport, Pricing, StoreHeader, ThreadShard, TokenEvent, TokenStore, TokenSummary,
 };
@@ -110,29 +111,148 @@ impl FromSql for Counter {
     }
 }
 fn error(error: impl std::fmt::Display) -> io::Error {
-    io::Error::other(error.to_string())
+    // Serde and SQLite erase I/O error kinds. Preserve our public cancellation
+    // result, without feeding Interrupted into retrying reader/writer helpers.
+    cancellation::check()
+        .err()
+        .unwrap_or_else(|| io::Error::other(error.to_string()))
+}
+
+const IO_CHUNK: usize = 64 * 1024;
+
+struct CheckedReader<R>(R);
+impl<R: Read> Read for CheckedReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        cancellation::check().map_err(|e| io::Error::other(e.to_string()))?;
+        let limit = output.len().min(IO_CHUNK);
+        self.0.read(&mut output[..limit])
+    }
+}
+struct CheckedWriter<W> {
+    inner: W,
+    since_check: usize,
+}
+impl<W: Write> CheckedWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            since_check: IO_CHUNK,
+        }
+    }
+}
+impl<W: Write> Write for CheckedWriter<W> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if self.since_check >= IO_CHUNK {
+            cancellation::check().map_err(|e| io::Error::other(e.to_string()))?;
+            self.since_check = 0;
+        }
+        let count = self.inner.write(&input[..input.len().min(IO_CHUNK)])?;
+        self.since_check = self.since_check.saturating_add(count);
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        cancellation::check().map_err(|e| io::Error::other(e.to_string()))?;
+        self.inner.flush()
+    }
+}
+fn checked_row<T>(row: rusqlite::Result<T>) -> io::Result<T> {
+    cancellation::check()?;
+    row.map_err(error)
+}
+fn sqlite_busy(attempt: i32) -> bool {
+    if attempt >= 500 || cancellation::check().is_err() {
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(10));
+    cancellation::check().is_ok()
+}
+
+// Rollback is mandatory cleanup. Suppress the cancelled scope while dropping a
+// transaction so the SQLite progress handler cannot interrupt its rollback.
+pub(crate) struct DbTransaction<'a>(Option<Transaction<'a>>);
+impl<'a> std::ops::Deref for DbTransaction<'a> {
+    type Target = Transaction<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("live transaction")
+    }
+}
+impl DbTransaction<'_> {
+    fn commit(self) -> io::Result<()> {
+        cancellation::check()?;
+        // Keep ownership until COMMIT succeeds so any error uses our protected
+        // rollback, including cancellation reported by SQLite during COMMIT.
+        self.execute_batch("COMMIT").map_err(error)
+    }
+}
+impl Drop for DbTransaction<'_> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            CancellationToken::new().scope(|| drop(tx));
+        }
+    }
 }
 fn conflict(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, message)
 }
 fn encode<T: Serialize + ?Sized>(value: &T) -> io::Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(error)
+    cancellation::check()?;
+    let mut writer = CheckedWriter::new(Vec::new());
+    serde_json::to_writer(&mut writer, value).map_err(error)?;
+    cancellation::check()?;
+    Ok(writer.inner)
 }
-fn hash(bytes: &[u8]) -> Vec<u8> {
-    Sha256::digest(bytes).to_vec()
+fn hash(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let mut digest = Sha256::new();
+    for chunk in bytes.chunks(IO_CHUNK) {
+        cancellation::check()?;
+        digest.update(chunk);
+    }
+    cancellation::check()?;
+    Ok(digest.finalize().to_vec())
 }
 fn compress(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    cancellation::check()?;
     let mut out = ZlibEncoder::new(Vec::new(), Compression::new(6));
-    out.write_all(bytes)?;
-    out.finish()
+    for chunk in bytes.chunks(IO_CHUNK) {
+        cancellation::check()?;
+        out.write_all(chunk)?;
+    }
+    cancellation::check()?;
+    let result = out.finish()?;
+    cancellation::check()?;
+    Ok(result)
 }
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-    serde_json::from_reader(ZlibDecoder::new(bytes)).map_err(error)
+    cancellation::check()?;
+    let value = serde_json::from_reader(BufReader::with_capacity(
+        IO_CHUNK,
+        CheckedReader(ZlibDecoder::new(bytes)),
+    ))
+    .map_err(error)?;
+    cancellation::check()?;
+    Ok(value)
+}
+fn json_decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+    cancellation::check()?;
+    let value = if bytes.len() <= IO_CHUNK {
+        serde_json::from_slice(bytes).map_err(error)?
+    } else {
+        serde_json::from_reader(BufReader::with_capacity(IO_CHUNK, CheckedReader(bytes)))
+            .map_err(error)?
+    };
+    cancellation::check()?;
+    Ok(value)
+}
+fn to_value<T: Serialize + ?Sized>(value: &T) -> io::Result<serde_json::Value> {
+    // serde_json's in-memory Value serializer has no cooperative I/O hooks.
+    // The checked stream bounds cancellation latency for large evidence shards.
+    json_decode(&encode(value)?)
 }
 fn revision_bytes(revision: u64) -> Vec<u8> {
     revision.to_be_bytes().to_vec()
 }
 fn read_revision(conn: &Connection) -> io::Result<Option<u64>> {
+    cancellation::check()?;
     let value: Option<Vec<u8>> = conn
         .query_row("SELECT revision FROM state WHERE singleton=1", [], |row| {
             row.get(0)
@@ -150,6 +270,7 @@ fn read_revision(conn: &Connection) -> io::Result<Option<u64>> {
         .transpose()
 }
 fn intern(tx: &Transaction<'_>, value: &str) -> io::Result<i64> {
+    cancellation::check()?;
     tx.execute(
         "INSERT INTO strings(value) VALUES(?) ON CONFLICT(value) DO NOTHING",
         [value],
@@ -181,7 +302,7 @@ fn project_event(
 }
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenEvent> {
     let flags: String = row.get(15)?;
-    let partial_flags = serde_json::from_str(&flags).map_err(|e| {
+    let partial_flags = json_decode(flags.as_bytes()).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(e))
     })?;
     Ok(TokenEvent {
@@ -213,9 +334,13 @@ pub struct TokenDb {
     _shared_read_lock: Option<File>,
 }
 impl TokenDb {
-    pub(crate) fn read_snapshot(&self) -> io::Result<Option<Transaction<'_>>> {
+    pub(crate) fn read_snapshot(&self) -> io::Result<Option<DbTransaction<'_>>> {
+        cancellation::check()?;
         if self.conn.is_autocommit() {
-            self.conn.unchecked_transaction().map(Some).map_err(error)
+            self.conn
+                .unchecked_transaction()
+                .map(|tx| Some(DbTransaction(Some(tx))))
+                .map_err(error)
         } else {
             Ok(None)
         }
@@ -231,6 +356,7 @@ impl TokenDb {
     }
     /// Explicit low-level open. Only a writable open may create schema.
     pub fn open(path: &Path, writable: bool) -> io::Result<Self> {
+        cancellation::check()?;
         let existed = path.exists();
         let flags = if writable {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
@@ -261,7 +387,9 @@ impl TokenDb {
             Connection::open_with_flags(path, flags)
         }
         .map_err(error)?;
-        conn.busy_timeout(Duration::from_secs(5)).map_err(error)?;
+        conn.busy_handler(Some(sqlite_busy)).map_err(error)?;
+        conn.progress_handler(1000, Some(|| cancellation::check().is_err()))
+            .map_err(error)?;
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(error)?;
         conn.pragma_update(None, "cache_size", -16384_i64)
@@ -275,8 +403,16 @@ impl TokenDb {
                 .map_err(error)?;
             conn.pragma_update(None, "wal_autocheckpoint", 1000_i64)
                 .map_err(error)?;
-            if !existed {
-                conn.execute_batch(SCHEMA).map_err(error)?;
+            let empty_schema: bool = conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','index','view','trigger'))",
+                [], |row| row.get(0),
+            ).map_err(error)?;
+            if !existed || empty_schema {
+                // A cancelled first open may leave an empty SQLite file. Schema
+                // creation is atomic and can safely restart only when empty.
+                let tx = DbTransaction(Some(conn.unchecked_transaction().map_err(error)?));
+                tx.execute_batch(SCHEMA).map_err(error)?;
+                tx.commit()?;
             }
         }
         if existed {
@@ -294,6 +430,7 @@ impl TokenDb {
                 ));
             }
         }
+        cancellation::check()?;
         Ok(Self {
             conn,
             path: path.to_owned(),
@@ -303,6 +440,7 @@ impl TokenDb {
         })
     }
     pub fn is_active(&self) -> io::Result<bool> {
+        cancellation::check()?;
         self.conn
             .query_row("SELECT active FROM state WHERE singleton=1", [], |row| {
                 row.get(0)
@@ -315,7 +453,9 @@ impl TokenDb {
         read_revision(&self.conn)
     }
     pub fn header(&self) -> io::Result<StoreHeader> {
-        Ok((*self.header_shared()?).clone())
+        let header = (*self.header_shared()?).clone();
+        cancellation::check()?;
+        Ok(header)
     }
     pub(crate) fn header_shared(&self) -> io::Result<Arc<StoreHeader>> {
         let _snapshot = self.read_snapshot()?;
@@ -348,7 +488,7 @@ impl TokenDb {
             })
             .map_err(error)?
         {
-            let (key, bytes) = row.map_err(error)?;
+            let (key, bytes) = checked_row(row)?;
             sources.insert(key, decode(&bytes)?);
         }
         object.insert("sources".into(), serde_json::Value::Object(sources));
@@ -361,10 +501,10 @@ impl TokenDb {
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(error)?
         {
-            quota.extend(decode::<Vec<serde_json::Value>>(&row.map_err(error)?)?);
+            quota.extend(decode::<Vec<serde_json::Value>>(&checked_row(row)?)?);
         }
         object.insert("quota".into(), serde_json::Value::Array(quota));
-        let header: StoreHeader = serde_json::from_value(header).map_err(error)?;
+        let header: StoreHeader = json_decode(&encode(&header)?)?;
         if revision != Some(header.revision) {
             return Err(error("Header revision does not match transaction revision"));
         }
@@ -373,12 +513,13 @@ impl TokenDb {
         Ok(header)
     }
     pub fn thread_ids(&self) -> io::Result<Vec<String>> {
+        cancellation::check()?;
         self.conn
             .prepare("SELECT thread_id FROM threads ORDER BY thread_id")
             .map_err(error)?
             .query_map([], |row| row.get(0))
             .map_err(error)?
-            .map(|row| row.map_err(error))
+            .map(checked_row)
             .collect()
     }
     pub fn load_thread(&self, thread_id: &str) -> io::Result<Option<ThreadShard>> {
@@ -401,7 +542,7 @@ impl TokenDb {
             .map_err(error)?
             .query_map([thread_id], event_from_row)
             .map_err(error)?
-            .map(|row| row.map_err(error))
+            .map(checked_row)
             .collect::<io::Result<_>>()?;
         Ok(Some(shard))
     }
@@ -437,11 +578,12 @@ impl TokenDb {
             .query_map(rusqlite::params_from_iter(args), event_from_row)
             .map_err(error)?;
         for row in rows {
-            let mut event = row.map_err(error)?;
+            let mut event = checked_row(row)?;
             if project_event(&header, &policy, &mut event) && !visit(event)? {
                 break;
             }
         }
+        cancellation::check()?;
         Ok(())
     }
     /// Inclusive start and exclusive end, identical to TokenStore::select_events.
@@ -524,12 +666,12 @@ impl TokenDb {
     pub fn days(&self) -> io::Result<Vec<i64>> {
         let _snapshot = self.read_snapshot()?;
         let enabled = !self.header_shared()?.response_threads.is_empty();
-        self.conn.prepare("SELECT DISTINCT p.day FROM day_counts p JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0) ORDER BY p.day").map_err(error)?.query_map([enabled],|row|row.get(0)).map_err(error)?.map(|row|row.map_err(error)).collect()
+        self.conn.prepare("SELECT DISTINCT p.day FROM day_counts p JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0) ORDER BY p.day").map_err(error)?.query_map([enabled],|row|row.get(0)).map_err(error)?.map(checked_row).collect()
     }
     pub fn models(&self) -> io::Result<Vec<String>> {
         let _snapshot = self.read_snapshot()?;
         let enabled = !self.header_shared()?.response_threads.is_empty();
-        self.conn.prepare("SELECT DISTINCT m.value FROM model_counts p JOIN strings m ON m.sid=p.model_sid JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0) ORDER BY m.value").map_err(error)?.query_map([enabled],|row|row.get(0)).map_err(error)?.map(|row|row.map_err(error)).collect()
+        self.conn.prepare("SELECT DISTINCT m.value FROM model_counts p JOIN strings m ON m.sid=p.model_sid JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0) ORDER BY m.value").map_err(error)?.query_map([enabled],|row|row.get(0)).map_err(error)?.map(checked_row).collect()
     }
     pub fn latest_per_thread(
         &self,
@@ -548,7 +690,7 @@ impl TokenDb {
             .query_map(params![include_excluded, enabled], event_from_row)
             .map_err(error)?
         {
-            let mut event = row.map_err(error)?;
+            let mut event = checked_row(row)?;
             if project_event(&header, &policy, &mut event) {
                 result.insert(event.session.clone(), event);
             }
@@ -577,7 +719,7 @@ impl TokenDb {
             )
             .map_err(error)?
         {
-            let mut event = row.map_err(error)?;
+            let mut event = checked_row(row)?;
             if project_event(&header, &policy, &mut event) {
                 result.insert(event.session.clone(), event);
             }
@@ -585,6 +727,7 @@ impl TokenDb {
         Ok(result)
     }
     pub fn turn_usage(&self) -> io::Result<BTreeMap<String, crate::tokens::TaskTurnUsage>> {
+        cancellation::check()?;
         let mut result = BTreeMap::new();
         let mut stmt = self
             .conn
@@ -596,7 +739,7 @@ impl TokenDb {
             })
             .map_err(error)?
         {
-            let (id, bytes) = row.map_err(error)?;
+            let (id, bytes) = checked_row(row)?;
             result.insert(id, decode(&bytes)?);
         }
         Ok(result)
@@ -607,7 +750,7 @@ impl TokenDb {
         expected_revision: u64,
     ) -> io::Result<CommitStats> {
         let payload = encode(export)?;
-        let digest = hash(&payload);
+        let digest = hash(&payload)?;
         let operation_id = format!(
             "{expected_revision}:{}:{}",
             export.header.revision,
@@ -621,7 +764,7 @@ impl TokenDb {
         expected_revision: u64,
         operation_id: &str,
     ) -> io::Result<CommitStats> {
-        let digest = hash(&encode(export)?);
+        let digest = hash(&encode(export)?)?;
         self.commit_inner(export, expected_revision, operation_id, digest)
     }
     fn commit_inner(
@@ -631,6 +774,7 @@ impl TokenDb {
         operation_id: &str,
         payload_digest: Vec<u8>,
     ) -> io::Result<CommitStats> {
+        cancellation::check()?;
         if !self.writable {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -638,9 +782,11 @@ impl TokenDb {
             ));
         }
         let old_header = self.header_shared().ok();
+        cancellation::check()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map(|tx| DbTransaction(Some(tx)))
             .map_err(error)?;
         if let Some((digest, revision)) = tx
             .query_row(
@@ -684,6 +830,7 @@ impl TokenDb {
         };
         persist_header(&tx, &export.header, &mut stats)?;
         for shard in &export.threads {
+            cancellation::check()?;
             persist_thread(&tx, shard, &mut stats)?;
         }
         tx.execute("INSERT INTO state VALUES(1,?,?,1) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,active=1",params![FORMAT_VERSION,revision_bytes(export.header.revision)]).map_err(error)?;
@@ -696,7 +843,7 @@ impl TokenDb {
             ],
         )
         .map_err(error)?;
-        tx.commit().map_err(error)?;
+        tx.commit()?;
         *self.header_cache.borrow_mut() = None;
         Ok(stats)
     }
@@ -704,12 +851,14 @@ impl TokenDb {
         let _snapshot = self.read_snapshot()?;
         let mut store = TokenStore::from_header(self.header()?);
         for id in self.thread_ids()? {
+            cancellation::check()?;
             store.hydrate_thread(
                 self.load_thread(&id)?
                     .ok_or_else(|| error("Missing thread during export"))?,
             )?;
         }
-        store.finish_hydration_for_export();
+        store.finish_hydration_for_export_checked()?;
+        cancellation::check()?;
         Ok(store)
     }
     pub fn export_json(&self, destination: &Path) -> io::Result<()> {
@@ -719,9 +868,10 @@ impl TokenDb {
                 "Export destination exists; original preserved",
             ));
         }
-        self.export_store()?.save(destination)
+        self.export_store()?.save_new(destination)
     }
     pub fn integrity_check(&self) -> io::Result<()> {
+        cancellation::check()?;
         let check: String = self
             .conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -745,6 +895,7 @@ impl TokenDb {
         Ok(())
     }
     pub fn checkpoint(&self) -> io::Result<()> {
+        cancellation::check()?;
         if self.writable {
             self.conn
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -759,12 +910,14 @@ fn persist_header(
     header: &StoreHeader,
     stats: &mut CommitStats,
 ) -> io::Result<()> {
-    let policy_ids: BTreeSet<_> = header
-        .response_threads
-        .union(&header.anonymous_threads)
-        .cloned()
-        .collect();
+    cancellation::check()?;
+    let mut policy_ids = BTreeSet::new();
+    for id in header.response_threads.union(&header.anonymous_threads) {
+        cancellation::check()?;
+        policy_ids.insert(id.clone());
+    }
     for id in &policy_ids {
+        cancellation::check()?;
         tx.execute("INSERT INTO thread_policy VALUES(?,?,?) ON CONFLICT(thread_id) DO UPDATE SET response=excluded.response,anonymous=excluded.anonymous WHERE response!=excluded.response OR anonymous!=excluded.anonymous",params![id,header.response_threads.contains(id),header.anonymous_threads.contains(id)]).map_err(error)?;
     }
     let old_ids: Vec<String> = tx
@@ -772,15 +925,16 @@ fn persist_header(
         .map_err(error)?
         .query_map([], |row| row.get(0))
         .map_err(error)?
-        .map(|row| row.map_err(error))
+        .map(checked_row)
         .collect::<io::Result<_>>()?;
     for id in old_ids {
+        cancellation::check()?;
         if !policy_ids.contains(&id) {
             tx.execute("DELETE FROM thread_policy WHERE thread_id=?", [id])
                 .map_err(error)?;
         }
     }
-    let mut value = serde_json::to_value(header).map_err(error)?;
+    let mut value = to_value(header)?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| error("Invalid token header"))?;
@@ -791,8 +945,9 @@ fn persist_header(
         .as_object()
         .ok_or_else(|| error("Invalid source cursor map"))?
     {
+        cancellation::check()?;
         let body = encode(cursor)?;
-        let digest = hash(&body);
+        let digest = hash(&body)?;
         let old: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT digest FROM source_cursors WHERE source_key=?",
@@ -814,9 +969,10 @@ fn persist_header(
         .map_err(error)?
         .query_map([], |r| r.get(0))
         .map_err(error)?
-        .map(|r| r.map_err(error))
+        .map(checked_row)
         .collect::<io::Result<_>>()?;
     for key in old_keys {
+        cancellation::check()?;
         if !sources.as_object().expect("checked").contains_key(&key) {
             tx.execute("DELETE FROM source_cursors WHERE source_key=?", [key])
                 .map_err(error)?;
@@ -824,8 +980,9 @@ fn persist_header(
     }
     object.remove("quota");
     for (ordinal, chunk) in header.quota.chunks(QUOTA_CHUNK).enumerate() {
+        cancellation::check()?;
         let body = encode(chunk)?;
-        let digest = hash(&body);
+        let digest = hash(&body)?;
         let old: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT digest FROM quota_chunks WHERE ordinal=?",
@@ -847,7 +1004,7 @@ fn persist_header(
     )
     .map_err(error)?;
     let body = encode(&value)?;
-    let digest = hash(&body);
+    let digest = hash(&body)?;
     let old: Option<Vec<u8>> = tx
         .query_row(
             "SELECT digest FROM global_parts WHERE name='header'",
@@ -868,7 +1025,7 @@ fn persist_thread(
     shard: &ThreadShard,
     stats: &mut CommitStats,
 ) -> io::Result<()> {
-    let digest = hash(&encode(shard)?);
+    let digest = hash(&encode(shard)?)?;
     let old: Option<Vec<u8>> = tx
         .query_row(
             "SELECT digest FROM threads WHERE thread_id=?",
@@ -880,7 +1037,7 @@ fn persist_thread(
     if old.as_ref() == Some(&digest) {
         return Ok(());
     }
-    let mut raw = serde_json::to_value(shard).map_err(error)?;
+    let mut raw = to_value(shard)?;
     raw.as_object_mut()
         .ok_or_else(|| error("Invalid thread shard"))?
         .insert("events".into(), serde_json::json!([]));
@@ -905,9 +1062,10 @@ fn persist_thread(
         .map_err(error)?
         .query_map([key], event_from_row)
         .map_err(error)?
-        .map(|row| row.map(|e| (e.id.clone(), e)).map_err(error))
+        .map(|row| checked_row(row).map(|e| (e.id.clone(), e)))
         .collect::<io::Result<_>>()?;
     for table in ["event_partitions", "day_counts", "model_counts"] {
+        cancellation::check()?;
         tx.execute(&format!("DELETE FROM {table} WHERE thread_key=?"), [key])
             .map_err(error)?;
     }
@@ -918,6 +1076,7 @@ fn persist_thread(
     tx.execute("DELETE FROM events WHERE thread_key=?", [key])
         .map_err(error)?;
     for (ordinal, event) in shard.events.iter().enumerate() {
+        cancellation::check()?;
         let old = old_events.remove(&event.id);
         if old.as_ref() != Some(event) {
             stats.event_changes.push((old, Some(event.clone())));
@@ -931,10 +1090,8 @@ fn persist_thread(
         let model = intern(tx, &event.model)?;
         let effort = optional_intern(tx, event.reasoning_effort.as_deref())?;
         let kind = optional_intern(tx, event.source_kind.as_deref())?;
-        let flags = intern(
-            tx,
-            &serde_json::to_string(&event.partial_flags).map_err(error)?,
-        )?;
+        let flags_json = String::from_utf8(encode(&event.partial_flags)?).map_err(error)?;
+        let flags = intern(tx, &flags_json)?;
         let excluded = event.is_excluded_auto_review();
         let anonymous = event.source_kind.as_deref() != Some("token_usage_record")
             && event
@@ -966,6 +1123,7 @@ fn persist_thread(
         stats.events_written += 1;
     }
     for ((excluded, anonymous), (count, latest, _, _, first)) in partitions {
+        cancellation::check()?;
         tx.execute(
             "INSERT INTO event_partitions VALUES(?,?,?,?,?,?)",
             params![key, excluded, anonymous, count, latest, first],
@@ -973,6 +1131,7 @@ fn persist_thread(
         .map_err(error)?;
     }
     for ((day, excluded, anonymous), count) in days {
+        cancellation::check()?;
         tx.execute(
             "INSERT INTO day_counts VALUES(?,?,?,?,?)",
             params![key, day, excluded, anonymous, count],
@@ -980,6 +1139,7 @@ fn persist_thread(
         .map_err(error)?;
     }
     for ((model, excluded, anonymous), count) in models {
+        cancellation::check()?;
         tx.execute(
             "INSERT INTO model_counts VALUES(?,?,?,?,?)",
             params![key, model, excluded, anonymous, count],
@@ -987,6 +1147,7 @@ fn persist_thread(
         .map_err(error)?;
     }
     for old in old_events.into_values() {
+        cancellation::check()?;
         stats.event_changes.push((Some(old), None));
     }
     stats.threads_written += 1;
@@ -996,17 +1157,20 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 pub fn fingerprint(path: &Path) -> io::Result<SourceFingerprint> {
+    cancellation::check()?;
     let before = fs::metadata(path)?;
     let mut file = BufReader::new(File::open(path)?);
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
+        cancellation::check()?;
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         hash.update(&buffer[..n]);
     }
+    cancellation::check()?;
     let after = fs::metadata(path)?;
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
         return Err(conflict("Legacy token JSON changed while fingerprinting"));
@@ -1094,7 +1258,7 @@ impl TokenDb {
             .query_map(rusqlite::params_from_iter(args), event_from_row)
             .map_err(error)?
         {
-            let mut event = row.map_err(error)?;
+            let mut event = checked_row(row)?;
             if project_event(&header, &policy, &mut event) {
                 result.push(event);
             }
@@ -1142,7 +1306,7 @@ impl TokenDb {
             .query_map(rusqlite::params_from_iter(args), event_from_row)
             .map_err(error)?
         {
-            let mut event = row.map_err(error)?;
+            let mut event = checked_row(row)?;
             if project_event(&header, &policy, &mut event) {
                 result.push(event);
             }
@@ -1223,6 +1387,7 @@ impl TokenDb {
         self.conn.query_row("SELECT MIN(p.first_ts) FROM event_partitions p JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0)",[enabled],|row|row.get(0)).map_err(error)
     }
     fn verify_legacy_stamp(&self, legacy: &Path) -> io::Result<()> {
+        cancellation::check()?;
         let metadata = match fs::metadata(legacy) {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1258,13 +1423,30 @@ impl TokenDb {
         allow_write: bool,
         progress: &mut dyn FnMut(DbProgress),
     ) -> io::Result<Option<Self>> {
+        cancellation::check()?;
         let destination = Self::database_path(legacy);
         if destination.exists() {
-            let db = Self::open(&destination, allow_write)?;
+            let mut db = Self::open(&destination, allow_write)?;
             if !db.is_active()? {
-                return Err(error(
-                    "Token database is not active; original JSON preserved",
-                ));
+                let empty: bool = db.conn.query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM state UNION ALL SELECT 1 FROM global_parts UNION ALL SELECT 1 FROM source_cursors UNION ALL SELECT 1 FROM quota_chunks UNION ALL SELECT 1 FROM threads UNION ALL SELECT 1 FROM strings UNION ALL SELECT 1 FROM events UNION ALL SELECT 1 FROM thread_policy UNION ALL SELECT 1 FROM event_partitions UNION ALL SELECT 1 FROM day_counts UNION ALL SELECT 1 FROM model_counts UNION ALL SELECT 1 FROM operations UNION ALL SELECT 1 FROM migration UNION ALL SELECT 1 FROM migrated_threads)",
+                    [], |row| row.get(0),
+                ).map_err(error)?;
+                if allow_write && !legacy.exists() && empty {
+                    // Only retry a completely empty first-run cache. Never
+                    // reinterpret a partly migrated/nonempty cache as empty.
+                    db.commit(
+                        &DirtyExport {
+                            header: TokenStore::default().header_checked()?,
+                            threads: Vec::new(),
+                        },
+                        0,
+                    )?;
+                } else {
+                    return Err(error(
+                        "Token database is not active; original JSON preserved",
+                    ));
+                }
             }
             db.verify_legacy_stamp(legacy)?;
             return Ok(Some(db));
@@ -1277,7 +1459,7 @@ impl TokenDb {
             let store = TokenStore::default();
             db.commit(
                 &DirtyExport {
-                    header: store.header(),
+                    header: store.header_checked()?,
                     threads: Vec::new(),
                 },
                 0,
@@ -1289,6 +1471,7 @@ impl TokenDb {
             done: 0,
             total: 0,
         });
+        cancellation::check()?;
         let parent = legacy.parent().unwrap_or_else(|| Path::new("."));
         let needed = fs::metadata(legacy)?
             .len()
@@ -1306,9 +1489,10 @@ impl TokenDb {
             done: 0,
             total: 0,
         });
+        cancellation::check()?;
         let store = TokenStore::load(legacy)?;
-        let header = store.header();
-        let shards = store.into_thread_shards();
+        let header = store.header_checked()?;
+        let shards = store.into_thread_shards_checked()?;
         let expected = shards.len();
         let staging = destination.with_extension("migrating.sqlite3");
         let mut db = Self::open(&staging, true)?;
@@ -1331,6 +1515,7 @@ impl TokenDb {
             let tx = db
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map(|tx| DbTransaction(Some(tx)))
                 .map_err(error)?;
             tx.execute(
                 "INSERT INTO migration VALUES(1,?,?,?,?,?,0)",
@@ -1350,10 +1535,11 @@ impl TokenDb {
             .map_err(error)?;
             let mut stats = CommitStats::default();
             persist_header(&tx, &header, &mut stats)?;
-            tx.commit().map_err(error)?;
+            tx.commit()?;
         }
         for (index, shard) in shards.iter().enumerate() {
-            let digest = hash(&encode(shard)?);
+            cancellation::check()?;
+            let digest = hash(&encode(shard)?)?;
             let old: Option<Vec<u8>> = db
                 .conn
                 .query_row(
@@ -1367,11 +1553,12 @@ impl TokenDb {
                 let tx = db
                     .conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map(|tx| DbTransaction(Some(tx)))
                     .map_err(error)?;
                 let mut stats = CommitStats::default();
                 persist_thread(&tx, shard, &mut stats)?;
                 tx.execute("INSERT INTO migrated_threads VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET digest=excluded.digest",params![shard.thread_id,digest]).map_err(error)?;
-                tx.commit().map_err(error)?;
+                tx.commit()?;
             }
             progress(DbProgress {
                 phase: "migrating_threads",
@@ -1393,6 +1580,7 @@ impl TokenDb {
             return Err(error("Migration header mismatch; original JSON preserved"));
         }
         for (index, shard) in shards.iter().enumerate() {
+            cancellation::check()?;
             let recovered = db
                 .load_thread(&shard.thread_id)?
                 .ok_or_else(|| error("Migration shard missing"))?;
@@ -1416,14 +1604,16 @@ impl TokenDb {
         let tx = db
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map(|tx| DbTransaction(Some(tx)))
             .map_err(error)?;
         tx.execute("UPDATE migration SET complete=1 WHERE singleton=1", [])
             .map_err(error)?;
         tx.execute("UPDATE state SET active=1 WHERE singleton=1", [])
             .map_err(error)?;
-        tx.commit().map_err(error)?;
+        tx.commit()?;
         db.checkpoint()?;
         drop(db);
+        cancellation::check()?;
         fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1436,6 +1626,7 @@ impl TokenDb {
                 "A final database appeared during migration; staged copy preserved",
             ));
         }
+        cancellation::check()?;
         fs::rename(&staging, &destination)?;
         #[cfg(unix)]
         {
@@ -1541,6 +1732,359 @@ mod tests {
             threads: grouped.into_values().collect(),
         }
     }
+    #[test]
+    fn cancelled_empty_cache_initialization_is_safe_to_restart() {
+        let dir = TempDir::new().unwrap();
+        let legacy = dir.path().join("tokens.json");
+        let path = TokenDb::database_path(&legacy);
+        // Simulate cancellation after schema creation, before the first atomic commit.
+        let mut db = TokenDb::open(&path, true).unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        assert_eq!(
+            token
+                .scope(|| db.commit(&export(Vec::new(), 0), 0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        drop(db);
+        let db = TokenDb::open_or_migrate(&legacy, true, &mut |_| {})
+            .unwrap()
+            .unwrap();
+        assert!(db.is_active().unwrap());
+        assert_eq!(db.counts().unwrap().stored_events, 0);
+        assert!(!legacy.exists());
+        db.integrity_check().unwrap();
+        // A rolled-back schema transaction leaves a genuinely empty DB file.
+        let empty_path = dir.path().join("empty.sqlite3");
+        drop(Connection::open(&empty_path).unwrap());
+        TokenDb::open(&empty_path, true)
+            .unwrap()
+            .integrity_check()
+            .unwrap();
+        // Unknown/nonempty inactive data is still rejected and preserved.
+        let bad_legacy = dir.path().join("nonempty.json");
+        let bad_path = TokenDb::database_path(&bad_legacy);
+        let bad = TokenDb::open(&bad_path, true).unwrap();
+        bad.conn
+            .execute("INSERT INTO strings(value) VALUES('preserved')", [])
+            .unwrap();
+        drop(bad);
+        assert!(TokenDb::open_or_migrate(&bad_legacy, true, &mut |_| {}).is_err());
+        let bad = TokenDb::open(&bad_path, false).unwrap();
+        assert_eq!(
+            bad.conn
+                .query_row("SELECT value FROM strings", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+    }
+
+    #[test]
+    fn cancelled_busy_wait_stops_before_the_normal_lock_timeout() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tokens.sqlite3");
+        let mut db = TokenDb::open(&path, true).unwrap();
+        db.commit(&export(Vec::new(), 1), 0).unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let token = CancellationToken::new();
+        let other = token.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            other.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result =
+            token.scope(|| db.commit(&export(vec![event("new", "thread", 1, false)], 2), 1));
+        cancel.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "should not wait the normal five-second busy budget"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(db.conn.is_autocommit());
+        assert_eq!(db.revision().unwrap(), Some(1));
+        db.commit(&export(vec![event("new", "thread", 1, false)], 2), 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn cancelled_migration_preserves_source_and_resumes_at_every_phase() {
+        for phase in [
+            "fingerprinting",
+            "loading_legacy",
+            "migrating_threads",
+            "validating",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let sources = dir.path().join("sources");
+            fs::create_dir(&sources).unwrap();
+            let store = fixture_store(&sources);
+            let legacy = dir.path().join("tokens.json");
+            store.save(&legacy).unwrap();
+            let original = fs::read(&legacy).unwrap();
+            let token = CancellationToken::new();
+            let result = token.scope(|| {
+                TokenDb::open_or_migrate(&legacy, true, &mut |status| {
+                    if status.phase == phase {
+                        token.cancel();
+                    }
+                })
+            });
+            assert_eq!(
+                result.err().unwrap().kind(),
+                io::ErrorKind::Interrupted,
+                "{phase}"
+            );
+            assert_eq!(fs::read(&legacy).unwrap(), original, "{phase}");
+            assert!(!TokenDb::database_path(&legacy).exists(), "{phase}");
+            if phase == "migrating_threads" || phase == "validating" {
+                let stage = TokenDb::database_path(&legacy).with_extension("migrating.sqlite3");
+                let staged = TokenDb::open(&stage, false).unwrap();
+                staged.integrity_check().unwrap();
+                let migrated: i64 = staged
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM migrated_threads", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert!(migrated >= 1, "a completed shard remains resumable");
+            }
+            let db = TokenDb::open_or_migrate(&legacy, true, &mut |_| {})
+                .unwrap()
+                .unwrap();
+            assert!(db.is_active().unwrap());
+            assert_eq!(db.counts().unwrap().stored_events, store.events().len());
+            assert_eq!(fs::read(&legacy).unwrap(), original);
+            db.integrity_check().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelled_sqlite_write_rolls_back_all_rows_and_operation_receipt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tokens.sqlite3");
+        let mut db = TokenDb::open(&path, true).unwrap();
+        db.commit(&export(vec![event("old", "thread", 10, false)], 1), 0)
+            .unwrap();
+        let next = export(
+            (0..200)
+                .map(|i| event(&format!("new-{i}"), "thread", i, false))
+                .collect(),
+            2,
+        );
+        let token = CancellationToken::new();
+        let hook_token = token.clone();
+        let mut inserted = 0;
+        db.conn
+            .update_hook(Some(move |action, _: &str, table: &str, _: i64| {
+                if action == rusqlite::hooks::Action::SQLITE_INSERT && table == "events" {
+                    inserted += 1;
+                    if inserted == 2 {
+                        hook_token.cancel();
+                    }
+                }
+            }))
+            .unwrap();
+        let error = token
+            .scope(|| db.commit_with_operation(&next, 1, "cancel-retry"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            db.conn.is_autocommit(),
+            "rollback must complete in the cancelled scope"
+        );
+        assert_eq!(db.revision().unwrap(), Some(1));
+        assert_eq!(
+            db.load_thread("thread").unwrap().unwrap().events[0].id,
+            "old"
+        );
+        let receipts: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE operation_id='cancel-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, 0);
+        drop(db);
+        let mut db = TokenDb::open(&path, true).unwrap();
+        assert_eq!(db.revision().unwrap(), Some(1));
+        db.commit_with_operation(&next, 1, "cancel-retry").unwrap();
+        assert_eq!(db.revision().unwrap(), Some(2));
+        assert_eq!(db.load_thread("thread").unwrap().unwrap().events.len(), 200);
+        assert!(
+            db.commit_with_operation(&next, 1, "cancel-retry")
+                .unwrap()
+                .duplicate
+        );
+        db.integrity_check().unwrap();
+    }
+
+    #[test]
+    fn cancelled_row_scan_releases_snapshot_and_replays_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let mut db = TokenDb::open(&dir.path().join("tokens.sqlite3"), true).unwrap();
+        db.commit(
+            &export(
+                (0..100)
+                    .map(|i| event(&format!("row-{i}"), "thread", i, false))
+                    .collect(),
+                1,
+            ),
+            0,
+        )
+        .unwrap();
+        let token = CancellationToken::new();
+        let mut seen = 0;
+        let error = token
+            .scope(|| {
+                db.for_each_event(None, None, |_| {
+                    seen += 1;
+                    token.cancel();
+                    Ok(true)
+                })
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(seen, 1);
+        assert_eq!(
+            token.scope(|| db.load_thread("thread")).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            token
+                .scope(|| db.query_events_all(None, None, true))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(db.conn.is_autocommit());
+        assert_eq!(db.query_events_all(None, None, true).unwrap().len(), 100);
+        assert_eq!(db.load_thread("thread").unwrap().unwrap().events.len(), 100);
+    }
+
+    #[test]
+    fn cancelled_sqlite_vm_interrupts_single_long_statement() {
+        let dir = TempDir::new().unwrap();
+        let db = TokenDb::open(&dir.path().join("tokens.sqlite3"), true).unwrap();
+        let token = CancellationToken::new();
+        let hook_token = token.clone();
+        let mut ticks = 0;
+        db.conn
+            .progress_handler(
+                1000,
+                Some(move || {
+                    ticks += 1;
+                    if ticks == 2 {
+                        hook_token.cancel();
+                    }
+                    cancellation::is_cancelled()
+                }),
+            )
+            .unwrap();
+        let result = token.scope(|| db.conn.query_row(
+            "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<10000000) SELECT SUM(x) FROM n", [], |row| row.get::<_, i64>(0),
+        ).map_err(error));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(db.conn.is_autocommit());
+        db.integrity_check().unwrap();
+    }
+
+    #[test]
+    fn cancelled_serialization_uses_non_retrying_io_error() {
+        struct CancelDuringSerialize(CancellationToken);
+        impl Serialize for CancelDuringSerialize {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(2))?;
+                seq.serialize_element(&"x".repeat(IO_CHUNK * 2))?;
+                self.0.cancel();
+                seq.serialize_element(&"second".repeat(IO_CHUNK))?;
+                seq.end()
+            }
+        }
+        let token = CancellationToken::new();
+        let value = CancelDuringSerialize(token.clone());
+        assert_eq!(
+            token.scope(|| encode(&value)).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let mut reader = CheckedReader(&b"unchanged"[..]);
+        let mut buffer = [0; 8];
+        assert_eq!(
+            token.scope(|| reader.read(&mut buffer)).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(
+            token.scope(|| compress(b"unchanged")).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let compressed = compress(b"[1,2,3]").unwrap();
+        assert_eq!(
+            token
+                .scope(|| decode::<Vec<u8>>(&compressed))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(decode::<Vec<u8>>(&compressed).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cancelled_export_never_publishes_partial_destination_and_retries() {
+        let dir = TempDir::new().unwrap();
+        let mut db = TokenDb::open(&dir.path().join("tokens.sqlite3"), true).unwrap();
+        db.commit(
+            &export(
+                (0..200)
+                    .map(|i| event(&format!("row-{i}"), "thread", i, false))
+                    .collect(),
+                1,
+            ),
+            0,
+        )
+        .unwrap();
+        let destination = dir.path().join("export.json");
+        let token = CancellationToken::new();
+        let hook_token = token.clone();
+        let mut ticks = 0;
+        db.conn
+            .progress_handler(
+                100,
+                Some(move || {
+                    ticks += 1;
+                    if ticks == 5 {
+                        hook_token.cancel();
+                    }
+                    cancellation::is_cancelled()
+                }),
+            )
+            .unwrap();
+        let result = token.scope(|| db.export_json(&destination));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!destination.exists());
+        assert!(db.conn.is_autocommit());
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("tmp-export")));
+        db.export_json(&destination).unwrap();
+        assert_eq!(TokenStore::load(&destination).unwrap().events().len(), 200);
+        let original = fs::read(&destination).unwrap();
+        assert_eq!(
+            db.export_json(&destination).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&destination).unwrap(), original);
+    }
+
     #[test]
     fn sqlite_preserves_max_u64_optional_fields_and_saturating_summary() {
         let dir = TempDir::new().unwrap();

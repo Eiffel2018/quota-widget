@@ -7,6 +7,7 @@ pub mod storage;
 pub mod tokens;
 
 pub mod background;
+pub mod cancellation;
 pub mod history;
 pub mod usage_views;
 

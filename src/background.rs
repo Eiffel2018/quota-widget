@@ -6,7 +6,9 @@
 //! the lock alive until `shutdown` (or `Drop`) has joined the worker, so queued
 //! atomic replacements cannot race a subsequently started instance.
 use crate::{
-    accounting, history,
+    accounting,
+    cancellation::{self, CancellationToken},
+    history,
     intervals::{CompletedInterval, IntervalIndex},
     model::HistoryEvent,
     storage::{self, Settings},
@@ -187,17 +189,29 @@ pub struct Worker {
     tx: Option<mpsc::Sender<Command>>,
     rx: mpsc::Receiver<Event>,
     join: Option<JoinHandle<()>>,
+    cancellation: CancellationToken,
 }
 impl Worker {
     pub fn spawn_database_with_progress(write_authorized: bool) -> Self {
+        Self::spawn_task(move |commands, events| {
+            crate::database_worker::run(commands, events, write_authorized)
+        })
+    }
+    fn spawn_task(
+        task: impl FnOnce(mpsc::Receiver<Command>, mpsc::Sender<Event>) + Send + 'static,
+    ) -> Self {
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
-        let join =
-            thread::spawn(move || crate::database_worker::run(commands, events, write_authorized));
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let join = thread::spawn(move || {
+            worker_cancellation.scope(|| task(commands, events));
+        });
         Self {
             tx: Some(tx),
             rx,
             join: Some(join),
+            cancellation,
         }
     }
     pub fn spawn() -> Self {
@@ -211,14 +225,7 @@ impl Worker {
         emit_progress: bool,
         save_tokens: impl FnMut(&TokenStore, &Path) -> std::io::Result<()> + Send + 'static,
     ) -> Self {
-        let (tx, commands) = mpsc::channel();
-        let (events, rx) = mpsc::channel();
-        let join = thread::spawn(move || run(commands, events, emit_progress, save_tokens));
-        Self {
-            tx: Some(tx),
-            rx,
-            join: Some(join),
-        }
+        Self::spawn_task(move |commands, events| run(commands, events, emit_progress, save_tokens))
     }
     pub fn send(&self, command: Command) -> Result<(), Box<mpsc::SendError<Command>>> {
         match &self.tx {
@@ -229,6 +236,23 @@ impl Worker {
     pub fn try_recv(&self) -> Result<Event, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
+    /// Request a cooperative, nonblocking close. Current expensive work stops
+    /// at a checkpoint; queued scans/views/reprices are skipped. Already accepted
+    /// settings and raw-history commands still flush before the thread exits.
+    /// Keep the GUI's writer lock alive until `is_finished()` and `shutdown()`.
+    pub fn request_cancel_shutdown(&mut self) {
+        self.cancellation.cancel();
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Command::Shutdown);
+        }
+    }
+
+    /// Poll from the UI while it continues repainting during close. Once true,
+    /// `shutdown()` only reaps the completed thread and does not wait for work.
+    pub fn is_finished(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Flush queued work and wait before releasing the GUI's writer lock.
     /// Idempotent; after this returns, no background file writes remain.
     pub fn shutdown(&mut self) -> thread::Result<()> {
@@ -274,6 +298,86 @@ fn send_save_error(events: &mpsc::Sender<Event>, path: PathBuf, error: std::io::
         path,
         error: error.to_string(),
     });
+}
+
+/// Drain only accepted control writes during cooperative close. Never consult
+/// the canceled importer or derive views. Read the destination history before
+/// merging so cancellation of an initial load cannot erase existing evidence.
+pub(crate) fn flush_cancelled_command(
+    command: Command,
+    events: &mpsc::Sender<Event>,
+    write_authorized: bool,
+    raw_history: &[HistoryEvent],
+    loaded_history_path: Option<&Path>,
+    saved_settings: &mut Option<(PathBuf, Vec<u8>)>,
+) -> bool {
+    match command {
+        Command::Shutdown => return false,
+        Command::SaveSettings { path, settings } if write_authorized => {
+            let result = (|| {
+                let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
+                if saved_settings
+                    .as_ref()
+                    .is_some_and(|(p, b)| p == &path && b == &bytes)
+                {
+                    return Ok(());
+                }
+                storage::save_settings(&path, &settings)?;
+                *saved_settings = Some((path.clone(), bytes));
+                Ok(())
+            })();
+            if let Err(error) = result {
+                send_save_error(events, path, error);
+            }
+        }
+        Command::MergeHistory {
+            events: incoming,
+            save_path: Some(path),
+        } if write_authorized => {
+            let result = (|| {
+                let (existing, legacy, missing) = match storage::load_json::<LoadedHistory>(&path) {
+                    Ok(file) if matches!(file.version, 1 | 2) => {
+                        (file.events, file.version == 1, false)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        (vec![], false, true)
+                    }
+                    Ok(_) => {
+                        return Err(std::io::Error::other(
+                            "Unsupported history-file version; original preserved",
+                        ))
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut merged = existing.clone();
+                if loaded_history_path.is_none_or(|loaded| loaded == path) {
+                    merged = history::merge(merged, raw_history.to_vec());
+                }
+                merged = history::merge(merged, incoming);
+                if !missing && !legacy && merged == existing {
+                    return Ok(());
+                }
+                if legacy {
+                    storage::backup_legacy_history(&path)?;
+                }
+                storage::save_json(
+                    &path,
+                    &HistoryFile {
+                        version: 2,
+                        events: &merged,
+                    },
+                )
+            })();
+            if let Err(error) = result {
+                send_save_error(events, path, error);
+            }
+            let _ = events.send(Event::HistoryUpdated { normalized: None });
+        }
+        // No accepted save path means there is no authorized write to flush.
+        // Remaining heavy commands and display-only history can be abandoned.
+        _ => {}
+    }
+    true
 }
 
 struct ProgressReporter<'a> {
@@ -335,6 +439,7 @@ struct State {
     saved_revision: Option<(PathBuf, u64)>,
     token_writes_blocked: bool,
     raw_history: Vec<HistoryEvent>,
+    loaded_history_path: Option<PathBuf>,
     history_revision: u64,
     saved_history_revision: Option<(PathBuf, u64)>,
     history_writes_blocked: bool,
@@ -358,6 +463,7 @@ impl State {
             saved_revision: None,
             token_writes_blocked: false,
             raw_history: Vec::new(),
+            loaded_history_path: None,
             history_revision: 0,
             saved_history_revision: None,
             history_writes_blocked: false,
@@ -460,6 +566,9 @@ impl State {
         authorized_path: Option<&std::path::Path>,
         events: &mpsc::Sender<Event>,
     ) {
+        if cancellation::is_cancelled() {
+            return;
+        }
         let Some(parent) = authorized_path.and_then(std::path::Path::parent) else {
             return;
         };
@@ -534,7 +643,8 @@ impl State {
         save_tokens: &mut dyn FnMut(&TokenStore, &Path) -> std::io::Result<()>,
     ) {
         let Some(path) = path else { return };
-        if self.token_writes_blocked || self.history_writes_blocked {
+        if cancellation::is_cancelled() || self.token_writes_blocked || self.history_writes_blocked
+        {
             return;
         }
         let revision = self.store.revision();
@@ -563,6 +673,25 @@ fn run(
     // No serialization occurs in send().
     let mut saved_settings: Option<(PathBuf, Vec<u8>)> = None;
     while let Ok(command) = commands.recv() {
+        if cancellation::is_cancelled() {
+            if let Command::Load { history_path, .. } = &command {
+                // A skipped account switch is still a raw-history boundary.
+                // Never carry the previous account's unsaved evidence into it.
+                state.raw_history.clear();
+                state.loaded_history_path = history_path.clone();
+            }
+            if !flush_cancelled_command(
+                command,
+                &events,
+                true,
+                &state.raw_history,
+                state.loaded_history_path.as_deref(),
+                &mut saved_settings,
+            ) {
+                break;
+            }
+            continue;
+        }
         state.collect_retired_snapshots();
         match command {
             Command::Load {
@@ -595,10 +724,14 @@ fn run(
                     }
                 };
                 state.raw_history.clear();
+                state.loaded_history_path = history_path.clone();
                 state.history_revision = 0;
                 state.saved_history_revision = None;
                 state.history_writes_blocked = false;
                 state.history_backup_pending = None;
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let history_error = history_path.and_then(|path| {
                     match storage::load_json::<LoadedHistory>(&path) {
                         Ok(file) if file.version == 1 || file.version == 2 => {
@@ -620,12 +753,20 @@ fn run(
                         }
                     }
                 });
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 progress.progress.events = state.store.events().len();
                 progress.stage(ProgressStage::BuildingViews);
                 let imported = history::replay(state.store.quota_observations());
                 state.merge_history(imported);
                 let normalized_history = state.normalized_history();
-                state.store.reprice(&pricing);
+                if state.store.reprice_checked(&pricing).is_err() {
+                    continue;
+                }
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let snapshot = state.publish_snapshot();
                 let _ = events.send(Event::Loaded {
                     snapshot,
@@ -636,6 +777,9 @@ fn run(
                 // Make cached records usable before calculating derived quota
                 // intervals, which can be expensive on a large history.
                 progress.progress.events = state.store.events().len();
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 progress.stage(ProgressStage::BuildingIntervals);
                 if let Some(intervals) = state.intervals_if_changed() {
                     let _ = events.send(Event::IntervalsUpdated { intervals });
@@ -660,9 +804,15 @@ fn run(
                     Ok(report) => (Some(report), None),
                     Err(error) => (None, Some(error.to_string())),
                 };
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 progress.progress.events = state.store.events().len();
                 progress.stage(ProgressStage::BuildingViews);
                 let snapshot = state.snapshot_if_changed();
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let quota_changed = state.store.quota_observations().len() != previous_quota_count;
                 let normalized_history = if quota_changed {
                     let imported = history::replay(state.store.quota_observations());
@@ -678,6 +828,9 @@ fn run(
                     report,
                     error,
                 });
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 progress.stage(ProgressStage::BuildingIntervals);
                 let intervals = state.intervals_if_changed();
                 if save_path.is_some() || history_save_path.is_some() {
@@ -699,7 +852,12 @@ fn run(
                     ProgressReporter::new(emit_progress, &events, Operation::Reprice);
                 progress.progress.events = state.store.events().len();
                 progress.stage(ProgressStage::BuildingViews);
-                state.store.reprice(&pricing);
+                if state.store.reprice_checked(&pricing).is_err() {
+                    continue;
+                }
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let snapshot = state.snapshot_if_changed();
                 let _ = events.send(Event::Updated {
                     snapshot,
@@ -707,6 +865,9 @@ fn run(
                     report: None,
                     error: None,
                 });
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 progress.stage(ProgressStage::BuildingIntervals);
                 let intervals = state.intervals_if_changed();
                 if save_path.is_some() {
@@ -726,8 +887,12 @@ fn run(
                 let normalized = state
                     .merge_history(incoming)
                     .then(|| state.normalized_history());
-                let intervals = state.intervals_if_changed();
                 state.save_history_if_changed(save_path.clone(), &events);
+                let intervals = if cancellation::is_cancelled() {
+                    None
+                } else {
+                    state.intervals_if_changed()
+                };
                 state.save_intervals_if_changed(save_path.as_deref(), &events);
                 let _ = events.send(Event::HistoryUpdated { normalized });
                 if let Some(intervals) = intervals {
@@ -789,6 +954,386 @@ mod tests {
             } => snapshot,
             other => panic!("unexpected load result: {other:?}"),
         }
+    }
+
+    fn wait_until_finished(worker: &Worker) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not complete cooperative close"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn cancelled_shutdown_skips_queued_heavy_work_but_flushes_controls_for_both_workers() {
+        for database in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let token_path = temp.path().join("tokens.json");
+            let history_path = temp.path().join("history.json");
+            let settings_path = temp.path().join("settings.json");
+            fs::write(&token_path, b"synthetic original must remain untouched").unwrap();
+            let first = history_event();
+            storage::save_json(
+                &history_path,
+                &HistoryFile {
+                    version: 1,
+                    events: std::slice::from_ref(&first),
+                },
+            )
+            .unwrap();
+            let original_history = fs::read(&history_path).unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let mut worker = Worker::spawn_task(move |commands, events| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                if database {
+                    crate::database_worker::run(commands, events, true);
+                } else {
+                    run(commands, events, false, |store, path| store.save(path));
+                }
+            });
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            worker
+                .send(Command::Load {
+                    token_path: token_path.clone(),
+                    history_path: Some(history_path.clone()),
+                    pricing: Pricing::default(),
+                })
+                .unwrap();
+            worker
+                .send(Command::Import {
+                    root: temp.path().join("nonexistent-synthetic-source"),
+                    metadata: None,
+                    pricing: Pricing::default(),
+                    save_path: Some(token_path.clone()),
+                    history_save_path: None,
+                })
+                .unwrap();
+            worker
+                .send(Command::Reprice {
+                    pricing: Pricing::demo(),
+                    save_path: Some(token_path.clone()),
+                })
+                .unwrap();
+            worker
+                .send(Command::View(crate::db_view::ViewRequest {
+                    day_start: 0,
+                    day_end: 100,
+                    group: usage_views::GroupBy::Response,
+                    excluded: false,
+                    page: 0,
+                    page_size: 10,
+                    boundary: None,
+                    fallback_start: 0,
+                    now: 100,
+                }))
+                .unwrap();
+            for dark in [true, false] {
+                worker
+                    .send(Command::SaveSettings {
+                        path: settings_path.clone(),
+                        settings: Settings {
+                            dark,
+                            sessions_path: temp
+                                .path()
+                                .join("synthetic-sessions")
+                                .to_string_lossy()
+                                .into(),
+                            ..Settings::default()
+                        },
+                    })
+                    .unwrap();
+            }
+            let mut second = first.clone();
+            second.observed_at_unix += 10;
+            let mut third = first.clone();
+            third.observed_at_unix += 20;
+            for event in [second.clone(), third.clone(), third.clone()] {
+                worker
+                    .send(Command::MergeHistory {
+                        events: vec![event],
+                        save_path: Some(history_path.clone()),
+                    })
+                    .unwrap();
+            }
+            worker.request_cancel_shutdown();
+            worker.request_cancel_shutdown();
+            assert!(
+                !worker.is_finished(),
+                "cancel request must not wait for the gated worker"
+            );
+            assert!(worker.send(Command::Shutdown).is_err());
+            release_tx.send(()).unwrap();
+            wait_until_finished(&worker);
+            worker.shutdown().unwrap();
+            worker.shutdown().unwrap();
+            assert!(worker.is_finished());
+            assert_eq!(
+                fs::read(&token_path).unwrap(),
+                b"synthetic original must remain untouched"
+            );
+            assert!(!crate::token_db::TokenDb::database_path(&token_path).exists());
+            assert!(!storage::load_json::<Settings>(&settings_path).unwrap().dark);
+            let stored: LoadedHistory = storage::load_json(&history_path).unwrap();
+            assert_eq!(stored.version, 2);
+            assert_eq!(
+                stored.events,
+                history::merge(vec![first, second], vec![third])
+            );
+            let backups: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("history.json.pre-0.3.4-")
+                })
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(fs::read(&backups[0]).unwrap(), original_history);
+            assert!(!temp.path().join("quota-intervals.json").exists());
+            assert!(!worker
+                .rx
+                .try_iter()
+                .any(|event| matches!(event, Event::Loaded { .. } | Event::Updated { .. })));
+        }
+    }
+
+    #[test]
+    fn healthy_shutdown_flushes_heavy_work_and_controls_in_fifo_for_both_workers() {
+        for database in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let tokens = temp.path().join("tokens.json");
+            let history_path = temp.path().join("history.json");
+            let settings_path = temp.path().join("settings.json");
+            let mut worker = if database {
+                Worker::spawn_database_with_progress(true)
+            } else {
+                Worker::spawn()
+            };
+            worker
+                .send(Command::Load {
+                    token_path: tokens.clone(),
+                    history_path: None,
+                    pricing: Pricing::default(),
+                })
+                .unwrap();
+            worker
+                .send(synthetic_import(
+                    &temp.path().join("synthetic-source"),
+                    Some(tokens.clone()),
+                ))
+                .unwrap();
+            worker
+                .send(Command::SaveSettings {
+                    path: settings_path.clone(),
+                    settings: Settings {
+                        dark: false,
+                        sessions_path: temp
+                            .path()
+                            .join("synthetic-source")
+                            .to_string_lossy()
+                            .into(),
+                        ..Settings::default()
+                    },
+                })
+                .unwrap();
+            worker
+                .send(Command::MergeHistory {
+                    events: vec![history_event()],
+                    save_path: Some(history_path.clone()),
+                })
+                .unwrap();
+            worker.shutdown().unwrap();
+            assert!(worker.is_finished());
+            if database {
+                let db = crate::token_db::TokenDb::open_readonly(
+                    &crate::token_db::TokenDb::database_path(&tokens),
+                )
+                .unwrap();
+                assert_eq!(db.query_events_all(None, None, true).unwrap().len(), 1);
+            } else {
+                assert_eq!(TokenStore::load(&tokens).unwrap().events().len(), 1);
+            }
+            assert!(!storage::load_json::<Settings>(&settings_path).unwrap().dark);
+            assert_eq!(
+                storage::load_json::<LoadedHistory>(&history_path)
+                    .unwrap()
+                    .events,
+                vec![history_event()]
+            );
+            assert!(worker.rx.try_iter().any(|event| matches!(
+                event,
+                Event::Updated {
+                    report: Some(_),
+                    error: None,
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn cancel_during_save_is_nonblocking_and_never_persists_canceled_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let token_path = temp.path().join("tokens.json");
+        let settings_path = temp.path().join("settings.json");
+        TokenStore::default().save(&token_path).unwrap();
+        let original = fs::read(&token_path).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut worker = Worker::spawn_with_sink(false, move |store, path| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            cancellation::check()?;
+            store.save(path)
+        });
+        load(&worker, token_path.clone(), Pricing::default());
+        let source = temp.path().join("synthetic-source");
+        worker
+            .send(synthetic_import(&source, Some(token_path.clone())))
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let source_before: Vec<_> = fs::read_dir(&source)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        worker
+            .send(Command::SaveSettings {
+                path: settings_path.clone(),
+                settings: Settings {
+                    dark: false,
+                    sessions_path: source.to_string_lossy().into(),
+                    ..Settings::default()
+                },
+            })
+            .unwrap();
+        worker
+            .send(Command::Reprice {
+                pricing: Pricing::demo(),
+                save_path: Some(token_path.clone()),
+            })
+            .unwrap();
+        worker.request_cancel_shutdown();
+        assert!(!worker.is_finished());
+        release_tx.send(()).unwrap();
+        wait_until_finished(&worker);
+        worker.shutdown().unwrap();
+        assert_eq!(fs::read(token_path).unwrap(), original);
+        assert!(!storage::load_json::<Settings>(&settings_path).unwrap().dark);
+        for (path, before) in source_before {
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn canceled_history_drain_preserves_corrupt_input_but_saves_requested_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.json");
+        let settings_path = temp.path().join("settings.json");
+        fs::write(&path, b"unreadable original raw history").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut saved = None;
+        assert!(flush_cancelled_command(
+            Command::MergeHistory {
+                events: vec![history_event()],
+                save_path: Some(path.clone())
+            },
+            &tx,
+            true,
+            &[],
+            None,
+            &mut saved
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), Event::SaveFailed { .. }));
+        assert_eq!(fs::read(path).unwrap(), b"unreadable original raw history");
+        flush_cancelled_command(
+            Command::SaveSettings {
+                path: settings_path.clone(),
+                settings: Settings {
+                    sessions_path: temp
+                        .path()
+                        .join("synthetic-sessions")
+                        .to_string_lossy()
+                        .into(),
+                    ..Settings::default()
+                },
+            },
+            &tx,
+            true,
+            &[],
+            None,
+            &mut saved,
+        );
+        assert!(settings_path.is_file());
+    }
+
+    #[test]
+    fn canceled_history_drain_does_not_merge_evidence_from_another_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_path = temp.path().join("old-account-history.json");
+        let new_path = temp.path().join("new-account-history.json");
+        let old = history_event();
+        let mut incoming = old.clone();
+        incoming.session = "synthetic-new-account".into();
+        let (events, _) = mpsc::channel();
+        flush_cancelled_command(
+            Command::MergeHistory {
+                events: vec![incoming.clone()],
+                save_path: Some(new_path.clone()),
+            },
+            &events,
+            true,
+            &[old],
+            Some(&old_path),
+            &mut None,
+        );
+        let saved: LoadedHistory = storage::load_json(&new_path).unwrap();
+        assert_eq!(saved.events, vec![incoming]);
+        assert!(!old_path.exists());
+    }
+
+    #[test]
+    fn canceled_readonly_database_never_flushes_unauthorized_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (commands, receiver) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let settings = temp.path().join("settings.json");
+        let history = temp.path().join("history.json");
+        commands
+            .send(Command::SaveSettings {
+                path: settings.clone(),
+                settings: Settings {
+                    sessions_path: temp
+                        .path()
+                        .join("synthetic-sessions")
+                        .to_string_lossy()
+                        .into(),
+                    ..Settings::default()
+                },
+            })
+            .unwrap();
+        commands
+            .send(Command::MergeHistory {
+                events: vec![history_event()],
+                save_path: Some(history.clone()),
+            })
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        cancellation.scope(|| crate::database_worker::run(receiver, events, false));
+        assert!(!settings.exists());
+        assert!(!history.exists());
     }
 
     #[test]

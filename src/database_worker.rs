@@ -1,6 +1,9 @@
 //! Single-owner incremental database orchestration. The GUI receives bounded views.
 use crate::{
-    background::{Command, Event, Operation, Progress, ProgressStage, Snapshot},
+    background::{
+        flush_cancelled_command, Command, Event, Operation, Progress, ProgressStage, Snapshot,
+    },
+    cancellation,
     db_view::{DailyView, DatabaseView, ViewRequest},
     display_cache::{DayCache, DayKey, RangeCache, RangeKey},
     display_time,
@@ -43,6 +46,7 @@ struct State {
     store: TokenStore,
     pricing: Pricing,
     raw_history: Vec<HistoryEvent>,
+    loaded_history_path: Option<PathBuf>,
     normalized: Arc<Vec<HistoryEvent>>,
     history_blocked: bool,
     history_backup: Option<PathBuf>,
@@ -68,6 +72,7 @@ impl State {
             store: TokenStore::default(),
             pricing: Pricing::default(),
             raw_history: vec![],
+            loaded_history_path: None,
             normalized: Arc::new(vec![]),
             history_blocked: false,
             history_backup: None,
@@ -106,6 +111,9 @@ impl State {
         true
     }
     fn invalidate(&mut self, stats: &CommitStats) {
+        if cancellation::is_cancelled() {
+            return;
+        }
         if stats.global_policy_changed {
             self.ranges.clear();
             self.daily_cache = None;
@@ -131,6 +139,7 @@ impl State {
             let changes: Vec<_> = stats
                 .event_changes
                 .iter()
+                .take_while(|_| !cancellation::is_cancelled())
                 .map(|(old, new)| (project(old), project(new)))
                 .collect();
             if let Some(cache) = &mut self.grouped_day {
@@ -142,6 +151,9 @@ impl State {
                 }
             }
             for (old, new) in &changes {
+                if cancellation::is_cancelled() {
+                    return;
+                }
                 if let Some(cache) = &mut self.day_totals {
                     cache.adjust(old.as_ref(), new.as_ref());
                 }
@@ -155,6 +167,9 @@ impl State {
             self.range_totals = None;
         }
         for (old, new) in &stats.event_changes {
+            if cancellation::is_cancelled() {
+                return;
+            }
             for e in old.iter().chain(new.iter()) {
                 self.ranges
                     .retain(|&(start, end), _| !(e.timestamp > start && e.timestamp <= end));
@@ -171,6 +186,7 @@ impl State {
         }
     }
     fn reprice(&mut self, pricing: &Pricing) -> io::Result<()> {
+        cancellation::check()?;
         let Some(db) = self.db.as_ref() else {
             self.pricing = pricing.clone();
             return Ok(());
@@ -182,12 +198,14 @@ impl State {
         }
         if header.requires_attribution_rebuild(pricing) {
             for id in db.thread_ids()? {
+                cancellation::check()?;
                 if let Some(shard) = db.load_thread(&id)? {
                     self.store.hydrate_thread(shard)?;
                 }
             }
         }
-        self.store.reprice_hydrated(pricing);
+        self.store.reprice_hydrated_checked(pricing)?;
+        cancellation::check()?;
         self.pricing = pricing.clone();
         self.ranges.clear();
         self.daily_cache = None;
@@ -197,6 +215,7 @@ impl State {
         Ok(())
     }
     fn commit(&mut self) -> io::Result<Option<CommitStats>> {
+        cancellation::check()?;
         let Some(db) = self.db.as_mut() else {
             return Ok(None);
         };
@@ -210,12 +229,15 @@ impl State {
                 "Read-only state: changes were not persisted",
             ));
         }
-        let stats = db.commit(&self.store.dirty_export(), revision)?;
+        let export = self.store.dirty_export_checked()?;
+        cancellation::check()?;
+        let stats = db.commit(&export, revision)?;
         self.store.mark_committed();
         self.invalidate(&stats);
         Ok(Some(stats))
     }
     fn publish(&mut self) -> io::Result<Arc<Snapshot>> {
+        cancellation::check()?;
         let db = self.db.as_ref().ok_or_else(|| {
             io::Error::other("Token database unavailable; original data preserved")
         })?;
@@ -235,6 +257,7 @@ impl State {
             (&a.session, a.timestamp, &a.id).cmp(&(&b.session, b.timestamp, &b.id))
         });
         for event in &mut latest {
+            cancellation::check()?;
             event.cost_usd = tokens::event_cost(event, &self.pricing);
         }
         let range_key = RangeKey {
@@ -263,6 +286,7 @@ impl State {
             Some(tail_start.saturating_add(1)),
             Some(range_key.end.saturating_add(1)),
             |e| {
+                cancellation::check()?;
                 range.add(&e);
                 Ok(true)
             },
@@ -306,6 +330,7 @@ impl State {
         {
             let mut cache = DayCache::new(day_key);
             db.for_each_event(Some(day_key.start), Some(day_key.end), |e| {
+                cancellation::check()?;
                 cache.add(&e);
                 Ok(true)
             })?;
@@ -362,6 +387,7 @@ impl State {
             task_turn_usage: db.turn_usage()?,
             ..Snapshot::default()
         });
+        cancellation::check()?;
         if let Some(old) = self.snapshot.replace(snapshot.clone()) {
             self.retired.push(old);
         }
@@ -369,6 +395,7 @@ impl State {
         Ok(snapshot)
     }
     fn rebuild_intervals(&mut self) -> io::Result<bool> {
+        cancellation::check()?;
         let Some(db) = self.db.as_ref() else {
             return Ok(false);
         };
@@ -379,6 +406,7 @@ impl State {
             &self.normalized,
             earliest,
             |start, end| {
+                cancellation::check()?;
                 if let Some(cached) = ranges.get(&(start, end)) {
                     return Ok(cached.clone());
                 }
@@ -388,6 +416,7 @@ impl State {
                     false,
                 )?;
                 for e in &mut events {
+                    cancellation::check()?;
                     e.cost_usd = tokens::event_cost(e, pricing);
                 }
                 let values = intervals::model_usage(events.iter());
@@ -395,6 +424,7 @@ impl State {
                 Ok(values)
             },
         )?;
+        cancellation::check()?;
         if *self.intervals == values {
             return Ok(false);
         }
@@ -425,12 +455,19 @@ impl State {
         }
     }
     fn emit_intervals(&mut self, events: &mpsc::Sender<Event>, save: Option<&Path>) {
+        if cancellation::is_cancelled() {
+            return;
+        }
         match self.rebuild_intervals() {
             Ok(true) => {
                 let _ = events.send(Event::IntervalsUpdated {
                     intervals: self.intervals.clone(),
                 });
-                if self.write_authorized && !self.blocked && !self.history_blocked {
+                if !cancellation::is_cancelled()
+                    && self.write_authorized
+                    && !self.blocked
+                    && !self.history_blocked
+                {
                     if let Some(parent) = save.and_then(Path::parent) {
                         let path = parent.join("quota-intervals.json");
                         if let Err(error) = storage::save_json(
@@ -536,6 +573,27 @@ pub(crate) fn run(
     let mut state = State::new(write_authorized);
     let mut saved_settings: Option<(PathBuf, Vec<u8>)> = None;
     while let Ok(command) = commands.recv() {
+        if cancellation::is_cancelled() {
+            if let Command::Load { history_path, .. } = &command {
+                // A skipped account switch is still a raw-history boundary.
+                // Never carry the previous account's unsaved evidence into it.
+                state.raw_history.clear();
+                state.loaded_history_path = history_path.clone();
+            }
+            if !flush_cancelled_command(
+                command,
+                &events,
+                write_authorized,
+                &state.raw_history,
+                state.loaded_history_path.as_deref(),
+                &mut saved_settings,
+            ) {
+                // A committed SQLite transaction is already durable. Avoid a
+                // potentially slow WAL checkpoint during interactive close.
+                break;
+            }
+            continue;
+        }
         match command {
             Command::Load {
                 token_path,
@@ -544,6 +602,7 @@ pub(crate) fn run(
             } => {
                 state = State::new(write_authorized);
                 state.pricing = pricing.clone();
+                state.loaded_history_path = history_path.clone();
                 let started = Instant::now();
                 progress(
                     &events,
@@ -565,8 +624,21 @@ pub(crate) fn run(
                     }));
                 });
                 let mut error = None;
-                match result {Ok(Some(db))=>match db.header(){Ok(header)=>{state.store=TokenStore::from_header(header);state.db=Some(db)},Err(e)=>error=Some(e.to_string())},Ok(None)=>error=Some("SQLite migration needs the application's writer lock; original JSON was preserved. Close the other instance and reopen.".into()),Err(e)=>error=Some(e.to_string())}
+                match result {
+                    Ok(Some(db)) => match db.header() {
+                        Ok(header) => {
+                            state.store = TokenStore::from_header(header);
+                            state.db = Some(db);
+                        }
+                        Err(e) => error = Some(e.to_string()),
+                    },
+                    Ok(None) => error = Some("SQLite migration needs the application's writer lock; original JSON was preserved. Close the other instance and reopen.".into()),
+                    Err(e) => error = Some(e.to_string()),
+                }
                 state.blocked = error.is_some();
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let history_error =
                     history_path.as_ref().and_then(|path| {
                         match storage::load_json::<HistoryFile>(path) {
@@ -588,6 +660,9 @@ pub(crate) fn run(
                             }
                         }
                     });
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 state.normalized = Arc::new(history::normalized(&state.raw_history));
                 state.merge(history::replay(state.store.quota_observations()));
                 if error.is_none() && write_authorized {
@@ -598,6 +673,9 @@ pub(crate) fn run(
                         error = Some(e.to_string());
                         state.blocked = true;
                     }
+                }
+                if cancellation::is_cancelled() {
+                    continue;
                 }
                 progress(
                     &events,
@@ -613,6 +691,9 @@ pub(crate) fn run(
                         Arc::new(Snapshot::default())
                     }
                 };
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let _ = events.send(Event::Loaded {
                     snapshot,
                     normalized_history: state.normalized.clone(),
@@ -631,6 +712,9 @@ pub(crate) fn run(
             Command::View(request) => {
                 state.request = request;
                 let result = state.publish();
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let (snapshot, error) = match result {
                     Ok(s) => (Some(s), None),
                     Err(e) => (None, Some(e.to_string())),
@@ -704,6 +788,11 @@ pub(crate) fn run(
                     state.commit()?;
                     Ok(report)
                 })();
+                if cancellation::is_cancelled() {
+                    // The token importer may contain a partially rebuilt shard.
+                    // It is abandoned here and cannot reach any later commit.
+                    continue;
+                }
                 let mut history_changed = false;
                 if result.is_ok() && state.store.quota_observations().len() != old_quota {
                     history_changed =
@@ -772,6 +861,9 @@ pub(crate) fn run(
                         "Repricing requires the matching writable database path",
                     ))
                 };
+                if cancellation::is_cancelled() {
+                    continue;
+                }
                 let (snapshot, error) = match result {
                     Ok(s) => (Some(s), None),
                     Err(e) => (None, Some(e.to_string())),
@@ -794,7 +886,9 @@ pub(crate) fn run(
                 });
                 if changed {
                     state.save_history(save_path.as_deref(), &events);
-                    state.emit_intervals(&events, save_path.as_deref());
+                    if !cancellation::is_cancelled() {
+                        state.emit_intervals(&events, save_path.as_deref());
+                    }
                 }
             }
             Command::SaveSettings { path, settings } => {

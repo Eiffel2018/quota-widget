@@ -13,6 +13,241 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// Cancellation never uses Interrupted inside std/serde IO adapters: their
+// retry-on-Interrupted loops would otherwise spin forever after shutdown.
+// Translate the terminal sentinel back to Interrupted at our public boundary.
+fn checkpoint() -> io::Result<()> {
+    #[cfg(test)]
+    CANCEL_AFTER_CHECKS.with(|state| {
+        if let Some((left, token)) = state.borrow_mut().as_mut() {
+            if *left == 0 {
+                token.cancel();
+            } else {
+                *left -= 1;
+            }
+        }
+    });
+    crate::cancellation::check()
+}
+
+#[cfg(test)]
+thread_local! {
+    static CANCEL_AFTER_CHECKS: std::cell::RefCell<Option<(usize, crate::cancellation::CancellationToken)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn checked<T>(operation: impl FnOnce() -> T) -> io::Result<T> {
+    checkpoint()?;
+    let value = operation();
+    checkpoint()?;
+    Ok(value)
+}
+
+/// Pure legacy APIs cannot return an error. Their bounded iterators stop on
+/// cancellation; checked worker boundaries reject every such partial result.
+/// Do not use an unchecked projection to publish a background-work revision.
+struct CancellationIter<I> {
+    inner: I,
+    stopped: bool,
+}
+trait CancelIterExt: Iterator + Sized {
+    fn until_cancelled(self) -> CancellationIter<Self> {
+        CancellationIter {
+            inner: self,
+            stopped: false,
+        }
+    }
+}
+impl<I: Iterator> CancelIterExt for I {}
+fn cancel_iter<T: IntoIterator>(value: T) -> CancellationIter<T::IntoIter> {
+    value.into_iter().until_cancelled()
+}
+impl<I: Iterator> Iterator for CancellationIter<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.stopped || checkpoint().is_err() {
+            self.stopped = true;
+            None
+        } else {
+            self.inner.next()
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (
+            0,
+            if self.stopped {
+                Some(0)
+            } else {
+                self.inner.size_hint().1
+            },
+        )
+    }
+}
+impl<I: DoubleEndedIterator> DoubleEndedIterator for CancellationIter<I> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.stopped || checkpoint().is_err() {
+            self.stopped = true;
+            None
+        } else {
+            self.inner.next_back()
+        }
+    }
+}
+
+/// Stable sorting without an uninterruptible whole-history std sort. Sort small
+/// index runs, merge with bounded checkpoints, then permute in place. Cancellation
+/// never drops raw elements, even if it interrupts the final permutation.
+fn sort_checked<T>(
+    rows: &mut [T],
+    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) -> io::Result<()> {
+    const BATCH: usize = 1024;
+    checkpoint()?;
+    if rows.len() <= BATCH {
+        rows.sort_by(compare);
+        return checkpoint();
+    }
+    let len = rows.len();
+    let mut order: Vec<_> = cancel_iter(0..len).collect();
+    checkpoint()?;
+    for run in order.chunks_mut(BATCH) {
+        checkpoint()?;
+        run.sort_by(|a, b| compare(&rows[*a], &rows[*b]));
+    }
+    let mut scratch = vec![0usize; len];
+    let mut width = BATCH;
+    while width < len {
+        for begin in (0..len).step_by(width.saturating_mul(2)) {
+            checkpoint()?;
+            let middle = begin.saturating_add(width).min(len);
+            let end = middle.saturating_add(width).min(len);
+            let (mut left, mut right) = (begin, middle);
+            for (at, slot) in scratch.iter_mut().enumerate().take(end).skip(begin) {
+                if at.is_multiple_of(BATCH) {
+                    checkpoint()?;
+                }
+                let take_left = right == end
+                    || (left < middle
+                        && compare(&rows[order[left]], &rows[order[right]])
+                            != std::cmp::Ordering::Greater);
+                *slot = if take_left {
+                    let value = order[left];
+                    left += 1;
+                    value
+                } else {
+                    let value = order[right];
+                    right += 1;
+                    value
+                };
+            }
+        }
+        std::mem::swap(&mut order, &mut scratch);
+        width = width.saturating_mul(2);
+    }
+    for (target, &original) in order.iter().enumerate() {
+        if target.is_multiple_of(BATCH) {
+            checkpoint()?;
+        }
+        scratch[original] = target;
+    }
+    let mut swaps = 0usize;
+    for at in 0..len {
+        if at.is_multiple_of(BATCH) {
+            checkpoint()?;
+        }
+        while scratch[at] != at {
+            if swaps.is_multiple_of(BATCH) {
+                checkpoint()?;
+            }
+            let target = scratch[at];
+            rows.swap(at, target);
+            scratch.swap(at, target);
+            swaps += 1;
+        }
+    }
+    checkpoint()
+}
+trait CancelSortExt<T> {
+    fn sort_cancellable_by(&mut self, compare: impl FnMut(&T, &T) -> std::cmp::Ordering);
+    fn sort_cancellable_by_key<K: Ord>(&mut self, key: impl FnMut(&T) -> K);
+    fn sort_cancellable(&mut self)
+    where
+        T: Ord;
+}
+impl<T> CancelSortExt<T> for [T] {
+    fn sort_cancellable_by(&mut self, compare: impl FnMut(&T, &T) -> std::cmp::Ordering) {
+        let _ = sort_checked(self, compare);
+    }
+    fn sort_cancellable_by_key<K: Ord>(&mut self, mut key: impl FnMut(&T) -> K) {
+        let _ = sort_checked(self, |a, b| key(a).cmp(&key(b)));
+    }
+    fn sort_cancellable(&mut self)
+    where
+        T: Ord,
+    {
+        let _ = sort_checked(self, Ord::cmp);
+    }
+}
+
+trait CancelDedupExt<T> {
+    fn dedup_cancellable_by(&mut self, same: impl FnMut(&T, &T) -> bool);
+    fn dedup_cancellable(&mut self)
+    where
+        T: PartialEq;
+}
+impl<T> CancelDedupExt<T> for Vec<T> {
+    fn dedup_cancellable_by(&mut self, mut same: impl FnMut(&T, &T) -> bool) {
+        if self.is_empty() || checkpoint().is_err() {
+            return;
+        }
+        let mut write = 1;
+        for read in 1..self.len() {
+            if checkpoint().is_err() {
+                return;
+            }
+            if !same(&self[read], &self[write - 1]) {
+                self.swap(read, write);
+                write += 1;
+            }
+        }
+        self.truncate(write);
+    }
+    fn dedup_cancellable(&mut self)
+    where
+        T: PartialEq,
+    {
+        self.dedup_cancellable_by(PartialEq::eq);
+    }
+}
+
+struct CancellationIo<T>(T);
+fn io_checkpoint() -> io::Result<()> {
+    checkpoint().map_err(|error| io::Error::other(error.to_string()))
+}
+impl<R: Read> Read for CancellationIo<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        io_checkpoint()?;
+        let length = bytes.len().min(64 * 1024);
+        self.0.read(&mut bytes[..length])
+    }
+}
+impl<W: Write> Write for CancellationIo<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io_checkpoint()?;
+        self.0.write(&bytes[..bytes.len().min(256 * 1024)])
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io_checkpoint()?;
+        self.0.flush()
+    }
+}
+fn read_token_store(reader: impl Read) -> io::Result<TokenStore> {
+    checkpoint()?;
+    let result =
+        serde_json::from_reader(BufReader::with_capacity(64 * 1024, CancellationIo(reader)));
+    checkpoint()?;
+    result.map_err(invalid_data)
+}
+
 pub const DEFAULT_ASSUMED_MODEL: &str = "gpt-6.1-sol";
 pub const DEFAULT_BROWSE_DAYS: i64 = 30;
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -477,7 +712,7 @@ struct RecordedEfforts<'a> {
 impl<'a> RecordedEfforts<'a> {
     fn new(contexts: &'a [EffortContext]) -> Self {
         let mut turns: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        for context in contexts {
+        for context in cancel_iter(contexts) {
             if let Some(turn) = context.turn_id.as_deref() {
                 turns
                     .entry((context.session.as_str(), turn))
@@ -500,6 +735,7 @@ impl<'a> RecordedEfforts<'a> {
         let sources: Vec<_> = row
             .source_effort_contexts
             .iter()
+            .until_cancelled()
             .filter(|context| {
                 context.session == row.session
                     && context.turn_id == row.turn_id
@@ -517,13 +753,22 @@ impl<'a> RecordedEfforts<'a> {
         };
         // Captured file order resolves same-millisecond contexts. Without it,
         // disagreeing contexts at the latest timestamp stay unknown.
-        if let Some(time) = sources.iter().map(|source| source.timestamp_ms).max() {
+        if let Some(time) = sources
+            .iter()
+            .until_cancelled()
+            .map(|source| source.timestamp_ms)
+            .max()
+        {
             let mut values = BTreeSet::new();
-            for source in sources.iter().filter(|source| source.timestamp_ms == time) {
+            for source in sources
+                .iter()
+                .until_cancelled()
+                .filter(|source| source.timestamp_ms == time)
+            {
                 if source.values.is_empty() || !matches_model(source) {
                     return BTreeSet::new();
                 }
-                values.extend(source.values.iter().cloned());
+                values.extend(source.values.iter().until_cancelled().cloned());
             }
             return values;
         }
@@ -533,13 +778,14 @@ impl<'a> RecordedEfforts<'a> {
         let mut values = BTreeSet::new();
         for context in rows.unwrap()[..end]
             .iter()
+            .until_cancelled()
             .rev()
             .take_while(|context| context.timestamp_ms == latest.timestamp_ms)
         {
             if context.values.is_empty() || !matches_model(context) {
                 return BTreeSet::new();
             }
-            values.extend(context.values.iter().cloned());
+            values.extend(context.values.iter().until_cancelled().cloned());
         }
         values
     }
@@ -549,18 +795,25 @@ impl<'a> RecordedEfforts<'a> {
         // explicit value, nor pick up a setting changed after it was first seen.
         let explicit: BTreeSet<_> = rows
             .iter()
-            .flat_map(|row| row.reasoning_efforts.iter().cloned())
+            .until_cancelled()
+            .flat_map(|row| row.reasoning_efforts.iter().until_cancelled().cloned())
             .collect();
         if !explicit.is_empty() {
-            return (explicit.len() == 1).then(|| explicit.into_iter().next().unwrap());
+            return (explicit.len() == 1)
+                .then(|| explicit.into_iter().until_cancelled().next().unwrap());
         }
-        let first = rows.iter().map(|row| row.timestamp_ms).min()?;
+        let first = rows
+            .iter()
+            .until_cancelled()
+            .map(|row| row.timestamp_ms)
+            .min()?;
         let values: BTreeSet<_> = rows
             .iter()
+            .until_cancelled()
             .filter(|row| row.timestamp_ms == first)
             .flat_map(|row| self.context_values(row, first))
             .collect();
-        (values.len() == 1).then(|| values.into_iter().next().unwrap())
+        (values.len() == 1).then(|| values.into_iter().until_cancelled().next().unwrap())
     }
 }
 
@@ -577,7 +830,7 @@ impl<'a> RecordedModels<'a> {
             sessions: BTreeMap::new(),
             turns: BTreeMap::new(),
         };
-        for context in contexts {
+        for context in cancel_iter(contexts) {
             result
                 .sessions
                 .entry(&context.session)
@@ -705,6 +958,7 @@ impl StoreHeader {
         let mut names: BTreeMap<_, _> = self
             .recorded_names
             .iter()
+            .until_cancelled()
             .map(|(id, row)| (id.clone(), row.name.clone()))
             .collect();
         names.extend(self.metadata_names.clone());
@@ -713,6 +967,7 @@ impl StoreHeader {
     pub fn task_parents(&self) -> BTreeMap<String, String> {
         self.recorded_parents
             .iter()
+            .until_cancelled()
             .filter_map(|(child, row)| {
                 row.parent
                     .as_ref()
@@ -780,11 +1035,12 @@ fn anonymous_bounds(
     events: &[TokenEvent],
 ) -> BTreeMap<String, i64> {
     let mut bounds: BTreeMap<String, i64> = BTreeMap::new();
-    for row in observations.iter().filter(|row| {
+    for row in observations.iter().until_cancelled().filter(|row| {
         owners.contains(&row.session)
             && row
                 .flags
                 .iter()
+                .until_cancelled()
                 .any(|flag| flag == "session_identity_missing")
     }) {
         bounds
@@ -794,13 +1050,14 @@ fn anonymous_bounds(
     }
     // Events-only compatibility caches have second precision. Preserve the
     // entire final second rather than inventing a millisecond cutoff.
-    let raw_owners: BTreeSet<_> = bounds.keys().cloned().collect();
-    for event in events.iter().filter(|event| {
+    let raw_owners: BTreeSet<_> = bounds.keys().until_cancelled().cloned().collect();
+    for event in events.iter().until_cancelled().filter(|event| {
         owners.contains(&event.session)
             && !raw_owners.contains(&event.session)
             && event
                 .partial_flags
                 .iter()
+                .until_cancelled()
                 .any(|flag| flag == "session_identity_missing")
     }) {
         let end = event.timestamp.saturating_mul(1000).saturating_add(999);
@@ -829,11 +1086,15 @@ impl<'a> EventPolicy<'a> {
         anonymous_threads: &'a BTreeSet<String>,
         anonymous_bounds_ms: &BTreeMap<String, i64>,
     ) -> Self {
-        let anonymous_bound_ms = anonymous_threads.iter().try_fold(i64::MIN, |bound, id| {
-            #[cfg(test)]
-            POLICY_BOUND_LOOKUPS.with(|count| count.set(count.get() + 1));
-            anonymous_bounds_ms.get(id).map(|value| bound.max(*value))
-        });
+        let anonymous_bound_ms =
+            anonymous_threads
+                .iter()
+                .until_cancelled()
+                .try_fold(i64::MIN, |bound, id| {
+                    #[cfg(test)]
+                    POLICY_BOUND_LOOKUPS.with(|count| count.set(count.get() + 1));
+                    anonymous_bounds_ms.get(id).map(|value| bound.max(*value))
+                });
         Self {
             response_present: !response_threads.is_empty(),
             anonymous_threads,
@@ -849,6 +1110,7 @@ impl<'a> EventPolicy<'a> {
                 && event
                     .partial_flags
                     .iter()
+                    .until_cancelled()
                     .any(|f| f == "session_identity_missing"));
         }
         let proven_disjoint = self
@@ -963,6 +1225,35 @@ impl Default for TokenStore {
     }
 }
 impl TokenStore {
+    /// Fallible boundaries for background work. Canceled importer instances must
+    /// be discarded; neither their cursors nor partial derived data may be committed.
+    pub fn header_checked(&self) -> io::Result<StoreHeader> {
+        checked(|| self.header())
+    }
+    pub fn thread_shards_checked(&self) -> io::Result<Vec<ThreadShard>> {
+        checked(|| self.thread_shards())
+    }
+    pub fn into_thread_shards_checked(self) -> io::Result<Vec<ThreadShard>> {
+        checked(|| self.into_thread_shards())
+    }
+    pub fn dirty_export_checked(&self) -> io::Result<DirtyExport> {
+        checked(|| self.dirty_export())
+    }
+    pub fn finish_hydration_for_export_checked(&mut self) -> io::Result<()> {
+        checked(|| self.finish_hydration_for_export())
+    }
+    pub fn refresh_cached_prices_checked(&mut self, pricing: &Pricing) -> io::Result<()> {
+        checked(|| self.refresh_cached_prices(pricing))
+    }
+    pub fn reprice_checked(&mut self, pricing: &Pricing) -> io::Result<()> {
+        checked(|| self.reprice(pricing))
+    }
+    pub fn reprice_hydrated_checked(&mut self, pricing: &Pricing) -> io::Result<()> {
+        checked(|| self.reprice_hydrated(pricing))
+    }
+    fn reconcile_checked(&mut self, pricing: &Pricing) -> io::Result<()> {
+        checked(|| self.reconcile(pricing))
+    }
     /// Start a lazy database-backed importer without loading historical usage.
     pub fn from_header(header: StoreHeader) -> Self {
         let anonymous_policy_bound_ms = header.event_policy().anonymous_bound_ms;
@@ -993,18 +1284,28 @@ impl TokenStore {
     pub fn header(&self) -> StoreHeader {
         let (response_threads, anonymous_threads) = if self.database_mode {
             (
-                self.response_threads.clone(),
-                self.anonymous_threads.clone(),
+                self.response_threads
+                    .iter()
+                    .until_cancelled()
+                    .cloned()
+                    .collect(),
+                self.anonymous_threads
+                    .iter()
+                    .until_cancelled()
+                    .cloned()
+                    .collect(),
             )
         } else {
             let responses: BTreeSet<_> = self
                 .observations
                 .iter()
+                .until_cancelled()
                 .filter(|r| r.source_kind.as_deref() == Some("token_usage_record"))
                 .map(|r| r.session.clone())
                 .chain(
                     self.events
                         .iter()
+                        .until_cancelled()
                         .filter(|e| e.source_kind.as_deref() == Some("token_usage_record"))
                         .map(|e| e.session.clone()),
                 )
@@ -1012,7 +1313,13 @@ impl TokenStore {
             let candidates: BTreeSet<_> = self
                 .observations
                 .iter()
-                .filter(|r| r.flags.iter().any(|f| f == "session_identity_missing"))
+                .until_cancelled()
+                .filter(|r| {
+                    r.flags
+                        .iter()
+                        .until_cancelled()
+                        .any(|f| f == "session_identity_missing")
+                })
                 .map(|r| r.session.clone())
                 .collect();
             let mut anonymous = BTreeSet::new();
@@ -1023,6 +1330,7 @@ impl TokenStore {
                 for row in self
                     .observations
                     .iter()
+                    .until_cancelled()
                     .filter(|row| candidates.contains(&row.session))
                 {
                     candidate_shards
@@ -1037,6 +1345,7 @@ impl TokenStore {
                 for row in self
                     .contexts
                     .iter()
+                    .until_cancelled()
                     .filter(|row| candidates.contains(&row.session))
                 {
                     if let Some(shard) = candidate_shards.get_mut(&row.session) {
@@ -1046,6 +1355,7 @@ impl TokenStore {
                 for row in self
                     .effort_contexts
                     .iter()
+                    .until_cancelled()
                     .filter(|row| candidates.contains(&row.session))
                 {
                     if let Some(shard) = candidate_shards.get_mut(&row.session) {
@@ -1053,15 +1363,16 @@ impl TokenStore {
                     }
                 }
             }
-            for mut shard in candidate_shards.into_values() {
+            for mut shard in cancel_iter(candidate_shards.into_values().until_cancelled()) {
                 self.normalize_shard(
                     &mut shard,
                     self.last_pricing.as_ref().unwrap_or(&Pricing::default()),
                 );
                 if !responses.contains(&shard.thread_id)
-                    && shard.events.iter().any(|e| {
+                    && shard.events.iter().until_cancelled().any(|e| {
                         e.partial_flags
                             .iter()
+                            .until_cancelled()
                             .any(|f| f == "session_identity_missing")
                     })
                 {
@@ -1071,35 +1382,69 @@ impl TokenStore {
             (responses, anonymous)
         };
         let anonymous_bounds_ms = if self.database_mode {
-            self.anonymous_bounds_ms.clone()
+            self.anonymous_bounds_ms
+                .iter()
+                .until_cancelled()
+                .map(|(key, value)| (key.clone(), *value))
+                .collect()
         } else {
             anonymous_bounds(&anonymous_threads, &self.observations, &self.events)
         };
         StoreHeader {
             version: self.version,
             normalization_version: self.normalization_version,
-            sources: self.sources.clone(),
-            recorded_task_models: self.recorded_task_models.clone(),
-            recorded_names: self.recorded_names.clone(),
-            recorded_parents: self.recorded_parents.clone(),
+            sources: self
+                .sources
+                .iter()
+                .until_cancelled()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            recorded_task_models: self
+                .recorded_task_models
+                .iter()
+                .until_cancelled()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            recorded_names: self
+                .recorded_names
+                .iter()
+                .until_cancelled()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            recorded_parents: self
+                .recorded_parents
+                .iter()
+                .until_cancelled()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             metadata_path: self.metadata_path.clone(),
             metadata_cursor: self.metadata_cursor.clone(),
-            metadata_names: self.metadata_names.clone(),
+            metadata_names: self
+                .metadata_names
+                .iter()
+                .until_cancelled()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             revision: self.revision,
             next_sequence: self.next_sequence.max(
                 self.observations
                     .iter()
+                    .until_cancelled()
                     .map(|row| row.sequence.saturating_add(1))
                     .max()
                     .unwrap_or(0),
             ),
             pricing: self.last_pricing.clone(),
-            quota: self.quota.clone(),
+            quota: self.quota.iter().until_cancelled().cloned().collect(),
             response_threads,
             anonymous_threads,
             anonymous_bounds_ms,
             excluded_tasks: if self.database_mode {
-                self.excluded_task_cache.clone()
+                self.excluded_task_cache
+                    .iter()
+                    .until_cancelled()
+                    .cloned()
+                    .collect()
             } else {
                 self.excluded_auto_review_tasks()
             },
@@ -1114,28 +1459,29 @@ impl TokenStore {
             })
         }
         let mut shards = BTreeMap::new();
-        for row in &self.observations {
+        for row in cancel_iter(&self.observations) {
             shard(&mut shards, &row.session)
                 .observations
                 .push(row.clone());
         }
-        for row in &self.contexts {
+        for row in cancel_iter(&self.contexts) {
             shard(&mut shards, &row.session).contexts.push(row.clone());
         }
-        for row in &self.effort_contexts {
+        for row in cancel_iter(&self.effort_contexts) {
             shard(&mut shards, &row.session)
                 .effort_contexts
                 .push(row.clone());
         }
         if self.database_mode {
-            for (thread, events) in &self.local_events {
-                shard(&mut shards, thread).events = events.clone();
+            for (thread, events) in cancel_iter(&self.local_events) {
+                shard(&mut shards, thread).events =
+                    events.iter().until_cancelled().cloned().collect();
             }
-            for thread in &self.hydrated_threads {
+            for thread in cancel_iter(&self.hydrated_threads) {
                 shard(&mut shards, thread);
             }
         } else {
-            for event in &self.events {
+            for event in cancel_iter(&self.events) {
                 shard(&mut shards, &event.session)
                     .events
                     .push(event.clone());
@@ -1145,6 +1491,7 @@ impl TokenStore {
             for id in self
                 .sources
                 .values()
+                .until_cancelled()
                 .filter_map(|cursor| cursor.session.as_deref())
             {
                 shard(&mut shards, id);
@@ -1152,21 +1499,23 @@ impl TokenStore {
             for id in self
                 .recorded_task_models
                 .keys()
-                .chain(self.recorded_names.keys())
-                .chain(self.recorded_parents.keys())
-                .chain(self.metadata_names.keys())
+                .until_cancelled()
+                .chain(self.recorded_names.keys().until_cancelled())
+                .chain(self.recorded_parents.keys().until_cancelled())
+                .chain(self.metadata_names.keys().until_cancelled())
             {
                 shard(&mut shards, id);
             }
             for parent in self
                 .recorded_parents
                 .values()
+                .until_cancelled()
                 .filter_map(|row| row.parent.as_deref())
             {
                 shard(&mut shards, parent);
             }
         }
-        shards.into_values().collect()
+        shards.into_values().until_cancelled().collect()
     }
 
     fn normalize_shard(&self, shard: &mut ThreadShard, pricing: &Pricing) {
@@ -1183,6 +1532,9 @@ impl TokenStore {
                 .insert(shard.thread_id.clone(), models.clone());
         }
         local.reconcile_full(pricing);
+        if checkpoint().is_err() {
+            return;
+        }
         shard.turn_usage = local.included_task_turn_usage().remove(&shard.thread_id);
         shard.observations = local.observations;
         shard.contexts = local.contexts;
@@ -1195,7 +1547,7 @@ impl TokenStore {
     pub fn thread_shards(&self) -> Vec<ThreadShard> {
         let mut shards = self.collect_loaded_shards(!self.database_mode);
         let pricing = self.last_pricing.clone().unwrap_or_default();
-        for shard in &mut shards {
+        for shard in cancel_iter(&mut shards) {
             self.normalize_shard(shard, &pricing);
         }
         shards
@@ -1212,27 +1564,28 @@ impl TokenStore {
             })
         }
         let mut shards = BTreeMap::new();
-        for row in std::mem::take(&mut self.observations) {
+        for row in cancel_iter(std::mem::take(&mut self.observations)) {
             shard(&mut shards, &row.session).observations.push(row);
         }
-        for row in std::mem::take(&mut self.contexts) {
+        for row in cancel_iter(std::mem::take(&mut self.contexts)) {
             shard(&mut shards, &row.session).contexts.push(row);
         }
-        for row in std::mem::take(&mut self.effort_contexts) {
+        for row in cancel_iter(std::mem::take(&mut self.effort_contexts)) {
             shard(&mut shards, &row.session).effort_contexts.push(row);
         }
         if self.database_mode {
-            for (thread, events) in std::mem::take(&mut self.local_events) {
+            for (thread, events) in cancel_iter(std::mem::take(&mut self.local_events)) {
                 shard(&mut shards, &thread).events = events;
             }
         } else {
-            for event in std::mem::take(&mut self.events) {
+            for event in cancel_iter(std::mem::take(&mut self.events)) {
                 shard(&mut shards, &event.session).events.push(event);
             }
         }
         for id in self
             .sources
             .values()
+            .until_cancelled()
             .filter_map(|cursor| cursor.session.as_deref())
         {
             shard(&mut shards, id);
@@ -1240,28 +1593,31 @@ impl TokenStore {
         for id in self
             .recorded_task_models
             .keys()
-            .chain(self.recorded_names.keys())
-            .chain(self.recorded_parents.keys())
-            .chain(self.metadata_names.keys())
+            .until_cancelled()
+            .chain(self.recorded_names.keys().until_cancelled())
+            .chain(self.recorded_parents.keys().until_cancelled())
+            .chain(self.metadata_names.keys().until_cancelled())
         {
             shard(&mut shards, id);
         }
         for parent in self
             .recorded_parents
             .values()
+            .until_cancelled()
             .filter_map(|row| row.parent.as_deref())
         {
             shard(&mut shards, parent);
         }
         let pricing = self.last_pricing.clone().unwrap_or_default();
-        let mut result: Vec<_> = shards.into_values().collect();
-        for shard in &mut result {
+        let mut result: Vec<_> = shards.into_values().until_cancelled().collect();
+        for shard in cancel_iter(&mut result) {
             self.normalize_shard(shard, &pricing);
         }
         result
     }
 
     pub fn hydrate_thread(&mut self, shard: ThreadShard) -> io::Result<()> {
+        checkpoint()?;
         if !self.database_mode {
             return Err(invalid_data("Thread hydration requires database mode"));
         }
@@ -1271,46 +1627,59 @@ impl TokenStore {
         if shard
             .observations
             .iter()
+            .until_cancelled()
             .any(|r| r.session != shard.thread_id)
-            || shard.contexts.iter().any(|r| r.session != shard.thread_id)
+            || shard
+                .contexts
+                .iter()
+                .until_cancelled()
+                .any(|r| r.session != shard.thread_id)
             || shard
                 .effort_contexts
                 .iter()
+                .until_cancelled()
                 .any(|r| r.session != shard.thread_id)
-            || shard.events.iter().any(|r| r.session != shard.thread_id)
+            || shard
+                .events
+                .iter()
+                .until_cancelled()
+                .any(|r| r.session != shard.thread_id)
         {
             return Err(invalid_data("Thread shard contains another logical thread"));
         }
         self.ensure_indexes();
+        checkpoint()?;
         // Validate the complete shard before mutating any importer state. A bad
         // row halfway through must not create a partial replacement on retry.
         let mut identities = BTreeSet::new();
-        if shard.observations.iter().any(|row| {
+        if shard.observations.iter().until_cancelled().any(|row| {
             self.known_observations.contains_key(&row.identity) || !identities.insert(&row.identity)
         }) {
             return Err(invalid_data(
                 "Thread shard contains duplicate observation identities",
             ));
         }
-        for row in shard.observations {
+        for row in cancel_iter(shard.observations) {
             self.next_sequence = self.next_sequence.max(row.sequence.saturating_add(1));
             let at = self.observations.len();
             self.known_observations.insert(row.identity.clone(), at);
             self.observations.push(row);
         }
-        self.contexts.extend(shard.contexts);
-        self.effort_contexts.extend(shard.effort_contexts);
+        self.contexts.extend(cancel_iter(shard.contexts));
+        self.effort_contexts
+            .extend(cancel_iter(shard.effort_contexts));
         let policy = EventPolicy {
             response_present: !self.response_threads.is_empty(),
             anonymous_threads: &self.anonymous_threads,
             anonymous_bound_ms: self.anonymous_policy_bound_ms,
         };
-        for event in &shard.events {
+        for event in cancel_iter(&shard.events) {
             let mut event = event.clone();
             if policy.apply(&mut event) {
                 self.events.push(event);
             }
         }
+        checkpoint()?;
         self.local_events
             .insert(shard.thread_id.clone(), shard.events);
         self.hydrated_threads.insert(shard.thread_id);
@@ -1318,16 +1687,21 @@ impl TokenStore {
     }
 
     fn reconcile_hydrated(&mut self, pricing: &Pricing) {
+        if checkpoint().is_err() {
+            return;
+        }
         let mut shards = self.collect_loaded_shards(false);
-        for shard in &mut shards {
+        for shard in cancel_iter(&mut shards) {
             self.normalize_shard(shard, pricing);
             let response = shard
                 .observations
                 .iter()
+                .until_cancelled()
                 .any(|r| r.source_kind.as_deref() == Some("token_usage_record"))
                 || shard
                     .events
                     .iter()
+                    .until_cancelled()
                     .any(|e| e.source_kind.as_deref() == Some("token_usage_record"));
             if response {
                 self.response_threads.insert(shard.thread_id.clone());
@@ -1335,9 +1709,10 @@ impl TokenStore {
                 self.response_threads.remove(&shard.thread_id);
             }
             let anonymous = !response
-                && shard.events.iter().any(|e| {
+                && shard.events.iter().until_cancelled().any(|e| {
                     e.partial_flags
                         .iter()
+                        .until_cancelled()
                         .any(|f| f == "session_identity_missing")
                 });
             if anonymous {
@@ -1356,18 +1731,37 @@ impl TokenStore {
                 .get(&shard.thread_id)
                 .cloned()
                 .unwrap_or_default();
-            models.extend(shard.contexts.iter().map(|context| context.model.clone()));
+            models.extend(
+                shard
+                    .contexts
+                    .iter()
+                    .until_cancelled()
+                    .map(|context| context.model.clone()),
+            );
             let only_review_models = models.len() == 1 && models.contains(AUTO_REVIEW_MODEL);
-            let any_review = shard.events.iter().any(TokenEvent::is_excluded_auto_review);
-            let any_included = shard.events.iter().any(|e| !e.is_excluded_auto_review());
+            let any_review = shard
+                .events
+                .iter()
+                .until_cancelled()
+                .any(TokenEvent::is_excluded_auto_review);
+            let any_included = shard
+                .events
+                .iter()
+                .until_cancelled()
+                .any(|e| !e.is_excluded_auto_review());
             if (only_review_models || any_review) && !any_included {
                 self.excluded_task_cache.insert(shard.thread_id.clone());
             } else {
                 self.excluded_task_cache.remove(&shard.thread_id);
             }
             self.dirty_threads.insert(shard.thread_id.clone());
-            self.local_events
-                .insert(shard.thread_id.clone(), shard.events.clone());
+            self.local_events.insert(
+                shard.thread_id.clone(),
+                shard.events.iter().until_cancelled().cloned().collect(),
+            );
+        }
+        if checkpoint().is_err() {
+            return;
         }
         // Keep the persisted evidence in the same canonical order/deduplicated
         // context form as the full normalizer; otherwise copied contexts would
@@ -1375,43 +1769,49 @@ impl TokenStore {
         self.observations.clear();
         self.contexts.clear();
         self.effort_contexts.clear();
-        for shard in shards {
-            self.observations.extend(shard.observations);
-            self.contexts.extend(shard.contexts);
-            self.effort_contexts.extend(shard.effort_contexts);
+        for shard in cancel_iter(shards) {
+            self.observations.extend(cancel_iter(shard.observations));
+            self.contexts.extend(cancel_iter(shard.contexts));
+            self.effort_contexts
+                .extend(cancel_iter(shard.effort_contexts));
         }
         self.observations
-            .sort_by_key(|a| (a.timestamp_ms, a.sequence));
-        self.contexts.sort_by(|a, b| {
+            .sort_cancellable_by_key(|a| (a.timestamp_ms, a.sequence));
+        self.contexts.sort_cancellable_by(|a, b| {
             a.timestamp_ms
                 .cmp(&b.timestamp_ms)
                 .then(a.session.cmp(&b.session))
                 .then(a.model.cmp(&b.model))
         });
-        self.effort_contexts.sort();
+        self.effort_contexts.sort_cancellable();
         self.known_observations = self
             .observations
             .iter()
+            .until_cancelled()
             .enumerate()
             .map(|(index, row)| (row.identity.clone(), index))
             .collect();
-        self.events.clear();
+        let mut normalized_events = Vec::new();
         let policy = EventPolicy::new(
             &self.response_threads,
             &self.anonymous_threads,
             &self.anonymous_bounds_ms,
         );
         self.anonymous_policy_bound_ms = policy.anonymous_bound_ms;
-        for events in self.local_events.values() {
-            for event in events {
+        for events in self.local_events.values().until_cancelled() {
+            for event in cancel_iter(events) {
                 let mut event = event.clone();
                 if policy.apply(&mut event) {
-                    self.events.push(event);
+                    normalized_events.push(event);
                 }
             }
         }
-        self.events
-            .sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+        normalized_events
+            .sort_cancellable_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+        if checkpoint().is_err() {
+            return;
+        }
+        self.events = normalized_events;
         self.last_pricing = Some(pricing.clone());
         self.normalization_version = NORMALIZATION_VERSION;
         self.usage_dirty = false;
@@ -1423,13 +1823,19 @@ impl TokenStore {
         let mut shards: Vec<_> = self
             .collect_loaded_shards(false)
             .into_iter()
+            .until_cancelled()
             .filter(|s| self.dirty_threads.contains(&s.thread_id))
             .collect();
         // Derive tooltip data from each already-normalized local event cache.
-        for shard in &mut shards {
+        for shard in cancel_iter(&mut shards) {
             let local = Self {
-                observations: shard.observations.clone(),
-                events: shard.events.clone(),
+                observations: shard
+                    .observations
+                    .iter()
+                    .until_cancelled()
+                    .cloned()
+                    .collect(),
+                events: shard.events.iter().until_cancelled().cloned().collect(),
                 ..Self::default()
             };
             shard.turn_usage = local.included_task_turn_usage().remove(&shard.thread_id);
@@ -1443,17 +1849,23 @@ impl TokenStore {
     /// Finish an all-shard compatibility export without changing its committed
     /// revision or recomputing accounting. Exporters must hydrate every shard.
     pub fn finish_hydration_for_export(&mut self) {
+        if checkpoint().is_err() {
+            return;
+        }
         self.observations
-            .sort_by_key(|a| (a.timestamp_ms, a.sequence));
-        self.contexts.sort_by(|a, b| {
+            .sort_cancellable_by_key(|a| (a.timestamp_ms, a.sequence));
+        self.contexts.sort_cancellable_by(|a, b| {
             a.timestamp_ms
                 .cmp(&b.timestamp_ms)
                 .then(a.session.cmp(&b.session))
                 .then(a.model.cmp(&b.model))
         });
-        self.effort_contexts.sort();
+        self.effort_contexts.sort_cancellable();
         self.events
-            .sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+            .sort_cancellable_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+        if checkpoint().is_err() {
+            return;
+        }
         self.indexes_ready = false;
         // A complete compatibility export is an ordinary standalone TokenStore.
         // It can be inspected/repriced without a database hydration callback.
@@ -1469,7 +1881,7 @@ impl TokenStore {
     /// Refresh derived display prices without replaying accounting evidence.
     /// Model override/default changes must be reconciled before calling this.
     pub fn refresh_cached_prices(&mut self, pricing: &Pricing) {
-        for event in &mut self.events {
+        for event in cancel_iter(&mut self.events) {
             event.cost_usd = event_cost(event, pricing);
         }
     }
@@ -1522,6 +1934,9 @@ impl TokenStore {
                 progress,
             );
             if let Err(error) = self.import_metadata_index(path, &mut report) {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
                 if error.kind() != io::ErrorKind::NotFound {
                     report.warnings.push(format!(
                         "Could not read task-name metadata {}: {error}",
@@ -1534,19 +1949,21 @@ impl TokenStore {
             self.metadata_names.clear();
             self.revision = self.revision.saturating_add(1);
         }
+        checkpoint()?;
         Ok(report)
     }
 
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        checkpoint()?;
         match File::open(path.as_ref()) {
             Ok(file) => {
-                let mut store: Self =
-                    serde_json::from_reader(BufReader::new(file)).map_err(invalid_data)?;
+                let mut store: Self = read_token_store(file)?;
                 store.persisted_revision_at_load = Some(store.revision);
                 store.next_sequence = store.next_sequence.max(
                     store
                         .observations
                         .iter()
+                        .until_cancelled()
                         .map(|row| row.sequence.saturating_add(1))
                         .max()
                         .unwrap_or(0),
@@ -1560,11 +1977,11 @@ impl TokenStore {
                     // Older stores collapsed absent optional counters to zero.
                     // Until selected source replay enriches them, do not claim
                     // those cached/reasoning counts or exact prices are known.
-                    for row in &mut store.observations {
+                    for row in cancel_iter(&mut store.observations) {
                         flag(&mut row.flags, "cached_count_unavailable");
                         flag(&mut row.flags, "reasoning_count_unavailable");
                     }
-                    for event in &mut store.events {
+                    for event in cancel_iter(&mut store.events) {
                         flag(&mut event.partial_flags, "cached_count_unavailable");
                         flag(&mut event.partial_flags, "reasoning_count_unavailable");
                         event.cost_usd = None;
@@ -1583,7 +2000,7 @@ impl TokenStore {
                     // omitted by old caches is recovered only from selected files.
                     store.sources.clear();
                     let pricing = store.last_pricing.clone().unwrap_or_default();
-                    store.reconcile(&pricing);
+                    store.reconcile_checked(&pricing)?;
                 }
                 // Events are a derived cache. A current-version file may still
                 // have retained observations but a missing/empty event cache
@@ -1593,9 +2010,10 @@ impl TokenStore {
                 // do not clear cursors or touch the source file.
                 if store.events.is_empty() && !store.observations.is_empty() {
                     let pricing = store.last_pricing.clone().unwrap_or_default();
-                    store.reconcile(&pricing);
+                    store.reconcile_checked(&pricing)?;
                 }
                 store.refresh_mixed_schema_warning();
+                checkpoint()?;
                 Ok(store)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
@@ -1604,6 +2022,7 @@ impl TokenStore {
     }
     /// Atomic replacement; the application must hold its shared writer lock around load/mutate/save.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        checkpoint()?;
         let path = path.as_ref();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
@@ -1619,10 +2038,12 @@ impl TokenStore {
                 .create_new(true)
                 .open(&temporary)?;
             write_token_store(&mut file, self)?;
+            checkpoint()?;
             file.sync_all()?;
             // In particular on Windows, release the completed temporary file
             // before attempting the same-directory atomic replacement.
             drop(file);
+            checkpoint()?;
             fs::rename(&temporary, path)
         })();
         if result.is_err() {
@@ -1642,6 +2063,7 @@ impl TokenStore {
         path: &Path,
         before_publish: impl FnOnce(),
     ) -> io::Result<()> {
+        checkpoint()?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
@@ -1656,11 +2078,13 @@ impl TokenStore {
             .open(&temporary)?;
         let result = (|| {
             write_token_store(&mut file, self)?;
+            checkpoint()?;
             file.sync_all()?;
             // Windows requires the completed temporary file to be closed before
             // publishing it. A hard link creates a new name or fails atomically.
             drop(file);
             before_publish();
+            checkpoint()?;
             fs::hard_link(&temporary, path).map_err(|error| {
                 io::Error::new(error.kind(), format!(
                     "Could not publish export without replacing existing data; atomic same-directory hard links are required: {error}"))
@@ -1682,6 +2106,7 @@ impl TokenStore {
             ("gpt-6.1-sol", 18_200, 14_100, 2_320, 1_120),
         ]
         .into_iter()
+        .until_cancelled()
         .enumerate()
         {
             let session = format!(
@@ -1786,9 +2211,15 @@ impl TokenStore {
         let mut names: BTreeMap<_, _> = self
             .recorded_names
             .iter()
+            .until_cancelled()
             .map(|(id, row)| (id.clone(), row.name.clone()))
             .collect();
-        names.extend(self.metadata_names.clone());
+        names.extend(
+            self.metadata_names
+                .iter()
+                .until_cancelled()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         names
     }
     /// Authoritative immediate parent relationships from official thread metadata.
@@ -1797,6 +2228,7 @@ impl TokenStore {
     pub fn task_parents(&self) -> BTreeMap<String, String> {
         self.recorded_parents
             .iter()
+            .until_cancelled()
             .filter_map(|(task, row)| {
                 row.parent
                     .as_ref()
@@ -1817,8 +2249,13 @@ impl TokenStore {
     /// Review-only tasks may be hidden, including metadata-only review tasks.
     /// Any included event or contradictory recorded model evidence keeps the task.
     pub fn excluded_auto_review_tasks(&self) -> BTreeSet<String> {
-        let mut models = self.recorded_task_models.clone();
-        for context in &self.contexts {
+        let mut models: BTreeMap<String, BTreeSet<String>> = self
+            .recorded_task_models
+            .iter()
+            .until_cancelled()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        for context in cancel_iter(&self.contexts) {
             models
                 .entry(context.session.clone())
                 .or_default()
@@ -1826,11 +2263,12 @@ impl TokenStore {
         }
         let mut excluded: BTreeSet<String> = models
             .iter()
+            .until_cancelled()
             .filter(|(_, models)| models.len() == 1 && models.contains(AUTO_REVIEW_MODEL))
             .map(|(task, _)| task.clone())
             .collect();
         let mut included = BTreeSet::new();
-        for event in &self.events {
+        for event in cancel_iter(&self.events) {
             if event.is_excluded_auto_review() {
                 excluded.insert(event.session.clone());
             } else {
@@ -1845,6 +2283,7 @@ impl TokenStore {
         let excluded_turns: BTreeSet<(&str, &str)> = if exclude_review {
             self.events
                 .iter()
+                .until_cancelled()
                 .filter(|event| event.is_excluded_auto_review())
                 .filter_map(|event| {
                     event
@@ -1857,11 +2296,11 @@ impl TokenStore {
             BTreeSet::new()
         };
         let mut latest: BTreeMap<&str, &TokenEvent> = BTreeMap::new();
-        for event in self.events.iter().filter(included) {
+        for event in self.events.iter().until_cancelled().filter(included) {
             latest.insert(&event.session, event);
         }
         let mut sums: BTreeMap<(&str, &str), (u64, u64, bool, bool)> = BTreeMap::new();
-        for event in self.events.iter().filter(included) {
+        for event in self.events.iter().until_cancelled().filter(included) {
             if let Some(turn) = event.turn_id.as_deref() {
                 let counts = sums
                     .entry((&event.session, turn))
@@ -1871,15 +2310,17 @@ impl TokenStore {
                 counts.2 &= !event
                     .partial_flags
                     .iter()
+                    .until_cancelled()
                     .any(|f| f == "input_count_unavailable");
                 counts.3 &= !event
                     .partial_flags
                     .iter()
+                    .until_cancelled()
                     .any(|f| f == "output_count_unavailable");
             }
         }
         let mut snapshots: BTreeMap<(&str, &str), &UsageObservation> = BTreeMap::new();
-        for row in &self.observations {
+        for row in cancel_iter(&self.observations) {
             if let Some(turn) = row
                 .turn_id
                 .as_deref()
@@ -1897,6 +2338,7 @@ impl TokenStore {
         }
         latest
             .into_iter()
+            .until_cancelled()
             .map(|(task, event)| {
                 let mut usage = TaskTurnUsage {
                     turn_id: event.turn_id.clone(),
@@ -1922,6 +2364,7 @@ impl TokenStore {
                         } else if !snapshot
                             .flags
                             .iter()
+                            .until_cancelled()
                             .any(|flag| flag == "invalid_usage_snapshot")
                         {
                             if let Some(counts) = snapshot.turn_total {
@@ -1958,6 +2401,7 @@ impl TokenStore {
     pub fn select_events(&self, from: Option<i64>, to: Option<i64>) -> Vec<&TokenEvent> {
         self.events
             .iter()
+            .until_cancelled()
             .filter(|e| from.is_none_or(|v| e.timestamp >= v) && to.is_none_or(|v| e.timestamp < v))
             .collect()
     }
@@ -1969,6 +2413,7 @@ impl TokenStore {
         for event in self
             .select_events(from, to)
             .into_iter()
+            .until_cancelled()
             .filter(|event| !event.is_excluded_auto_review())
         {
             result.event_count += 1;
@@ -1985,15 +2430,19 @@ impl TokenStore {
             }
         }
         result.total_tokens = result.input.saturating_add(result.output);
-        let coverage_incomplete = self.select_events(from, to).iter().any(|e| {
-            !e.is_excluded_auto_review()
-                && e.partial_flags.iter().any(|f| {
-                    matches!(
-                        f.as_str(),
-                        "response_coverage_gap" | "mixed_schema_legacy_overlap_suppressed"
-                    )
-                })
-        });
+        let coverage_incomplete = self
+            .select_events(from, to)
+            .iter()
+            .until_cancelled()
+            .any(|e| {
+                !e.is_excluded_auto_review()
+                    && e.partial_flags.iter().until_cancelled().any(|f| {
+                        matches!(
+                            f.as_str(),
+                            "response_coverage_gap" | "mixed_schema_legacy_overlap_suppressed"
+                        )
+                    })
+            });
         result.cost_usd =
             (result.unpriced_events == 0 && !coverage_incomplete).then_some(result.priced_cost_usd);
         result
@@ -2017,6 +2466,7 @@ impl TokenStore {
             self.next_sequence = self.next_sequence.max(
                 self.observations
                     .iter()
+                    .until_cancelled()
                     .map(|row| row.sequence.saturating_add(1))
                     .max()
                     .unwrap_or(0),
@@ -2024,13 +2474,20 @@ impl TokenStore {
             self.known_observations = self
                 .observations
                 .iter()
+                .until_cancelled()
                 .enumerate()
                 .map(|(index, row)| (row.identity.clone(), index))
                 .collect();
-            self.known_quota = self.quota.iter().map(quota_identity).collect();
+            self.known_quota = self
+                .quota
+                .iter()
+                .until_cancelled()
+                .map(quota_identity)
+                .collect();
             self.legacy_quota = self
                 .quota
                 .iter()
+                .until_cancelled()
                 .enumerate()
                 .filter(|(_, row)| row.origin_session.is_none() && row.source_id.is_none())
                 .map(|(index, row)| (legacy_quota_identity(row), index))
@@ -2085,9 +2542,13 @@ impl TokenStore {
         self.revision = self.revision.saturating_add(1);
     }
     fn refresh_mixed_schema_warning(&mut self) {
-        self.mixed_schema_warning = self.events.iter().any(|e| {
+        if checkpoint().is_err() {
+            return;
+        }
+        self.mixed_schema_warning = self.events.iter().until_cancelled().any(|e| {
             e.partial_flags
                 .iter()
+                .until_cancelled()
                 .any(|f| f == "mixed_schema_legacy_overlap_suppressed")
         });
     }
@@ -2135,6 +2596,7 @@ impl TokenStore {
         progress: &mut dyn FnMut(ImportProgress),
         mut loader: Option<&mut ThreadLoader<'_>>,
     ) -> io::Result<ImportReport> {
+        checkpoint()?;
         let mut report = ImportReport::default();
         self.report_progress(ImportPhase::Discovering, &report, 0, progress);
         if fs::symlink_metadata(root)?.file_type().is_symlink() {
@@ -2144,14 +2606,15 @@ impl TokenStore {
         }
         let mut paths = Vec::new();
         collect_jsonl(root, &mut paths, &mut report)?;
-        paths.sort();
+        paths.sort_cancellable();
         let files_total = paths.len();
         self.report_progress(ImportPhase::Reading, &report, files_total, progress);
         let mut last_progress = Instant::now();
         let old_observation_count = self.observations.len();
         let old_context_count = self.contexts.len();
         let old_effort_context_count = self.effort_contexts.len();
-        for path in paths {
+        for path in cancel_iter(paths) {
+            checkpoint()?;
             if let Err(error) = self.import_file(
                 &path,
                 &mut report,
@@ -2160,6 +2623,9 @@ impl TokenStore {
                 progress,
                 &mut loader,
             ) {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
                 report
                     .warnings
                     .push(format!("Could not read {}: {error}", path.display()));
@@ -2171,6 +2637,7 @@ impl TokenStore {
             }
         }
         self.report_progress(ImportPhase::Reading, &report, files_total, progress);
+        checkpoint()?;
         if self.usage_dirty
             || self.observations.len() != old_observation_count
             || self.contexts.len() != old_context_count
@@ -2179,11 +2646,17 @@ impl TokenStore {
         {
             self.report_progress(ImportPhase::Reconciling, &report, files_total, progress);
             // Only a real reconciliation needs an old-ID set, never an idle poll.
-            let old_ids: BTreeSet<_> = self.events.iter().map(|event| event.id.clone()).collect();
-            self.reconcile(pricing);
+            let old_ids: BTreeSet<_> = self
+                .events
+                .iter()
+                .until_cancelled()
+                .map(|event| event.id.clone())
+                .collect();
+            self.reconcile_checked(pricing)?;
             report.events_added = self
                 .events
                 .iter()
+                .until_cancelled()
                 .filter(|event| !old_ids.contains(&event.id))
                 .count();
         }
@@ -2192,17 +2665,21 @@ impl TokenStore {
         }
         if !report.quota_observations.is_empty() {
             self.quota
-                .sort_by_key(|row| (row.timestamp, row.timestamp_ms));
+                .sort_cancellable_by_key(|row| (row.timestamp, row.timestamp_ms));
             // Sorting invalidates legacy enrichment positions, only relevant at migration.
             self.legacy_quota = self
                 .quota
                 .iter()
+                .until_cancelled()
                 .enumerate()
                 .filter(|(_, row)| row.origin_session.is_none() && row.source_id.is_none())
                 .map(|(index, row)| (legacy_quota_identity(row), index))
                 .collect();
         }
-        report.quota_observations.sort_by_key(|row| row.timestamp);
+        report
+            .quota_observations
+            .sort_cancellable_by_key(|row| row.timestamp);
+        checkpoint()?;
         Ok(report)
     }
 
@@ -2236,6 +2713,9 @@ impl TokenStore {
                 progress,
             );
             if let Err(error) = self.import_metadata_index(path, &mut report) {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
                 if error.kind() != io::ErrorKind::NotFound {
                     report.warnings.push(format!(
                         "Could not read task-name metadata {}: {error}",
@@ -2248,10 +2728,12 @@ impl TokenStore {
             self.metadata_names.clear();
             self.revision = self.revision.saturating_add(1);
         }
+        checkpoint()?;
         Ok(report)
     }
 
     fn import_metadata_index(&mut self, path: &Path, report: &mut ImportReport) -> io::Result<()> {
+        checkpoint()?;
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2299,6 +2781,7 @@ impl TokenStore {
         let available = metadata.len().saturating_sub(cursor.offset);
         let mut reader = BufReader::new(file.take(available));
         loop {
+            checkpoint()?;
             let (bytes, length, complete, oversized) = read_bounded_line(&mut reader)?;
             if length == 0 {
                 break;
@@ -2314,7 +2797,7 @@ impl TokenStore {
                 report.malformed_json_line(path, offset, "oversized line exceeds the 4 MiB limit");
                 continue;
             }
-            if bytes.iter().all(u8::is_ascii_whitespace) {
+            if bytes.iter().until_cancelled().all(u8::is_ascii_whitespace) {
                 continue;
             }
             let value: Value = match serde_json::from_slice(&bytes) {
@@ -2334,11 +2817,13 @@ impl TokenStore {
                 self.metadata_names.insert(id, name.trim().to_owned());
             }
         }
+        checkpoint()?;
         finish_cursor(
             &mut reader.into_inner().into_inner(),
             &mut cursor,
             &metadata,
         )?;
+        checkpoint()?;
         if self.metadata_cursor != cursor {
             self.metadata_cursor = cursor;
             self.revision = self.revision.saturating_add(1);
@@ -2355,6 +2840,7 @@ impl TokenStore {
         progress: &mut dyn FnMut(ImportProgress),
         loader: &mut Option<&mut ThreadLoader<'_>>,
     ) -> io::Result<()> {
+        checkpoint()?;
         let canonical = fs::canonicalize(path)?;
         let key = canonical.to_string_lossy().into_owned();
         let mut cursor = self.sources.get(&key).cloned().unwrap_or_default();
@@ -2368,6 +2854,7 @@ impl TokenStore {
             return Ok(());
         }
         self.ensure_indexes();
+        checkpoint()?;
         let mut file = File::open(path)?;
         let metadata = file.metadata()?;
         let changed = source_rewritten(&mut file, &cursor, &metadata)?;
@@ -2389,6 +2876,7 @@ impl TokenStore {
         let available = metadata.len().saturating_sub(cursor.offset);
         let mut reader = BufReader::new(file.take(available));
         loop {
+            checkpoint()?;
             let (bytes, length, complete, oversized) = read_bounded_line(&mut reader)?;
             if length == 0 {
                 break;
@@ -2410,7 +2898,7 @@ impl TokenStore {
                 report.malformed_json_line(path, offset, "oversized line exceeds the 4 MiB limit");
                 continue;
             }
-            if bytes.iter().all(u8::is_ascii_whitespace) {
+            if bytes.iter().until_cancelled().all(u8::is_ascii_whitespace) {
                 continue;
             }
             let value: Value = match serde_json::from_slice(&bytes) {
@@ -2422,11 +2910,13 @@ impl TokenStore {
             };
             self.consume_value(&value, &key, &mut cursor, changed, report, loader)?;
         }
+        checkpoint()?;
         finish_cursor(
             &mut reader.into_inner().into_inner(),
             &mut cursor,
             &metadata,
         )?;
+        checkpoint()?;
         if self.sources.get(&key) != Some(&cursor) {
             self.revision = self.revision.saturating_add(1);
             self.sources.insert(key, cursor);
@@ -2443,6 +2933,7 @@ impl TokenStore {
         report: &mut ImportReport,
         loader: &mut Option<&mut ThreadLoader<'_>>,
     ) -> io::Result<()> {
+        checkpoint()?;
         let payload = value.get("payload").unwrap_or(value);
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
@@ -2696,7 +3187,7 @@ impl TokenStore {
             .get("thread_token_usage")
             .filter(|v| !v.is_null())
             .and_then(|v| parse_counts(v, &mut snapshot_flags));
-        if snapshot_flags.iter().any(|f| {
+        if snapshot_flags.iter().until_cancelled().any(|f| {
             !matches!(
                 f.as_str(),
                 "cache_write_pricing_unmodeled"
@@ -2733,6 +3224,7 @@ impl TokenStore {
         let source_model_turn_id = source_model.as_ref().and(cursor.model_turn_id.clone());
         let reasoning_efforts = [payload, info, value]
             .into_iter()
+            .until_cancelled()
             .flat_map(|value| effort_fields(value, &["reasoning_effort"]))
             .collect::<BTreeSet<_>>();
         let source_effort_context = cursor
@@ -2811,7 +3303,10 @@ impl TokenStore {
             source_model_timestamp_ms,
             source_model_turn_id,
             reasoning_efforts,
-            source_effort_contexts: source_effort_context.into_iter().collect(),
+            source_effort_contexts: source_effort_context
+                .into_iter()
+                .until_cancelled()
+                .collect(),
             total,
             last,
             flags,
@@ -2830,18 +3325,25 @@ impl TokenStore {
 
     /// Whole-store correctness oracle, also used inside one logical thread.
     fn reconcile_full(&mut self, pricing: &Pricing) {
+        if checkpoint().is_err() {
+            return;
+        }
         if self.observations.is_empty() {
-            for event in &mut self.events {
+            for event in cancel_iter(&mut self.events) {
                 if !event.model_assumed
                     && event.model == AUTO_REVIEW_MODEL
                     && !event
                         .partial_flags
                         .iter()
+                        .until_cancelled()
                         .any(|flag| flag == "model_override")
                 {
                     flag(&mut event.partial_flags, AUTO_REVIEW_EXCLUDED);
                 }
                 event.cost_usd = event_cost(event, pricing);
+            }
+            if checkpoint().is_err() {
+                return;
             }
             self.normalization_version = NORMALIZATION_VERSION;
             self.last_pricing = Some(pricing.clone());
@@ -2858,32 +3360,40 @@ impl TokenStore {
             seen_requests: BTreeSet<String>,
             seen_last: BTreeSet<String>,
         }
-        self.observations.sort_by(|a, b| {
+        self.observations.sort_cancellable_by(|a, b| {
             a.timestamp_ms
                 .cmp(&b.timestamp_ms)
                 .then(a.sequence.cmp(&b.sequence))
         });
-        self.contexts.sort_by(|a, b| {
+        self.contexts.sort_cancellable_by(|a, b| {
             a.timestamp_ms
                 .cmp(&b.timestamp_ms)
                 .then(a.session.cmp(&b.session))
                 .then(a.model.cmp(&b.model))
         });
-        self.contexts.dedup_by(|a, b| {
+        self.contexts.dedup_cancellable_by(|a, b| {
             a.timestamp_ms == b.timestamp_ms
                 && a.session == b.session
                 && a.turn_id == b.turn_id
                 && a.model == b.model
         });
+        if checkpoint().is_err() {
+            return;
+        }
         let recorded_models = RecordedModels::new(&self.contexts);
-        let mut model_evidence = self.recorded_task_models.clone();
-        for context in &self.contexts {
+        let mut model_evidence: BTreeMap<String, BTreeSet<String>> = self
+            .recorded_task_models
+            .iter()
+            .until_cancelled()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        for context in cancel_iter(&self.contexts) {
             model_evidence
                 .entry(context.session.clone())
                 .or_default()
                 .insert(context.model.clone());
         }
-        for row in &self.observations {
+        for row in cancel_iter(&self.observations) {
             if let Some(model) = recorded_models.recorded(row) {
                 model_evidence
                     .entry(row.session.clone())
@@ -2899,6 +3409,7 @@ impl TokenStore {
         for row in self
             .observations
             .iter()
+            .until_cancelled()
             .filter(|r| r.source_kind.as_deref() != Some("token_usage_record"))
         {
             let state = states.entry(row.session.clone()).or_default();
@@ -2986,7 +3497,7 @@ impl TokenStore {
             let recorded_model = recorded_models.recorded(row);
             let mut counts = counts;
             if recorded_model == Some(AUTO_REVIEW_MODEL) {
-                let aggregate_scope_uncertain = flags.iter().any(|flag| {
+                let aggregate_scope_uncertain = flags.iter().until_cancelled().any(|flag| {
                     matches!(
                         flag.as_str(),
                         "initial_snapshot_contains_unattributed_usage"
@@ -3104,7 +3615,7 @@ impl TokenStore {
                 previous.output = previous.output.saturating_add(event.output);
                 previous.reasoning = previous.reasoning.saturating_add(event.reasoning);
                 previous.model_assumed |= event.model_assumed;
-                for partial in event.partial_flags {
+                for partial in cancel_iter(event.partial_flags) {
                     flag(&mut previous.partial_flags, &partial);
                 }
                 previous.cost_usd = event_cost(previous, pricing);
@@ -3116,13 +3627,16 @@ impl TokenStore {
         }
         self.reconcile_response_records(&mut result, &recorded_models, pricing);
         self.apply_recorded_efforts(&mut result);
-        result.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
+        result.sort_cancellable_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
+        if checkpoint().is_err() {
+            return;
+        }
         self.events = result;
         self.normalization_version = NORMALIZATION_VERSION;
         self.last_pricing = Some(pricing.clone());
         self.refresh_mixed_schema_warning();
         if self.indexes_ready {
-            for (index, row) in self.observations.iter().enumerate() {
+            for (index, row) in self.observations.iter().until_cancelled().enumerate() {
                 if let Some(position) = self.known_observations.get_mut(&row.identity) {
                     *position = index;
                 }
@@ -3133,11 +3647,14 @@ impl TokenStore {
     }
 
     fn apply_recorded_efforts(&mut self, events: &mut [TokenEvent]) {
-        self.effort_contexts.sort();
-        self.effort_contexts.dedup();
+        if checkpoint().is_err() {
+            return;
+        }
+        self.effort_contexts.sort_cancellable();
+        self.effort_contexts.dedup_cancellable();
         let recorded = RecordedEfforts::new(&self.effort_contexts);
         let mut versions: BTreeMap<String, Vec<&UsageObservation>> = BTreeMap::new();
-        for row in &self.observations {
+        for row in cancel_iter(&self.observations) {
             let id = if row.source_kind.as_deref() == Some("token_usage_record") {
                 row.response_id.as_ref().map(|response| {
                     format!("response:{}:{}:{response}", row.session.len(), row.session)
@@ -3149,10 +3666,10 @@ impl TokenStore {
                 versions.entry(id).or_default().push(row);
             }
         }
-        for event in events {
+        for event in cancel_iter(events) {
             // A cumulative gap/residual can span different requests or efforts.
             // Metadata uncertainty must not alter pricing, partial flags or IDs.
-            let aggregate = event.partial_flags.iter().any(|flag| {
+            let aggregate = event.partial_flags.iter().until_cancelled().any(|flag| {
                 matches!(
                     flag.as_str(),
                     "initial_snapshot_contains_unattributed_usage"
@@ -3197,7 +3714,7 @@ impl TokenStore {
             })
         }
         let mut proof: BTreeMap<(&str, &str), Proof<'_>> = BTreeMap::new();
-        for (&(thread, response), &row) in selected {
+        for (&(thread, response), &row) in cancel_iter(selected) {
             let Some(turn) = row.turn_id.as_deref() else {
                 continue;
             };
@@ -3207,7 +3724,7 @@ impl TokenStore {
             } else {
                 state.invalid = true;
             }
-            for version in &versions[&(thread, response)] {
+            for version in cancel_iter(&versions[&(thread, response)]) {
                 state.first_response = Some(
                     state
                         .first_response
@@ -3219,7 +3736,7 @@ impl TokenStore {
                         .map_or(version.timestamp_ms, |old| old.max(version.timestamp_ms)),
                 );
                 if version.turn_id.as_deref() != Some(turn)
-                    || version.flags.iter().any(|flag| {
+                    || version.flags.iter().until_cancelled().any(|flag| {
                         flag.ends_with("_count_unavailable")
                             || matches!(
                                 flag.as_str(),
@@ -3237,7 +3754,7 @@ impl TokenStore {
             // Conflicting simultaneous versions cannot certify a complete turn.
             let rows = &versions[&(thread, response)];
             let mut seen: BTreeMap<i64, (Option<Counts>, Option<&str>)> = BTreeMap::new();
-            for version in rows {
+            for version in cancel_iter(rows) {
                 let value = (version.last, version.turn_id.as_deref());
                 if seen
                     .insert(version.timestamp_ms, value)
@@ -3247,7 +3764,7 @@ impl TokenStore {
                 }
             }
         }
-        for context in &self.effort_contexts {
+        for context in cancel_iter(&self.effort_contexts) {
             if let Some(turn) = context.turn_id.as_deref() {
                 if let Some(state) = proof.get_mut(&(context.session.as_str(), turn)) {
                     state.start = Some(
@@ -3258,7 +3775,7 @@ impl TokenStore {
                 }
             }
         }
-        for row in &self.observations {
+        for row in cancel_iter(&self.observations) {
             if row.source_kind.as_deref() == Some("token_usage_record") {
                 if let Some(turn) = row.turn_id.as_deref() {
                     if let Some(state) = proof.get_mut(&(row.session.as_str(), turn)) {
@@ -3271,6 +3788,7 @@ impl TokenStore {
         }
         proof
             .into_iter()
+            .until_cancelled()
             .filter_map(|(key, mut state)| {
                 let start = state.start?;
                 if state.invalid || state.first_response.is_none_or(|time| time < start) {
@@ -3278,9 +3796,9 @@ impl TokenStore {
                 }
                 state
                     .snapshots
-                    .sort_by_key(|row| (row.timestamp_ms, &row.identity));
+                    .sort_cancellable_by_key(|row| (row.timestamp_ms, &row.identity));
                 let mut previous: Option<(i64, Counts)> = None;
-                for row in &state.snapshots {
+                for row in cancel_iter(&state.snapshots) {
                     let raw = row.raw_turn_counts.as_ref()?.complete()?;
                     if row.turn_total != Some(raw)
                         || raw.cached > raw.input
@@ -3288,6 +3806,7 @@ impl TokenStore {
                         || row
                             .flags
                             .iter()
+                            .until_cancelled()
                             .any(|flag| flag == "invalid_usage_snapshot")
                         || previous.is_some_and(|(time, counts)| {
                             raw.decreased_from(counts)
@@ -3321,6 +3840,7 @@ impl TokenStore {
         for row in self
             .observations
             .iter()
+            .until_cancelled()
             .filter(|r| r.source_kind.as_deref() == Some("token_usage_record"))
         {
             let Some(response) = row.response_id.as_deref() else {
@@ -3347,17 +3867,19 @@ impl TokenStore {
             return;
         }
         let mut by_thread: BTreeMap<&str, Vec<&UsageObservation>> = BTreeMap::new();
-        for ((thread, _), row) in &selected {
+        for ((thread, _), row) in cancel_iter(&selected) {
             by_thread.entry(thread).or_default().push(*row);
         }
         let response_turns: BTreeMap<_, _> = by_thread
             .iter()
+            .until_cancelled()
             .map(|(thread, rows)| {
                 (
                     *thread,
                     (
-                        rows.iter().all(|r| r.turn_id.is_some()),
+                        rows.iter().until_cancelled().all(|r| r.turn_id.is_some()),
                         rows.iter()
+                            .until_cancelled()
                             .filter_map(|r| r.turn_id.as_deref())
                             .collect::<BTreeSet<_>>(),
                     ),
@@ -3366,7 +3888,7 @@ impl TokenStore {
             .collect();
         let mut legacy_rows: BTreeMap<String, Vec<&UsageObservation>> = BTreeMap::new();
         let mut checkpoints: BTreeMap<&str, Vec<(i64, Counts)>> = BTreeMap::new();
-        for row in &self.observations {
+        for row in cancel_iter(&self.observations) {
             if row.source_kind.as_deref() != Some("token_usage_record") {
                 if let Some(id) = legacy_event_id(row) {
                     legacy_rows
@@ -3385,23 +3907,33 @@ impl TokenStore {
         }
         let monotonic: BTreeSet<_> = checkpoints
             .iter_mut()
+            .until_cancelled()
             .filter_map(|(thread, rows)| {
-                rows.sort_by_key(|(t, c)| (*t, c.input, c.output, c.cached, c.reasoning));
+                rows.sort_cancellable_by_key(|(t, c)| {
+                    (*t, c.input, c.output, c.cached, c.reasoning)
+                });
                 rows.windows(2)
+                    .until_cancelled()
                     .all(|w| !w[1].1.decreased_from(w[0].1))
                     .then_some(*thread)
             })
             .collect();
         let coverage: BTreeMap<_, _> = by_thread
             .iter()
+            .until_cancelled()
             .map(|(thread, responses)| {
                 let ranges: Vec<_> = responses
                     .iter()
+                    .until_cancelled()
                     .filter_map(|r| {
                         let usage = r.last?;
                         let end = r.thread_total?;
                         (!end.decreased_from(usage)
-                            && !r.flags.iter().any(|f| f == "invalid_usage_snapshot"))
+                            && !r
+                                .flags
+                                .iter()
+                                .until_cancelled()
+                                .any(|f| f == "invalid_usage_snapshot"))
                         .then_some((end.sub(usage), end))
                     })
                     .collect();
@@ -3414,10 +3946,11 @@ impl TokenStore {
         let mut conflicting_responses: BTreeSet<(String, String)> = BTreeSet::new();
         let mut anonymous_legacy_overlap: Option<i64> = None;
         let mut kept = Vec::new();
-        for mut event in legacy.drain(..) {
+        for mut event in cancel_iter(legacy.drain(..)) {
             let rows = legacy_rows.get(&event.id).map(Vec::as_slice).unwrap_or(&[]);
             let upper_bound = rows
                 .iter()
+                .until_cancelled()
                 .map(|r| r.timestamp_ms)
                 .max()
                 .unwrap_or_else(|| event.timestamp.saturating_mul(1000).saturating_add(999));
@@ -3425,6 +3958,7 @@ impl TokenStore {
                 if event
                     .partial_flags
                     .iter()
+                    .until_cancelled()
                     .any(|f| f == "session_identity_missing")
                 {
                     // An anonymous legacy archive cannot establish that it belongs
@@ -3446,7 +3980,7 @@ impl TokenStore {
                 .as_deref()
                 .and_then(|id| selected.get(&(event.session.as_str(), id)))
                 .or_else(|| {
-                    rows.iter().find_map(|r| {
+                    rows.iter().until_cancelled().find_map(|r| {
                         r.request_id
                             .as_deref()
                             .and_then(|id| selected.get(&(event.session.as_str(), id)))
@@ -3467,7 +4001,7 @@ impl TokenStore {
                 }
                 continue;
             }
-            let no_gap = !event.partial_flags.iter().any(|f| {
+            let no_gap = !event.partial_flags.iter().until_cancelled().any(|f| {
                 matches!(
                     f.as_str(),
                     "initial_snapshot_contains_unattributed_usage"
@@ -3502,7 +4036,7 @@ impl TokenStore {
                 (coverage.get(event.session.as_str()), endpoint)
             {
                 if monotonic.contains(event.session.as_str())
-                    && rows.iter().all(|r| r.total.is_some())
+                    && rows.iter().until_cancelled().all(|r| r.total.is_some())
                 {
                     let old = event_counts(&event);
                     if !end.decreased_from(old) {
@@ -3545,7 +4079,7 @@ impl TokenStore {
         }
         let mut turn_sums: BTreeMap<(&str, &str), Counts> = BTreeMap::new();
         let mut thread_sums: BTreeMap<&str, Counts> = BTreeMap::new();
-        for ((thread, _), row) in &selected {
+        for ((thread, _), row) in cancel_iter(&selected) {
             if let Some(counts) = row.last {
                 thread_sums
                     .entry(thread)
@@ -3559,7 +4093,7 @@ impl TokenStore {
                 }
             }
         }
-        for event in &kept {
+        for event in cancel_iter(&kept) {
             let counts = event_counts(event);
             thread_sums
                 .entry(&event.session)
@@ -3578,6 +4112,7 @@ impl TokenStore {
         for row in self
             .observations
             .iter()
+            .until_cancelled()
             .filter(|r| r.source_kind.as_deref() == Some("token_usage_record"))
         {
             if row.thread_total.is_some() {
@@ -3603,6 +4138,7 @@ impl TokenStore {
         }
         let thread_gaps: BTreeSet<_> = thread_snapshots
             .iter()
+            .until_cancelled()
             .filter_map(|(thread, row)| {
                 let observed = thread_sums.get(thread).copied().unwrap_or_default();
                 row.thread_total
@@ -3612,6 +4148,7 @@ impl TokenStore {
             .collect();
         let turn_gaps: BTreeSet<_> = turn_snapshots
             .iter()
+            .until_cancelled()
             .filter_map(|((thread, turn), row)| {
                 let observed = turn_sums
                     .get(&(*thread, *turn))
@@ -3623,7 +4160,7 @@ impl TokenStore {
             })
             .collect();
         let complete_turn_starts = self.complete_turn_starts(&selected, &versions);
-        for ((thread, response), row) in selected {
+        for ((thread, response), row) in cancel_iter(selected) {
             let Some(counts) = row.last else { continue };
             let mut flags = row.flags.clone();
             if thread_gaps.contains(thread)
@@ -3635,10 +4172,14 @@ impl TokenStore {
                 flag(&mut flags, "response_coverage_gap");
             }
             let key = (thread, response);
-            if versions[&key].iter().any(|other| other.last != row.last) {
+            if versions[&key]
+                .iter()
+                .until_cancelled()
+                .any(|other| other.last != row.last)
+            {
                 flag(&mut flags, "request_usage_updated");
             }
-            if versions[&key].iter().any(|other| {
+            if versions[&key].iter().until_cancelled().any(|other| {
                 other.timestamp_ms == row.timestamp_ms
                     && (other.last != row.last || other.turn_id != row.turn_id)
             }) {
@@ -3652,6 +4193,7 @@ impl TokenStore {
                 .get(thread)
                 .copied()
                 .into_iter()
+                .until_cancelled()
                 .chain(anonymous_legacy_overlap)
                 .max();
             let explicit_conflict = conflicting_responses
@@ -3670,10 +4212,12 @@ impl TokenStore {
             // identity rather than falling back to a later thread model or Sol.
             let explicit_models: BTreeSet<&str> = versions[&key]
                 .iter()
+                .until_cancelled()
                 .filter_map(|version| version.model.as_deref())
                 .collect();
             let explicit = versions[&key]
                 .iter()
+                .until_cancelled()
                 .filter(|version| version.model.is_some())
                 .max_by_key(|version| (version.timestamp_ms, &version.identity))
                 .and_then(|version| version.model.as_deref());
@@ -3682,6 +4226,7 @@ impl TokenStore {
                 .or_else(|| {
                     versions[&key]
                         .iter()
+                        .until_cancelled()
                         .find_map(|version| recorded_models.recorded(version))
                 });
             if explicit_models.len() > 1 {
@@ -3723,6 +4268,9 @@ impl TokenStore {
             };
             event.cost_usd = event_cost(&event, pricing);
             kept.push(event);
+        }
+        if checkpoint().is_err() {
+            return;
         }
         *legacy = kept;
     }
@@ -3772,9 +4320,9 @@ struct CoverageRanges {
 impl CoverageRanges {
     fn new(ranges: Vec<(Counts, Counts)>) -> Self {
         fn merge(mut rows: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
-            rows.sort_unstable();
+            rows.sort_cancellable();
             let mut result: Vec<(u64, u64)> = Vec::new();
-            for (a, b) in rows.into_iter().filter(|(a, b)| b > a) {
+            for (a, b) in rows.into_iter().until_cancelled().filter(|(a, b)| b > a) {
                 if let Some(last) = result.last_mut().filter(|last| a <= last.1) {
                     last.1 = last.1.max(b);
                 } else {
@@ -3784,12 +4332,31 @@ impl CoverageRanges {
             result
         }
         Self {
-            input: merge(ranges.iter().map(|(a, b)| (a.input, b.input)).collect()),
-            cached: merge(ranges.iter().map(|(a, b)| (a.cached, b.cached)).collect()),
-            output: merge(ranges.iter().map(|(a, b)| (a.output, b.output)).collect()),
+            input: merge(
+                ranges
+                    .iter()
+                    .until_cancelled()
+                    .map(|(a, b)| (a.input, b.input))
+                    .collect(),
+            ),
+            cached: merge(
+                ranges
+                    .iter()
+                    .until_cancelled()
+                    .map(|(a, b)| (a.cached, b.cached))
+                    .collect(),
+            ),
+            output: merge(
+                ranges
+                    .iter()
+                    .until_cancelled()
+                    .map(|(a, b)| (a.output, b.output))
+                    .collect(),
+            ),
             reasoning: merge(
                 ranges
                     .iter()
+                    .until_cancelled()
                     .map(|(a, b)| (a.reasoning, b.reasoning))
                     .collect(),
             ),
@@ -3800,6 +4367,7 @@ impl CoverageRanges {
             let at = ranges.partition_point(|(_, b)| *b <= start);
             let covered = ranges[at..]
                 .iter()
+                .until_cancelled()
                 .take_while(|(a, _)| *a < end)
                 .map(|(a, b)| b.min(&end).saturating_sub(*a.max(&start)))
                 .fold(0u64, u64::saturating_add);
@@ -3862,10 +4430,14 @@ fn effort_fields(value: &Value, names: &[&str]) -> BTreeSet<String> {
 /// serde_json issues small writes for individual tokens. Batch them before
 /// reaching the filesystem, and propagate flush errors before sync/rename.
 fn write_token_store(writer: impl Write, store: &TokenStore) -> io::Result<()> {
-    let mut buffered = BufWriter::with_capacity(256 * 1024, writer);
-    serde_json::to_writer(&mut buffered, store).map_err(invalid_data)?;
-    buffered.write_all(b"\n")?;
-    buffered.flush()
+    checkpoint()?;
+    let mut buffered = BufWriter::with_capacity(256 * 1024, CancellationIo(writer));
+    let result = serde_json::to_writer(&mut buffered, store);
+    checkpoint()?;
+    result.map_err(invalid_data)?;
+    let result = buffered.write_all(b"\n").and_then(|_| buffered.flush());
+    checkpoint()?;
+    result
 }
 
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
@@ -4067,6 +4639,7 @@ fn quota_identity(observation: &ImportedQuotaObservation) -> String {
     )
 }
 fn hash_range(file: &mut File, offset: u64, len: usize) -> io::Result<u64> {
+    checkpoint()?;
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = vec![0; len];
     file.read_exact(&mut bytes)?;
@@ -4074,13 +4647,16 @@ fn hash_range(file: &mut File, offset: u64, len: usize) -> io::Result<u64> {
 }
 /// Bounded memory even for very large conversation records. Final incomplete rows are deferred.
 fn read_bounded_line(reader: &mut impl BufRead) -> io::Result<(Vec<u8>, u64, bool, bool)> {
+    checkpoint()?;
     let mut output = Vec::new();
     let mut length = 0u64;
     loop {
+        checkpoint()?;
         let buffer = reader.fill_buf()?;
         if buffer.is_empty() {
             return Ok((output, length, false, length > MAX_LINE_BYTES as u64));
         }
+        let buffer = &buffer[..buffer.len().min(64 * 1024)];
         let found = buffer.iter().position(|byte| *byte == b'\n');
         let used = found.map_or(buffer.len(), |at| at + 1);
         let copy = used.min(MAX_LINE_BYTES.saturating_sub(output.len()));
@@ -4097,6 +4673,7 @@ fn collect_jsonl(
     output: &mut Vec<PathBuf>,
     report: &mut ImportReport,
 ) -> io::Result<()> {
+    checkpoint()?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(());
@@ -4112,9 +4689,13 @@ fn collect_jsonl(
     }
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
+            checkpoint()?;
             match entry {
                 Ok(entry) => {
                     if let Err(error) = collect_jsonl(&entry.path(), output, report) {
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
                         report.warnings.push(format!(
                             "Could not inspect {}: {error}",
                             entry.path().display()
@@ -4135,6 +4716,281 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    fn cancel_after<T>(checks: usize, work: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CANCEL_AFTER_CHECKS.with(|state| {
+                    state.replace(None);
+                });
+            }
+        }
+        let token = crate::cancellation::CancellationToken::new();
+        CANCEL_AFTER_CHECKS.with(|state| {
+            state.replace(Some((checks, token.clone())));
+        });
+        let _reset = Reset;
+        token.scope(work)
+    }
+
+    #[test]
+    fn cancellation_interrupts_legacy_json_parse_without_retrying_io() {
+        struct CancelReader {
+            data: io::Cursor<Vec<u8>>,
+            token: crate::cancellation::CancellationToken,
+            reads: usize,
+        }
+        impl Read for CancelReader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                let count = self.data.read(bytes)?;
+                self.token.cancel();
+                Ok(count)
+            }
+        }
+        let mut store = TokenStore::demo(1_791_158_400);
+        store.events = vec![store.events[0].clone(); 5_000];
+        let bytes = serde_json::to_vec(&store).unwrap();
+        assert!(bytes.len() > 64 * 1024);
+        let token = crate::cancellation::CancellationToken::new();
+        let mut reader = CancelReader {
+            data: io::Cursor::new(bytes),
+            token: token.clone(),
+            reads: 0,
+        };
+        let error = token.scope(|| read_token_store(&mut reader)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            reader.reads, 1,
+            "canceled serde must not retry Interrupted forever"
+        );
+    }
+
+    #[test]
+    fn cancellation_bounds_oversized_line_even_with_a_huge_input_buffer() {
+        let mut input = io::Cursor::new(vec![b'x'; 8 * 1024 * 1024]);
+        let error = cancel_after(4, || read_bounded_line(&mut input)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(input.position() > 0);
+        assert!(input.position() <= 4 * 64 * 1024);
+    }
+
+    #[test]
+    fn cancellation_during_import_preserves_persisted_cursors_and_source() {
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        let path = write_log(
+            &root,
+            "synthetic.jsonl",
+            &[usage(1, None, Some(c(10, 0, 1, 0)), Some("first"))],
+        );
+        let mut store = TokenStore::default();
+        store.import_dir(root.path(), &sample_pricing()).unwrap();
+        let cache = output.path().join("cache.json");
+        store.save(&cache).unwrap();
+        let committed = fs::read(&cache).unwrap();
+        let cursors = store.sources.clone();
+        let mut source = OpenOptions::new().append(true).open(&path).unwrap();
+        for index in 0..1_000 {
+            writeln!(
+                source,
+                "{}",
+                usage(2, None, Some(c(10, 0, 1, 0)), Some(&format!("new-{index}")))
+            )
+            .unwrap();
+        }
+        drop(source);
+        let source_bytes = fs::read(&path).unwrap();
+        let error =
+            cancel_after(150, || store.import_dir(root.path(), &sample_pricing())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            store.observations.len() > 1,
+            "exercise cancellation after reading started"
+        );
+        assert_eq!(
+            store.sources, cursors,
+            "aborted source cursor must not advance"
+        );
+        assert_eq!(fs::read(&cache).unwrap(), committed);
+        assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        // Discard the canceled importer and recover from the committed cursor.
+        let mut retry = TokenStore::load(&cache).unwrap();
+        retry.import_dir(root.path(), &sample_pricing()).unwrap();
+        assert_eq!(retry.events.len(), 1_001);
+    }
+
+    #[test]
+    fn cancellation_is_not_downgraded_to_metadata_or_discovery_warning() {
+        let root = TempDir::new().unwrap();
+        let index = root.path().join("names.jsonl");
+        fs::write(&index, "{\"id\":\"synthetic\",\"thread_name\":\"test\"}\n").unwrap();
+        let token = crate::cancellation::CancellationToken::new();
+        let mut store = TokenStore::default();
+        let error = token
+            .scope(|| {
+                store.import_dir_with_metadata_progress(
+                    root.path(),
+                    Some(&index),
+                    &sample_pricing(),
+                    &mut |progress| {
+                        if matches!(progress.phase, ImportPhase::Metadata) {
+                            token.cancel();
+                        }
+                    },
+                )
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let mut paths = Vec::new();
+        let mut report = ImportReport::default();
+        let error =
+            cancel_after(1, || collect_jsonl(root.path(), &mut paths, &mut report)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn cancellation_during_single_thread_normalization_does_not_publish_events() {
+        let root = TempDir::new().unwrap();
+        write_log(
+            &root,
+            "synthetic.jsonl",
+            &[usage(1, None, Some(c(10, 0, 1, 0)), Some("first"))],
+        );
+        let mut store = TokenStore::default();
+        store.import_dir(root.path(), &sample_pricing()).unwrap();
+        let prototype = store.observations[0].clone();
+        for index in 1..5_000 {
+            let mut row = prototype.clone();
+            row.identity = format!("synthetic-{index}");
+            row.request_id = Some(format!("request-{index}"));
+            row.sequence = index;
+            store.observations.push(row);
+        }
+        store.usage_dirty = true;
+        let prior_events = store.events.clone();
+        let prior_revision = store.revision;
+        let error =
+            cancel_after(15_000, || store.reconcile_checked(&sample_pricing())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(store.events, prior_events);
+        assert_eq!(store.revision, prior_revision);
+        assert_eq!(store.observations.len(), 5_000);
+    }
+
+    #[test]
+    fn cancellation_sort_is_stable_and_preserves_raw_items_on_abort() {
+        for length in [0, 1, 1_024, 1_025, 2_048, 6_000] {
+            let input: Vec<_> = (0..length)
+                .map(|index| ((length - index) % 53, index))
+                .collect();
+            let mut expected = input.clone();
+            expected.sort_by_key(|row| row.0);
+            let mut actual = input.clone();
+            sort_checked(&mut actual, |a, b| a.0.cmp(&b.0)).unwrap();
+            assert_eq!(actual, expected);
+            if length > 1_024 {
+                let mut interrupted = input.clone();
+                let error = cancel_after(length + 8, || {
+                    sort_checked(&mut interrupted, |a, b| a.0.cmp(&b.0))
+                })
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                interrupted.sort_by_key(|row| row.1);
+                assert_eq!(interrupted, input);
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_during_save_or_export_preserves_destination_and_cleans_temp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.json");
+        fs::write(&path, b"original committed data").unwrap();
+        let mut store = TokenStore::demo(1_791_158_400);
+        store.events = vec![store.events[0].clone(); 5_000];
+        let error = cancel_after(5, || store.save(&path)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(&path).unwrap(), b"original committed data");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        let export = dir.path().join("export.json");
+        let token = crate::cancellation::CancellationToken::new();
+        let error = token
+            .scope(|| store.save_new_before_publish(&export, || token.cancel()))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!export.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cancellation_during_legacy_load_preserves_original_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.json");
+        let mut store = TokenStore::demo(1_791_158_400);
+        store.events = vec![store.events[0].clone(); 5_000];
+        store.save(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let error = cancel_after(5, || TokenStore::load(&path)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn cancellation_during_hydration_and_projection_returns_interrupted() {
+        let root = TempDir::new().unwrap();
+        write_log(
+            &root,
+            "synthetic.jsonl",
+            &[usage(1, None, Some(c(10, 0, 1, 0)), Some("first"))],
+        );
+        let mut original = TokenStore::default();
+        original.import_dir(root.path(), &sample_pricing()).unwrap();
+        let prototype = original.observations[0].clone();
+        for index in 1..2_000 {
+            let mut row = prototype.clone();
+            row.identity = format!("synthetic-{index}");
+            row.request_id = Some(format!("request-{index}"));
+            row.sequence = index;
+            original.observations.push(row);
+        }
+        let header = original.header();
+        let mut shards = original.into_thread_shards_checked().unwrap();
+        assert_eq!(shards.len(), 1);
+        let mut importer = TokenStore::from_header(header);
+        let error = cancel_after(6_100, || importer.hydrate_thread(shards.remove(0))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!importer.hydrated_threads.contains("test-session"));
+        assert!(importer.local_events.is_empty());
+        let token = crate::cancellation::CancellationToken::new();
+        token.cancel();
+        token.scope(|| {
+            assert_eq!(
+                importer.header_checked().unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert_eq!(
+                importer.dirty_export_checked().unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert_eq!(
+                importer
+                    .finish_hydration_for_export_checked()
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert_eq!(
+                importer
+                    .reprice_hydrated_checked(&sample_pricing())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Interrupted
+            );
+        });
+    }
 
     #[test]
     fn token_store_writer_batches_small_json_writes_and_preserves_bytes() {
