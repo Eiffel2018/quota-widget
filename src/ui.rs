@@ -72,7 +72,7 @@ struct MainCache {
     boundary: Option<HistoryEvent>,
     cost: accounting::ObservedCost,
     loading: bool,
-    recent_intervals: Vec<usize>,
+    recent_events: Vec<HistoryEvent>,
     recent_tooltip: String,
 }
 /// Native window managers may apply a stale minimum height to the first
@@ -191,6 +191,7 @@ struct HistoryCache {
     rows: Vec<(HistoryEvent, Option<f64>, bool)>,
     weighted: Option<f64>,
     interval_indices: Vec<usize>,
+    table_rows: Vec<(Option<usize>, IntervalPresentation)>,
 }
 struct WidgetApp {
     settings: Settings,
@@ -1488,32 +1489,43 @@ impl WidgetApp {
             return;
         }
         let all = self.matching_history();
-        let recent_intervals: Vec<_> = all
+        let visible = quota_widget::history::visible_observations(&all);
+        let recent_events: Vec<_> = visible
             .iter()
             .rev()
-            .filter(|e| e.observed_at_unix <= t)
-            .filter_map(|e| {
+            .filter(|e| e.observed_at_unix <= t && drop_event(e))
+            .filter(|e| {
                 self.interval_lookup
-                    .get(&intervals::history_event_key(e))
-                    .copied()
+                    .contains_key(&intervals::history_event_key(e))
+                    || e.reconciliation.is_some()
             })
             .take(5)
+            .cloned()
             .collect();
         let mut recent_tooltip = String::from("最近 5 次扣額 · UTC+8\n");
-        if recent_intervals.is_empty() {
+        if recent_events.is_empty() {
             recent_tooltip.push_str("已完成區間：0\n");
         }
-        for &index in &recent_intervals {
-            let row = &self.interval_presentations[index];
-            recent_tooltip.push_str(&format!(
-                "\n{} · {}\n估算 USD {} · 每% {} · {}\n區間 Token 小計 {}\n",
-                row.change,
-                row.end,
-                row.total,
-                row.per_point.replace("/百分點", ""),
-                row.status,
-                row.observed_total
-            ));
+        for event in &recent_events {
+            if let Some(&index) = self
+                .interval_lookup
+                .get(&intervals::history_event_key(event))
+            {
+                let row = &self.interval_presentations[index];
+                recent_tooltip.push_str(&format!(
+                    "\n{} · {}\n估算 USD {} · 每% {} · {}\n區間 Token 小計 {}\n",
+                    row.change,
+                    row.end,
+                    row.total,
+                    row.per_point.replace("/百分點", ""),
+                    row.status,
+                    row.observed_total
+                ));
+            } else {
+                let row = interval_views::unconfirmed_observation(event);
+                recent_tooltip
+                    .push_str(&format!("\n{} · {}\n{}\n", row.change, row.end, row.status));
+            }
         }
         let boundary = all
             .iter()
@@ -1587,7 +1599,7 @@ impl WidgetApp {
             boundary,
             cost,
             loading,
-            recent_intervals,
+            recent_events,
             recent_tooltip,
         };
     }
@@ -1979,7 +1991,7 @@ impl WidgetApp {
                 footer_response.on_hover_ui(|ui|{readable_tooltip(ui,&self.main_cache.recent_tooltip,font_size);});
                 if open_intervals {
                     self.history_open=true; self.history_intervals=true; self.history_selection=None;
-                    if let Some(i)=self.main_cache.recent_intervals.first() {if let Some(day)=local_day(self.intervals[*i].end) {self.date=day;}}
+                    if let Some(event)=self.main_cache.recent_events.first() {if let Some(day)=local_day(event.observed_at_unix) {self.date=day;}}
                 }
                 if ui
                     .put(
@@ -2234,6 +2246,10 @@ impl WidgetApp {
         );
         if self.history_cache.key.as_ref() != Some(&key) {
             let all = self.browsed_history();
+            let visible: BTreeSet<_> = quota_widget::history::visible_observations(&all)
+                .iter()
+                .map(intervals::history_event_key)
+                .collect();
             // One batch pass, instead of one full-history scan for every row.
             let costs = if self.tokens.database.is_some() {
                 all.iter()
@@ -2259,12 +2275,23 @@ impl WidgetApp {
                 .collect();
             self.history_cache.rows.reverse();
             self.history_cache.interval_indices.clear();
+            self.history_cache.table_rows.clear();
             for (event, _, _) in &self.history_cache.rows {
+                if !visible.contains(&intervals::history_event_key(event)) {
+                    continue;
+                }
                 if let Some(&index) = self
                     .interval_lookup
                     .get(&intervals::history_event_key(event))
                 {
                     self.history_cache.interval_indices.push(index);
+                    self.history_cache
+                        .table_rows
+                        .push((Some(index), self.interval_presentations[index].clone()));
+                } else if drop_event(event) && event.reconciliation.is_some() {
+                    self.history_cache
+                        .table_rows
+                        .push((None, interval_views::unconfirmed_observation(event)));
                 }
             }
             self.history_cache.weighted = self
@@ -2275,7 +2302,14 @@ impl WidgetApp {
                 .map(|estimate| estimate.usd_per_point);
             self.history_cache.key = Some(key);
         }
-        ui.label(format!("紀錄：{} 筆", self.history_cache.rows.len()));
+        ui.label(format!(
+            "紀錄：{} 筆",
+            if self.history_intervals {
+                self.history_cache.table_rows.len()
+            } else {
+                self.history_cache.rows.len()
+            }
+        ));
         ui.separator();
         let estimate = self
             .history_cache
@@ -2493,7 +2527,7 @@ impl WidgetApp {
         ))
     }
     fn completed_intervals_table(&mut self, ui: &mut egui::Ui) {
-        if self.history_cache.interval_indices.is_empty() {
+        if self.history_cache.table_rows.is_empty() {
             ui.label("已完成區間：0");
             return;
         }
@@ -2530,22 +2564,26 @@ impl WidgetApp {
                     .show_rows(
                         ui,
                         42. * scale,
-                        self.history_cache.interval_indices.len(),
+                        self.history_cache.table_rows.len(),
                         |ui, range| {
                             for row_index in range {
-                                let index = self.history_cache.interval_indices[row_index];
-                                let interval = &self.intervals[index];
-                                let view = &self.interval_presentations[index];
+                                let (index, view) = &self.history_cache.table_rows[row_index];
                                 let (rect, response) = ui.allocate_exact_size(
                                     Vec2::new(675. * scale, 42. * scale),
                                     Sense::click(),
                                 );
                                 if response
-                                    .on_hover_text(format!("{}\n點擊查看詳情", view.tooltip))
+                                    .on_hover_text(if index.is_some() {
+                                        format!("{}\n點擊查看詳情", view.tooltip)
+                                    } else {
+                                        view.tooltip.clone()
+                                    })
                                     .clicked()
                                 {
-                                    self.selected_interval =
-                                        Some(interval.history_event_key.clone());
+                                    if let Some(index) = index {
+                                        self.selected_interval =
+                                            Some(self.intervals[*index].history_event_key.clone());
+                                    }
                                 }
                                 let cells = [
                                     &view.change,
@@ -3924,18 +3962,19 @@ mod widget_revision_tests {
         app.history_generation += 1;
         app.set_intervals(Arc::new(intervals::completed_intervals(&[], &app.history)));
         app.refresh_main_cache();
-        assert_eq!(app.main_cache.recent_intervals.len(), 5);
+        assert_eq!(app.main_cache.recent_events.len(), 5);
         let recent: Vec<_> = app
             .main_cache
-            .recent_intervals
+            .recent_events
             .iter()
-            .map(|&i| app.intervals[i].end)
+            .map(|event| event.observed_at_unix)
             .collect();
         assert_eq!(
             recent,
             vec![time + 210, time + 180, time + 150, time + 120, time + 90]
         );
-        for &i in &app.main_cache.recent_intervals {
+        for event in &app.main_cache.recent_events {
+            let i = app.interval_lookup[&intervals::history_event_key(event)];
             assert!(app
                 .main_cache
                 .recent_tooltip
@@ -3983,7 +4022,7 @@ mod widget_revision_tests {
         let mut app = demo_app();
         app.set_intervals(Arc::new(Vec::new()));
         app.refresh_main_cache();
-        assert!(app.main_cache.recent_intervals.is_empty());
+        assert!(app.main_cache.recent_events.is_empty());
         assert!(app.main_cache.recent_tooltip.contains("已完成區間：0"));
         assert!(!app.main_cache.recent_tooltip.contains("$0"));
     }
@@ -3996,7 +4035,7 @@ mod widget_revision_tests {
             intervals::completed_intervals(app.tokens.events(), &app.history)
         );
         assert_eq!(app.interval_presentations.len(), app.intervals.len());
-        assert!(!app.main_cache.recent_intervals.is_empty());
+        assert!(!app.main_cache.recent_events.is_empty());
         assert!(!app.main_cache.recent_tooltip.contains("已完成區間：0"));
     }
     pub(super) fn demo_app() -> WidgetApp {
@@ -6122,5 +6161,61 @@ mod accessible_ui_tests {
         assert!(!text.contains("不可比較"));
         assert!(!text.contains("只列真實"));
         assert!(!text.contains("點擊可"));
+    }
+}
+
+#[cfg(test)]
+mod recovered_history_display_tests {
+    use super::*;
+    #[test]
+    fn recovered_decreases_reach_preview_and_table_without_inventing_costs() {
+        let row = |t: i64, b: i64, a: i64, reset: i64, account: Option<&str>| -> HistoryEvent {
+            serde_json::from_value(serde_json::json!({
+                "session":if account.is_some(){"live"}else{"imported-local-observations-v2"},
+                "observed_at_unix":t,"source_key":"codex","window_key":"primary",
+                "window_label":"week","kind":"QuotaDecrease","epoch":0,
+                "before":b.to_string(),"after":a.to_string(),"delta":(b-a).to_string(),
+                "before_observed_at_unix":t-1,"partial":false,
+                "evidence":{"imported":account.is_none(),"account_id":account,
+                    "reset_at":reset,"before_reset_at":reset}
+            }))
+            .unwrap()
+        };
+        let mut raw: Vec<_> = (0..13)
+            .map(|i| row(10 + i, 13 - i, 12 - i, 1000, None))
+            .collect();
+        raw.extend((0..8).map(|i| row(30 + i * 10, 12 - i, 11 - i, 2000, None)));
+        raw.push(row(120, 4, 3, 2000, Some("synthetic-account")));
+        let mut app = WidgetApp::new(
+            Settings {
+                import_enabled: false,
+                ..Default::default()
+            },
+            PathBuf::new(),
+            false,
+            true,
+            true,
+            vec![],
+        );
+        app.history = Arc::new(quota_widget::history::normalized(&raw));
+        app.set_intervals(Arc::new(intervals::completed_intervals(&[], &app.history)));
+        app.refresh_main_cache();
+        for change in ["4% → 3%", "5% → 4%", "6% → 5%", "7% → 6%", "8% → 7%"] {
+            assert!(app.main_cache.recent_tooltip.contains(change), "{change}");
+        }
+        app.date = local_day(120).unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
+        });
+        let recovered: Vec<_> = app
+            .history_cache
+            .table_rows
+            .iter()
+            .filter(|(i, _)| i.is_none())
+            .collect();
+        assert_eq!(recovered.len(), 8);
+        assert!(recovered.iter().all(|(_, view)| view.total == "待確認"));
+        assert_eq!(app.history_cache.interval_indices.len(), 14);
     }
 }

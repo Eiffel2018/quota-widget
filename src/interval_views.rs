@@ -201,3 +201,14 @@ pub fn newest_indices(intervals: &[CompletedInterval]) -> Vec<usize> {
     });
     indices
 }
+
+/// Show an actually logged decrease without claiming a confirmed cost boundary.
+pub fn unconfirmed_observation(event: &crate::model::HistoryEvent) -> IntervalPresentation {
+    IntervalPresentation {
+        change: format!("{}% → {}%", event.before, event.after),
+        start: "—".into(), end: display_time::datetime(event.observed_at_unix).unwrap_or_else(|| "未知".into()),
+        duration: "—".into(), total: "待確認".into(), observed_total: "未能確認歸屬".into(),
+        per_point: "未知".into(), status: "日誌補回 · 未確認".into(),
+        tooltip: "日誌記錄的額度下降；帳戶或週期邊界未能確認。時間為日誌觀察時間，未計入扣額或單價校準，原始 Token 記錄保留。".into(),
+    }
+}

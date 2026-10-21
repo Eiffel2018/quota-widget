@@ -292,13 +292,66 @@ pub fn merge(existing: Vec<HistoryEvent>, incoming: Vec<HistoryEvent>) -> Vec<Hi
     result
 }
 
+/// Prefer a direct observation over a nearby anonymous log echo in the UI only.
+/// Accounting retains both scopes; no account identity is assigned to a log.
+pub fn visible_observations(events: &[HistoryEvent]) -> Vec<HistoryEvent> {
+    type Key<'a> = (&'a str, Option<&'a str>, &'a str, &'a str, &'a str);
+    fn key(e: &HistoryEvent) -> Key<'_> {
+        (
+            e.source_key.as_str(),
+            e.window_key.as_deref(),
+            e.window_label.as_str(),
+            e.before.as_str(),
+            e.after.as_str(),
+        )
+    }
+    let mut direct: BTreeMap<Key<'_>, Vec<&HistoryEvent>> = BTreeMap::new();
+    for e in events.iter().filter(|e| {
+        !imported(e)
+            && is_confirmed_quota_change(e)
+            && e.evidence
+                .as_ref()
+                .and_then(|p| p.account_id.as_ref())
+                .is_some()
+    }) {
+        direct.entry(key(e)).or_default().push(e);
+    }
+    events
+        .iter()
+        .filter(|e| {
+            if !imported(e)
+                || e.evidence
+                    .as_ref()
+                    .and_then(|p| p.account_id.as_ref())
+                    .is_some()
+            {
+                return true;
+            }
+            let matches: BTreeSet<_> = direct
+                .get(&key(e))
+                .into_iter()
+                .flatten()
+                .filter(|live| {
+                    live.observed_at_unix.abs_diff(e.observed_at_unix) <= 600
+                        && reset_for(live)
+                            .zip(reset_for(e))
+                            .is_some_and(|(a, b)| a.abs_diff(b) <= RESET_JITTER_SECONDS as u64)
+                })
+                .filter_map(|live| live.evidence.as_ref().and_then(|p| p.account_id.as_deref()))
+                .collect();
+            matches.len() != 1
+        })
+        .cloned()
+        .collect()
+}
+
 struct Timeline {
     remaining: f64,
     last_at: i64,
     cycle: u64,
     reset_at: Option<i64>,
     last_visible: Option<usize>,
-    seen_uncertain: BTreeSet<(String, String)>,
+    seen_uncertain: BTreeSet<(Option<i64>, String, String)>,
     seen_remaining: BTreeSet<String>,
     pending_recovery: Option<(f64, i64)>,
     // A live epoch/session is a real continuity boundary, unlike the tentative
@@ -349,6 +402,25 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             serde_json::to_string(e).expect("history values are serializable"),
         )
     });
+    // Preserve uncertainty once per recorded anonymous quota period. Keeping
+    // one global pair set makes a prior exhausted period hide later observations.
+    // This does not change the conservative cost anchor or confirm a reset.
+    let mut deadlines: BTreeMap<Window, BTreeSet<i64>> = BTreeMap::new();
+    for e in raw.iter().filter(|e| imported(e) && window(e).0.is_none()) {
+        if let Some(reset) = reset_for(e) {
+            deadlines.entry(window(e)).or_default().insert(reset);
+        }
+    }
+    let mut periods = BTreeMap::new();
+    for (key, values) in deadlines {
+        let mut anchor: Option<i64> = None;
+        for reset in values {
+            if anchor.is_none_or(|at| reset.saturating_sub(at) > RESET_JITTER_SECONDS) {
+                anchor = Some(reset);
+            }
+            periods.insert((key.clone(), reset), anchor.unwrap());
+        }
+    }
     let mut timelines: BTreeMap<Window, Timeline> = BTreeMap::new();
     let mut result: Vec<HistoryEvent> = Vec::new();
     let mut legacy_cycles: BTreeMap<(String, String, String), u64> = BTreeMap::new();
@@ -469,6 +541,8 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             continue;
         }
         let is_imported = imported(&event);
+        let uncertain_period =
+            reset_for(&event).and_then(|reset| periods.get(&(window(&event), reset)).copied());
         let accepted = timelines.get(&window(&event));
         let accepted_remaining = accepted.map_or(before, |state| state.remaining);
         let accepted_reset = accepted
@@ -570,10 +644,11 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
             continue;
         }
         if event.reconciliation == Some(HistoryReconciliation::ConflictingObservation) {
-            if state
-                .seen_uncertain
-                .insert((event.before.clone(), event.after.clone()))
-            {
+            if state.seen_uncertain.insert((
+                uncertain_period,
+                event.before.clone(),
+                event.after.clone(),
+            )) {
                 event.partial = true;
                 result.push(event);
             }
@@ -646,10 +721,11 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
         if after > state.remaining + EPSILON && !real_reset {
             // Keep one visible uncertainty per repeated pair. It establishes no
             // new cycle or accounting boundary and cannot make the next echo a drop.
-            if state
-                .seen_uncertain
-                .insert((percent_text(state.remaining), percent_text(after)))
-            {
+            if state.seen_uncertain.insert((
+                uncertain_period,
+                percent_text(state.remaining),
+                percent_text(after),
+            )) {
                 // The conservative accounting anchor can sit below a disputed
                 // trajectory. Keep the observed direction and both endpoints:
                 // a raw 100→99 decrease is not an observed 0→99 replenishment.
@@ -684,10 +760,11 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
                     state.pending_recovery = None;
                     state.last_visible = None;
                     if (after - anchor).abs() <= EPSILON {
-                        if state
-                            .seen_uncertain
-                            .insert((event.before.clone(), event.after.clone()))
-                        {
+                        if state.seen_uncertain.insert((
+                            uncertain_period,
+                            event.before.clone(),
+                            event.after.clone(),
+                        )) {
                             event.partial = true;
                             event.reconciliation = Some(HistoryReconciliation::UncertainRecovery);
                             result.push(event);
@@ -787,5 +864,71 @@ mod tests {
         let raw = merge(vec![first], vec![second]);
         assert_eq!(raw.len(), 2);
         assert_eq!(normalized(&raw).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    fn row(t: i64, before: u32, after: u32, reset: i64, account: Option<&str>) -> HistoryEvent {
+        serde_json::from_value(serde_json::json!({"session": if account.is_some() {"live"} else {"imported-local-observations-v2"},
+            "observed_at_unix":t,"source_key":"codex","epoch":0,"kind":"QuotaDecrease",
+            "window_label":"week","window_key":"primary","before":before.to_string(),
+            "after":after.to_string(),"delta":(before-after).to_string(),"partial":false,
+            "before_observed_at_unix":t-5,
+            "evidence":{"imported":account.is_none(),"account_id":account,
+                "reset_at":reset,"before_reset_at":reset}})).unwrap()
+    }
+    #[test]
+    fn exhausted_anonymous_period_cannot_hide_later_period_decrements() {
+        let mut raw: Vec<_> = (0..13)
+            .map(|i| row(10 + i, 13 - i as u32, 12 - i as u32, 1000, None))
+            .collect();
+        for i in 0..8 {
+            raw.push(row(
+                30 + i * 10,
+                12 - i as u32,
+                11 - i as u32,
+                2000 + i % 3,
+                None,
+            ));
+        }
+        let original = serde_json::to_value(&raw).unwrap();
+        let out = normalized(&raw);
+        assert_eq!(out.len(), 21);
+        assert!(is_confirmed_quota_change(&out[0]));
+        assert!(out[13..]
+            .iter()
+            .all(|e| e.reconciliation.is_some() && !is_confirmed_quota_change(e)));
+        assert_eq!(out[13].before, "12");
+        assert_eq!(out.last().unwrap().after, "4");
+        assert!(out[1..].iter().all(|e| e.epoch == out[1].epoch));
+        assert_eq!(out[0].epoch, out[1].epoch);
+        assert_eq!(serde_json::to_value(&raw).unwrap(), original);
+        raw.reverse();
+        assert_eq!(normalized(&raw), out);
+    }
+    #[test]
+    fn expired_anonymous_period_cannot_spend_again_after_a_fresh_period() {
+        let raw = vec![
+            row(10, 2, 1, 1000, None),
+            row(1100, 100, 99, 2000, None),
+            row(1200, 1, 0, 1000, None),
+        ];
+        let out = normalized(&raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.last().unwrap().after, "99");
+    }
+    #[test]
+    fn direct_and_log_echo_display_once_but_ambiguous_accounts_stay_visible() {
+        let live = row(100, 4, 3, 2000, Some("a"));
+        let echo = row(630, 4, 3, 2002, None);
+        let mut events = vec![live.clone(), echo.clone(), row(80, 5, 4, 2000, None)];
+        assert_eq!(visible_observations(&events), vec![live, events[2].clone()]);
+        events.push(row(200, 4, 3, 2000, Some("b")));
+        assert_eq!(visible_observations(&events).len(), 4);
+        events.pop();
+        events[1].evidence.as_mut().unwrap().reset_at = Some(4000);
+        assert_eq!(visible_observations(&events).len(), 3);
     }
 }
