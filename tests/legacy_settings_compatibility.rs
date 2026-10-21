@@ -310,7 +310,46 @@ fn unreadable_oversized_existing_settings_cannot_be_replaced() {
     let path = dir.path().join("settings.json");
     let oversized = 256 * 1024 * 1024 + 1;
     // A sparse temporary file tests the size guard without allocating its body.
-    fs::File::create(&path).unwrap().set_len(oversized).unwrap();
+    let file = fs::File::create(&path).unwrap();
+    #[cfg(windows)]
+    {
+        use std::{ffi::c_void, os::windows::io::AsRawHandle, ptr::null_mut};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn DeviceIoControl(
+                handle: *mut c_void,
+                code: u32,
+                input: *mut c_void,
+                input_size: u32,
+                output: *mut c_void,
+                output_size: u32,
+                returned: *mut u32,
+                overlapped: *mut c_void,
+            ) -> i32;
+        }
+        // Windows set_len alone allocates disk space. Mark the NTFS fixture
+        // sparse first so this metadata-only guard also fits on a busy RAM disk.
+        let mut returned = 0;
+        assert_ne!(
+            unsafe {
+                DeviceIoControl(
+                    file.as_raw_handle(),
+                    0x000900c4,
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    0,
+                    &mut returned,
+                    null_mut(),
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+    }
+    file.set_len(oversized).unwrap();
+    drop(file);
     let error = storage::save_settings(&path, &synthetic_settings(dir.path())).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert_eq!(fs::metadata(&path).unwrap().len(), oversized);
