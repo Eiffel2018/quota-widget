@@ -149,7 +149,8 @@ pub fn shared_estimates(rows: &[CompletedInterval]) -> Vec<Option<QuotaEstimate>
                     && row.end > prior.end
                     && estimate.end <= prior.end
                     && row.end - estimate.end <= 86400
-                    && (row.before - prior.after).abs() < 1e-6
+                    && ((row.before - prior.after).abs() < 1e-6
+                        || (row.session != prior.session && row.before < prior.after))
                     && row.before.is_finite()
                     && row.after.is_finite()
                     && (0.0..=100.0).contains(&row.after)

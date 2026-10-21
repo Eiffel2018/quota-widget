@@ -1,9 +1,9 @@
-# Quota Widget 0.3.11
+# Quota Widget 0.3.12
 
 新扣額紀錄可沿用有效的歷史每百分點估值；只讀視窗在原持有者關閉後會自動恢復匯入。
 扣額表格縮成五欄，點擊紀錄可查看 Token、模型及估算詳情。
 
-[更新說明](docs/RELEASE-0.3.11.md) · [Windows 驗證](VALIDATION-0.3.11.md)
+[更新說明](docs/RELEASE-0.3.12.md) · [Windows 驗證](VALIDATION-0.3.12.md)
 
 ## 0.3.10
 

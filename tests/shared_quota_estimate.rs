@@ -240,3 +240,27 @@ fn historical_fallback_never_crosses_identity_resets_gaps_or_expiry() {
         assert!(shared_estimates(&rows)[5].is_none(), "{change}");
     }
 }
+
+#[test]
+fn restarted_observer_can_reuse_calibration_after_unrecorded_quota_drops() {
+    let mut rows = chain(&[(1., 14.); 6]);
+    rows[5].session = "new-observer-after-read-only-close".into();
+    rows[5].epoch = 0;
+    rows[5].before -= 3.;
+    rows[5].after -= 3.;
+    rows[5].events = 0;
+    rows[5].known_usd = 0.;
+    rows[5].partial = true;
+    rows[5].reasons = vec![IntervalReason::NoTokenEvents];
+    rows[5].start_boundary_kind = StartBoundaryKind::ObservedBaseline;
+    let e = shared_estimates(&rows)[5].clone().unwrap();
+    assert_eq!(e.usd_per_point, 14.);
+    assert_eq!(e.intervals, 5);
+    assert_eq!(e.percentage_points, 5.);
+    rows[5].before = rows[4].after + 1.;
+    rows[5].after = rows[5].before - 1.;
+    assert!(
+        shared_estimates(&rows)[5].is_none(),
+        "quota increases cannot carry estimates"
+    );
+}
