@@ -2205,13 +2205,13 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            "每週額度 v3.21".to_owned()
+                            "每週額度 v3.22".to_owned()
                         } else {
                             v.window_label.clone()
                         }
                     })
                     .unwrap_or_else(|| {
-                        "每週額度 v3.21".to_owned()
+                        "每週額度 v3.22".to_owned()
                     });
                 painter.circle_filled(
                     pt(22., 24.),

@@ -53,11 +53,22 @@ fn reset_cycle_starts(events: &[HistoryEvent]) -> Vec<i64> {
         .iter()
         .filter(|event| {
             event.kind == crate::model::HistoryKind::QuotaReset
-                && history::is_confirmed_quota_change(event)
+                // Reset boundaries are inferred from the recorded quota drop
+                // itself. Imported/legacy observations may be marked as
+                // uncertain recovery even when they explicitly record
+                // 0-98% -> 100% for the weekly window.
+                && event.reconciliation
+                    != Some(crate::model::HistoryReconciliation::ConflictingObservation)
                 && event
                     .after
                     .parse::<f64>()
                     .is_ok_and(|after| (after - 100.0).abs() < 0.000001)
+                // A 99% -> 100% rebound is not a quota reset. Codex may
+                // report that transiently while reconciling the same cycle.
+                && event
+                    .before
+                    .parse::<f64>()
+                    .is_ok_and(|before| (0.0..99.0).contains(&before))
                 && event.evidence.as_ref().and_then(|e| e.window_duration_mins) == Some(10080)
         })
         .map(|event| event.observed_at_unix)
@@ -95,19 +106,24 @@ mod reset_cycle_tests {
     }
 
     #[test]
-    fn reset_split_uses_confirmed_weekly_returns_to_one_hundred_only() {
+    fn reset_split_uses_weekly_returns_below_ninety_nine_to_one_hundred() {
         let mut conflict = reset(3_000, "30", "100", 10_080);
         conflict.reconciliation = Some(HistoryReconciliation::ConflictingObservation);
+        let mut legacy = reset(4_000, "65", "100", 10_080);
+        legacy.partial = true;
+        legacy.reconciliation = Some(HistoryReconciliation::UncertainRecovery);
         assert_eq!(
             reset_cycle_starts(&[
                 reset(1_000, "2", "100", 10_080),
+                reset(1_025, "99", "100", 10_080),
                 reset(1_050, "99", "100", 10_080),
                 reset(2_000, "20", "100", 10_080),
                 reset(2_500, "20", "21", 10_080),
                 reset(2_800, "20", "100", 300),
                 conflict,
+                legacy,
             ]),
-            vec![1_000, 2_000]
+            vec![1_000, 2_000, 4_000]
         );
     }
 }
