@@ -204,7 +204,7 @@ struct HistoryCache {
     has_lower_bound: bool,
     calculation_error: Option<String>,
 }
-type HistoryCacheKey = (u64, u64, NaiveDate, String, bool, bool);
+type HistoryCacheKey = (NaiveDate, String, bool, bool);
 #[derive(Clone)]
 struct DailyQuotaSegment {
     event: Option<HistoryEvent>,
@@ -501,14 +501,20 @@ fn interval_task_counts(events: &[&TokenEvent]) -> [usize; 4] {
         .iter()
         .filter(|event| !event.is_excluded_auto_review())
     {
-        total.insert(event.session.as_str());
+        // A Codex turn can emit many response/token rows; count it once per
+        // model, using the session only for legacy rows without a turn ID.
+        let turn = (
+            event.session.as_str(),
+            event.turn_id.as_deref().unwrap_or(event.session.as_str()),
+        );
+        total.insert(turn);
         let model = event.model.to_ascii_lowercase();
         if model.ends_with("-sol") {
-            sol.insert(event.session.as_str());
+            sol.insert(turn);
         } else if model.ends_with("-luna") {
-            luna.insert(event.session.as_str());
+            luna.insert(turn);
         } else if model.ends_with("-astra") {
-            astra.insert(event.session.as_str());
+            astra.insert(turn);
         }
     }
     [sol.len(), luna.len(), astra.len(), total.len()]
@@ -647,13 +653,13 @@ fn total_model_usage(models: &[intervals::ModelIntervalUsage]) -> intervals::Mod
 fn model_usage_tooltip(
     label: &str,
     model: Option<&intervals::ModelIntervalUsage>,
-    task_count: usize,
+    turn_count: usize,
 ) -> String {
     let Some(model) = model else {
-        return format!("{label}\nTask：{task_count} 個\n0 筆 · $0.0000");
+        return format!("{label}\n使用回合：{turn_count}\n0 筆 · $0.0000");
     };
     format!(
-        "{label}\nTask：{task_count} 個\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
+        "{label}\n使用回合：{turn_count}\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
         model.events,
         interval_model_cost(model),
         model.input,
@@ -1702,8 +1708,6 @@ impl WidgetApp {
             .map(|(row, estimate)| interval_views::present_with_estimate(row, estimate.as_ref()))
             .collect();
         self.intervals = intervals;
-        self.history_cache.key = None;
-        self.history_cache.work_key = None;
         self.main_cache.key = None;
     }
     fn selected(&self) -> Option<WindowView> {
@@ -2207,13 +2211,13 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            "每週額度 v3.24".to_owned()
+                            "每週額度 v3.25".to_owned()
                         } else {
                             v.window_label.clone()
                         }
                     })
                     .unwrap_or_else(|| {
-                        "每週額度 v3.24".to_owned()
+                        "每週額度 v3.25".to_owned()
                     });
                 painter.circle_filled(
                     pt(22., 24.),
@@ -2532,12 +2536,18 @@ impl WidgetApp {
                 |ctx, _| {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         self.history_open = false;
+                    } else {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            self.history_ui(ui);
+                        });
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        self.history_ui(ui);
-                    });
                 },
             );
+            if !self.history_open {
+                // Reopening explicitly refreshes the selected day once.
+                self.history_cache.key = None;
+                self.history_cache.work_key = None;
+            }
         }
         if self.tokens_open {
             ctx.show_viewport_immediate(
@@ -2689,8 +2699,6 @@ impl WidgetApp {
         ))
         .unwrap_or_default();
         let key = (
-            self.history_generation,
-            self.token_generation,
             self.date,
             selection_key,
             self.settings.hide_unchanged,
@@ -2735,6 +2743,7 @@ impl WidgetApp {
             self.history_cache.weighted_samples = 0;
             self.history_cache.has_lower_bound = false;
             self.history_cache.weighted = None;
+            self.history_cache.calculation_error = None;
             if self.history_intervals {
                 if let Some((day_start, day_end)) = display_time::day_bounds(self.date) {
                     let same_live_scope = current_view.as_ref().is_some_and(|view| {
@@ -3091,155 +3100,151 @@ impl WidgetApp {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
         let scale = ui.style().text_styles[&egui::TextStyle::Body].size / 12.;
-        const X: [f32; 6] = [0., 100., 375., 560., 745., 930.];
-        const WIDTH: [f32; 6] = [95., 265., 175., 175., 175., 160.];
-        const TABLE_WIDTH: f32 = 1095.;
-        egui::ScrollArea::horizontal()
-            .id_salt("interval-table-horizontal")
-            .show(ui, |ui| {
-                ui.set_min_width(TABLE_WIDTH * scale);
-                let (header, _) = ui.allocate_exact_size(
-                    Vec2::new(TABLE_WIDTH * scale, 26. * scale),
-                    Sense::hover(),
-                );
-                for (i, title) in [
-                    "額度變化",
-                    "變化時間（UTC+08）",
-                    "Luna",
-                    "Sol",
-                    "Astra",
-                    "Total",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    ui.put(
-                        Rect::from_min_size(
-                            header.min + Vec2::new(X[i] * scale, 0.),
-                            Vec2::new(WIDTH[i] * scale, 26. * scale),
-                        ),
-                        egui::Label::new(RichText::new(*title).strong()).truncate(),
-                    );
-                }
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("interval-table-rows")
-                    .show_rows(
-                        ui,
-                        54. * scale,
-                        self.history_cache.table_rows.len(),
-                        |ui, range| {
-                            for row_index in range {
-                                let row = &self.history_cache.table_rows[row_index];
-                                let view = &row.presentation;
-                                let (rect, response) = ui.allocate_exact_size(
-                                    Vec2::new(TABLE_WIDTH * scale, 54. * scale),
-                                    Sense::click(),
-                                );
-                                if response
-                                    .on_hover_text(if row.interval_index.is_some() {
-                                        format!("{}\n點擊查看詳情", view.tooltip)
-                                    } else {
-                                        view.tooltip.clone()
-                                    })
-                                    .clicked()
-                                {
-                                    if let Some(index) = row.interval_index {
-                                        self.selected_interval =
-                                            Some(self.intervals[index].history_event_key.clone());
-                                    }
-                                }
-                                let mut change_time = if view.end == "—" {
-                                    "—".into()
-                                } else {
-                                    view.end.clone()
-                                };
-                                change_time = change_time.replace(" +08:00", "");
-                                let families = [
-                                    ("luna", "Luna", 1),
-                                    ("sol", "Sol", 0),
-                                    ("astra", "Astra", 2),
-                                ];
-                                let family_models: Vec<_> = families
-                                    .iter()
-                                    .map(|(family, _, _)| model_family_usage(&row.models, family))
-                                    .collect();
-                                let total = total_model_usage(&row.models);
-                                let family_cell = |family_index: usize,
-                                                   usage: Option<
-                                    &intervals::ModelIntervalUsage,
-                                >| {
-                                    usage.map_or_else(
-                                        || format!("{}次\n$0.0000", row.task_counts[family_index]),
-                                        |model| {
-                                            format!(
-                                                "{}次\n{}",
-                                                row.task_counts[family_index],
-                                                interval_model_cost(model)
-                                            )
-                                        },
-                                    )
-                                };
-                                let cells = [
-                                    view.change.clone(),
-                                    change_time,
-                                    family_cell(1, family_models[0].as_ref()),
-                                    family_cell(0, family_models[1].as_ref()),
-                                    family_cell(2, family_models[2].as_ref()),
-                                    format!(
-                                        "{}次\n{}",
-                                        row.task_counts[3],
-                                        interval_model_cost(&total)
-                                    ),
-                                ];
-                                let hints = [
-                                    view.tooltip.clone(),
-                                    view.tooltip.clone(),
-                                    model_usage_tooltip(
-                                        "Luna（所有版本合併）",
-                                        family_models[0].as_ref(),
-                                        row.task_counts[1],
-                                    ),
-                                    model_usage_tooltip(
-                                        "Sol（所有版本合併）",
-                                        family_models[1].as_ref(),
-                                        row.task_counts[0],
-                                    ),
-                                    model_usage_tooltip(
-                                        "Astra（所有版本合併）",
-                                        family_models[2].as_ref(),
-                                        row.task_counts[2],
-                                    ),
-                                    model_usage_tooltip(
-                                        "所有模型總計",
-                                        Some(&total),
-                                        row.task_counts[3],
-                                    ),
-                                ];
-                                for i in 0..cells.len() {
-                                    ui.put(
-                                        Rect::from_min_size(
-                                            rect.min + Vec2::new(X[i] * scale, 0.),
-                                            Vec2::new(WIDTH[i] * scale, 50. * scale),
-                                        ),
-                                        egui::Label::new(RichText::new(&cells[i]).size(
-                                            ui.style().text_styles[&egui::TextStyle::Body].size,
-                                        )),
-                                    )
-                                    .on_hover_text(&hints[i]);
-                                }
-                                ui.painter().hline(
-                                    rect.x_range(),
-                                    rect.bottom() - 1.,
-                                    Stroke::new(
-                                        1_f32,
-                                        ui.visuals().widgets.noninteractive.bg_stroke.color,
-                                    ),
-                                );
+        // Keep the model totals visible in the default window. The previous
+        // fixed-width columns expanded with font scaling and pushed Total off-screen.
+        let table_width = (ui.available_width() / scale).max(1.);
+        let column_widths = [
+            table_width * 0.09,
+            table_width * 0.25,
+            table_width * 0.165,
+            table_width * 0.165,
+            table_width * 0.165,
+            table_width * 0.165,
+        ];
+        let mut column_x = [0.; 6];
+        for i in 1..column_x.len() {
+            column_x[i] = column_x[i - 1] + column_widths[i - 1];
+        }
+        let x = column_x;
+        let widths = column_widths;
+        ui.set_min_width(table_width * scale);
+        let (header, _) =
+            ui.allocate_exact_size(Vec2::new(table_width * scale, 26. * scale), Sense::hover());
+        for (i, title) in [
+            "額度變化",
+            "變化時間（UTC+08）",
+            "Luna",
+            "Sol",
+            "Astra",
+            "Total",
+        ]
+        .iter()
+        .enumerate()
+        {
+            ui.put(
+                Rect::from_min_size(
+                    header.min + Vec2::new(x[i] * scale, 0.),
+                    Vec2::new(widths[i] * scale, 26. * scale),
+                ),
+                egui::Label::new(RichText::new(*title).strong()).truncate(),
+            );
+        }
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("interval-table-rows")
+            .show_rows(
+                ui,
+                54. * scale,
+                self.history_cache.table_rows.len(),
+                |ui, range| {
+                    for row_index in range {
+                        let row = &self.history_cache.table_rows[row_index];
+                        let view = &row.presentation;
+                        let (rect, response) = ui.allocate_exact_size(
+                            Vec2::new(table_width * scale, 54. * scale),
+                            Sense::click(),
+                        );
+                        if response
+                            .on_hover_text(if row.interval_index.is_some() {
+                                format!("{}\n點擊查看詳情", view.tooltip)
+                            } else {
+                                view.tooltip.clone()
+                            })
+                            .clicked()
+                        {
+                            if let Some(index) = row.interval_index {
+                                self.selected_interval =
+                                    Some(self.intervals[index].history_event_key.clone());
                             }
-                        },
-                    );
-            });
+                        }
+                        let mut change_time = if view.end == "—" {
+                            "—".into()
+                        } else {
+                            view.end.clone()
+                        };
+                        change_time = change_time.replace(" +08:00", "");
+                        let families = [
+                            ("luna", "Luna", 1),
+                            ("sol", "Sol", 0),
+                            ("astra", "Astra", 2),
+                        ];
+                        let family_models: Vec<_> = families
+                            .iter()
+                            .map(|(family, _, _)| model_family_usage(&row.models, family))
+                            .collect();
+                        let total = total_model_usage(&row.models);
+                        let family_cell =
+                            |family_index: usize, usage: Option<&intervals::ModelIntervalUsage>| {
+                                usage.map_or_else(
+                                    || format!("{}次\n$0.0000", row.task_counts[family_index]),
+                                    |model| {
+                                        format!(
+                                            "{}次\n{}",
+                                            row.task_counts[family_index],
+                                            interval_model_cost(model)
+                                        )
+                                    },
+                                )
+                            };
+                        let cells = [
+                            view.change.clone(),
+                            change_time,
+                            family_cell(1, family_models[0].as_ref()),
+                            family_cell(0, family_models[1].as_ref()),
+                            family_cell(2, family_models[2].as_ref()),
+                            format!("{}次\n{}", row.task_counts[3], interval_model_cost(&total)),
+                        ];
+                        let hints = [
+                            view.tooltip.clone(),
+                            view.tooltip.clone(),
+                            model_usage_tooltip(
+                                "Luna（所有版本合併）",
+                                family_models[0].as_ref(),
+                                row.task_counts[1],
+                            ),
+                            model_usage_tooltip(
+                                "Sol（所有版本合併）",
+                                family_models[1].as_ref(),
+                                row.task_counts[0],
+                            ),
+                            model_usage_tooltip(
+                                "Astra（所有版本合併）",
+                                family_models[2].as_ref(),
+                                row.task_counts[2],
+                            ),
+                            model_usage_tooltip("所有模型總計", Some(&total), row.task_counts[3]),
+                        ];
+                        for i in 0..cells.len() {
+                            ui.put(
+                                Rect::from_min_size(
+                                    rect.min + Vec2::new(x[i] * scale, 0.),
+                                    Vec2::new(widths[i] * scale, 50. * scale),
+                                ),
+                                egui::Label::new(
+                                    RichText::new(&cells[i])
+                                        .size(ui.style().text_styles[&egui::TextStyle::Body].size),
+                                ),
+                            )
+                            .on_hover_text(&hints[i]);
+                        }
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.bottom() - 1.,
+                            Stroke::new(1_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                        );
+                    }
+                },
+            );
     }
 
     fn refresh_token_cache(&mut self) {
@@ -4588,41 +4593,47 @@ mod widget_revision_tests {
     }
 
     #[test]
-    fn interval_counts_unique_tasks_per_model_family() {
-        let make = |id: &str, session: &str, model: &str, flags: Vec<String>| TokenEvent {
-            id: id.into(),
-            timestamp: 100,
-            model: model.into(),
-            model_assumed: false,
-            reasoning_effort: None,
-            session: session.into(),
-            response_id: None,
-            turn_id: None,
-            source_kind: None,
-            input: 1,
-            cached: 0,
-            uncached: 1,
-            output: 0,
-            reasoning: 0,
-            cost_usd: Some(0.01),
-            coverage_start_timestamp_ms: None,
-            partial_flags: flags,
-        };
+    fn interval_counts_unique_turns_per_model_family() {
+        let make =
+            |id: &str, session: &str, turn: Option<&str>, model: &str, flags: Vec<String>| {
+                TokenEvent {
+                    id: id.into(),
+                    timestamp: 100,
+                    model: model.into(),
+                    model_assumed: false,
+                    reasoning_effort: None,
+                    session: session.into(),
+                    response_id: None,
+                    turn_id: turn.map(str::to_owned),
+                    source_kind: None,
+                    input: 1,
+                    cached: 0,
+                    uncached: 1,
+                    output: 0,
+                    reasoning: 0,
+                    cost_usd: Some(0.01),
+                    coverage_start_timestamp_ms: None,
+                    partial_flags: flags,
+                }
+            };
         let events = [
-            make("1", "task-a", "gpt-6.1-sol", vec![]),
-            make("2", "task-a", "gpt-6.1-sol", vec![]),
-            make("3", "task-a", "gpt-6-luna", vec![]),
-            make("4", "task-b", "gpt-6-luna", vec![]),
-            make("5", "task-c", "gpt-6-astra", vec![]),
+            make("1", "task-a", Some("turn-1"), "gpt-6.1-sol", vec![]),
+            make("2", "task-a", Some("turn-1"), "gpt-6.1-sol", vec![]),
+            make("3", "task-a", Some("turn-2"), "gpt-6.1-sol", vec![]),
+            make("4", "task-a", Some("turn-1"), "gpt-6-luna", vec![]),
+            make("5", "task-b", None, "gpt-6-luna", vec![]),
+            make("6", "task-b", None, "gpt-6-luna", vec![]),
+            make("7", "task-c", Some("turn-1"), "gpt-6-astra", vec![]),
             make(
-                "6",
+                "8",
                 "task-review",
+                Some("review-turn"),
                 "codex-auto-review",
                 vec!["excluded_recorded_codex_auto_review".into()],
             ),
         ];
         let refs: Vec<_> = events.iter().collect();
-        assert_eq!(interval_task_counts(&refs), [1, 2, 1, 3]);
+        assert_eq!(interval_task_counts(&refs), [2, 2, 1, 4]);
     }
 
     #[test]
@@ -4729,7 +4740,7 @@ mod widget_revision_tests {
         app.set_intervals(Arc::new(repriced));
         app.refresh_main_cache();
         assert!(app.main_cache.recent_tooltip.contains("$12.3456"));
-        assert!(app.history_cache.key.is_none());
+        assert!(app.history_cache.key.is_some());
     }
     #[test]
     fn empty_recent_interval_hover_has_no_fabricated_price() {
