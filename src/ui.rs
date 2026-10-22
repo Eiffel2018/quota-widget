@@ -2205,13 +2205,13 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            "每週額度 v3.22".to_owned()
+                            "每週額度 v3.23".to_owned()
                         } else {
                             v.window_label.clone()
                         }
                     })
                     .unwrap_or_else(|| {
-                        "每週額度 v3.22".to_owned()
+                        "每週額度 v3.23".to_owned()
                     });
                 painter.circle_filled(
                     pt(22., 24.),
@@ -2223,7 +2223,7 @@ impl WidgetApp {
                     },
                 );
                 let title_size = font_size;
-                painter.with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(147., 36.))).text(
+                painter.with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(140., 36.))).text(
                     pt(34., 14.),
                     Align2::LEFT_TOP,
                     title,
@@ -2232,7 +2232,7 @@ impl WidgetApp {
                 );
                 if ui
                     .put(
-                        Rect::from_min_max(pt(148., 12.), pt(220., 37.)),
+                        Rect::from_min_max(pt(145., 12.), pt(208., 37.)),
                         egui::Button::new(RichText::new("扣額紀錄").size(font_size).color(fg)).fill(line),
                     )
                     .clicked()
@@ -2241,12 +2241,26 @@ impl WidgetApp {
                 }
                 if ui
                     .put(
-                        Rect::from_min_max(pt(224., 12.), pt(301., 37.)),
+                        Rect::from_min_max(pt(211., 12.), pt(275., 37.)),
                         egui::Button::new(RichText::new("Token明細").size(font_size).color(fg)).fill(line),
                     )
                     .clicked()
                 {
                     self.tokens_open = true;
+                }
+                if ui
+                    .put(
+                        Rect::from_min_max(pt(279., 12.), pt(302., 37.)),
+                        egui::Button::new(
+                            RichText::new("×").size(font_size + 2.).color(fg),
+                        )
+                        .fill(line),
+                    )
+                    .on_hover_text("關閉小工具")
+                    .clicked()
+                {
+                    self.begin_close();
+                    ctx.request_repaint();
                 }
                 if let Some(progress) = self.compact_status_text() {
                     let progress_rect = Rect::from_min_max(pt(21., 39.), pt(289., 57.));
