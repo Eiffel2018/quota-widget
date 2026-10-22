@@ -195,6 +195,8 @@ struct HistoryCache {
     table_rows: Vec<TableIntervalRow>,
     pending_segments: Vec<DailyQuotaSegment>,
     day_token_indices: Vec<usize>,
+    token_db_signature: Option<(PathBuf, u64, Option<std::time::SystemTime>)>,
+    token_db: Option<quota_widget::token_db::TokenDb>,
     next_segment: usize,
     weighted_usd: f64,
     weighted_points: f64,
@@ -2205,13 +2207,13 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            "每週額度 v3.23".to_owned()
+                            "每週額度 v3.24".to_owned()
                         } else {
                             v.window_label.clone()
                         }
                     })
                     .unwrap_or_else(|| {
-                        "每週額度 v3.23".to_owned()
+                        "每週額度 v3.24".to_owned()
                     });
                 painter.circle_filled(
                     pt(22., 24.),
@@ -2572,6 +2574,26 @@ impl WidgetApp {
             );
         }
     }
+    fn history_token_db(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::io::Result<&quota_widget::token_db::TokenDb> {
+        let metadata = std::fs::metadata(path)?;
+        let signature = (path.to_path_buf(), metadata.len(), metadata.modified().ok());
+        if self.history_cache.token_db_signature.as_ref() != Some(&signature) {
+            self.history_cache.token_db = None;
+            self.history_cache.token_db_signature = Some(signature);
+        }
+        if self.history_cache.token_db.is_none() {
+            self.history_cache.token_db =
+                Some(quota_widget::token_db::TokenDb::open_readonly(path)?);
+        }
+        Ok(self
+            .history_cache
+            .token_db
+            .as_ref()
+            .expect("database opened above"))
+    }
     fn history_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("扣額紀錄");
         if self.demo {
@@ -2752,8 +2774,13 @@ impl WidgetApp {
         {
             let segment =
                 self.history_cache.pending_segments[self.history_cache.next_segment].clone();
-            let loaded_segment = if let Some(view) = &self.tokens.database {
-                quota_widget::token_db::TokenDb::open_readonly(&view.database_path).and_then(|db| {
+            let database_path = self
+                .tokens
+                .database
+                .as_ref()
+                .map(|view| view.database_path.clone());
+            let loaded_segment = if let Some(path) = database_path {
+                self.history_token_db(&path).and_then(|db| {
                     db.query_events(
                         Some(segment.start.saturating_add(1)),
                         Some(segment.end.saturating_add(1)),
