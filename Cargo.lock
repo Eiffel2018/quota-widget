@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "quota-widget"
-version = "0.3.19"
+version = "3.14.0"
 dependencies = [
  "chrono",
  "eframe",

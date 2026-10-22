@@ -4,6 +4,7 @@ use crate::{
         flush_cancelled_command, Command, Event, Operation, Progress, ProgressStage, Snapshot,
     },
     cancellation,
+    cycle_db::CycleDb,
     db_view::{DailyView, DatabaseView, ViewRequest},
     display_cache::{DayCache, DayKey, RangeCache, RangeKey},
     display_time,
@@ -16,7 +17,6 @@ use crate::{
     tokens::{self, ImportReport, Pricing, TokenEvent, TokenStore},
     usage_views::{self, GroupBy, TaskRow},
 };
-use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     io,
@@ -25,31 +25,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Deserialize)]
-struct HistoryFile {
-    version: u32,
-    events: Vec<HistoryEvent>,
-}
-#[derive(Serialize)]
-struct HistoryOutput<'a> {
-    version: u32,
-    events: &'a [HistoryEvent],
-}
-#[derive(Serialize)]
-struct IntervalOutput<'a> {
-    version: u32,
-    intervals: &'a [CompletedInterval],
-}
-
 struct State {
     db: Option<TokenDb>,
+    cycle_db: Option<CycleDb>,
+    cycle_start: Option<i64>,
     store: TokenStore,
     pricing: Pricing,
     raw_history: Vec<HistoryEvent>,
     loaded_history_path: Option<PathBuf>,
     normalized: Arc<Vec<HistoryEvent>>,
     history_blocked: bool,
-    history_backup: Option<PathBuf>,
     history_dirty: bool,
     request: ViewRequest,
     ranges: BTreeMap<(i64, i64), Vec<ModelIntervalUsage>>,
@@ -69,13 +54,14 @@ impl State {
         let (day_start, day_end) = display_time::day_bounds(display_time::now_day()).unwrap();
         Self {
             db: None,
+            cycle_db: None,
+            cycle_start: None,
             store: TokenStore::default(),
             pricing: Pricing::default(),
             raw_history: vec![],
             loaded_history_path: None,
             normalized: Arc::new(vec![]),
             history_blocked: false,
-            history_backup: None,
             history_dirty: false,
             request: ViewRequest {
                 day_start,
@@ -233,8 +219,54 @@ impl State {
         cancellation::check()?;
         let stats = db.commit(&export, revision)?;
         self.store.mark_committed();
+        if let Some(cycle_db) = self.cycle_db.as_mut() {
+            cycle_db.apply_changes(&stats.event_changes)?;
+        }
         self.invalidate(&stats);
         Ok(Some(stats))
+    }
+    fn sync_cycle_archive(&mut self) -> io::Result<()> {
+        if !self.write_authorized || self.blocked || self.history_blocked {
+            return Ok(());
+        }
+        let latest_reset = self
+            .normalized
+            .iter()
+            .filter(|event| {
+                event.kind == crate::model::HistoryKind::QuotaReset
+                    && event
+                        .before
+                        .parse::<f64>()
+                        .ok()
+                        .zip(event.after.parse::<f64>().ok())
+                        .is_some_and(|(before, after)| after > before)
+                    && event.evidence.as_ref().and_then(|e| e.window_duration_mins) == Some(10080)
+            })
+            .map(|event| event.observed_at_unix)
+            .max();
+        let Some(start) = latest_reset else {
+            return Ok(());
+        };
+        if self.cycle_start != Some(start) {
+            let directory = self
+                .db
+                .as_ref()
+                .and_then(|db| db.path().parent())
+                .ok_or_else(|| io::Error::other("Token database has no parent directory"))?;
+            self.cycle_db = Some(CycleDb::open(directory, start)?);
+            self.cycle_start = Some(start);
+        }
+        let Some(cycle_db) = self.cycle_db.as_mut() else {
+            return Ok(());
+        };
+        if cycle_db.needs_backfill()? {
+            let Some(db) = self.db.as_ref() else {
+                return Ok(());
+            };
+            let events = db.query_events(Some(start), None, true)?;
+            cycle_db.backfill(&events)?;
+        }
+        Ok(())
     }
     fn publish(&mut self) -> io::Result<Arc<Snapshot>> {
         cancellation::check()?;
@@ -431,30 +463,19 @@ impl State {
         self.intervals = Arc::new(values);
         Ok(true)
     }
-    fn save_history(&mut self, path: Option<&Path>, events: &mpsc::Sender<Event>) {
-        let Some(path) = path else { return };
+    fn save_history(&mut self, _path: Option<&Path>, events: &mpsc::Sender<Event>) {
         if !self.write_authorized || self.blocked || self.history_blocked || !self.history_dirty {
             return;
         }
-        let result = (|| {
-            if self.history_backup.as_deref() == Some(path) {
-                storage::backup_legacy_history(path)?;
-                self.history_backup = None;
-            }
-            storage::save_json(
-                path,
-                &HistoryOutput {
-                    version: 2,
-                    events: &self.raw_history,
-                },
-            )
-        })();
+        let Some(db) = self.db.as_ref() else { return };
+        let path = db.path().to_owned();
+        let result = db.save_history_events(&self.raw_history);
         match result {
             Ok(()) => self.history_dirty = false,
-            Err(error) => save_error(events, path, error),
+            Err(error) => save_error(events, &path, error),
         }
     }
-    fn emit_intervals(&mut self, events: &mpsc::Sender<Event>, save: Option<&Path>) {
+    fn emit_intervals(&mut self, events: &mpsc::Sender<Event>, _save: Option<&Path>) {
         if cancellation::is_cancelled() {
             return;
         }
@@ -463,24 +484,6 @@ impl State {
                 let _ = events.send(Event::IntervalsUpdated {
                     intervals: self.intervals.clone(),
                 });
-                if !cancellation::is_cancelled()
-                    && self.write_authorized
-                    && !self.blocked
-                    && !self.history_blocked
-                {
-                    if let Some(parent) = save.and_then(Path::parent) {
-                        let path = parent.join("quota-intervals.json");
-                        if let Err(error) = storage::save_json(
-                            &path,
-                            &IntervalOutput {
-                                version: 2,
-                                intervals: &self.intervals,
-                            },
-                        ) {
-                            save_error(events, &path, error)
-                        }
-                    }
-                }
             }
             Ok(false) => {}
             Err(error) => {
@@ -672,32 +675,26 @@ pub(crate) fn run(
                 if cancellation::is_cancelled() {
                     continue;
                 }
-                let history_error =
-                    history_path.as_ref().and_then(|path| {
-                        match storage::load_json::<HistoryFile>(path) {
-                            Ok(file) if matches!(file.version, 1 | 2) => {
-                                if file.version == 1 {
-                                    state.history_backup = Some(path.clone())
-                                };
-                                state.raw_history = file.events;
-                                None
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                            Ok(_) => {
-                                state.history_blocked = true;
-                                Some("Unsupported history version; original preserved".into())
-                            }
-                            Err(e) => {
-                                state.history_blocked = true;
-                                Some(format!("history.json: {e}"))
-                            }
-                        }
-                    });
+                let history_error = state.db.as_ref().and_then(|db| match db.history_events() {
+                    Ok(raw_history) => {
+                        state.raw_history = raw_history;
+                        None
+                    }
+                    Err(e) => {
+                        state.history_blocked = true;
+                        Some(format!("SQLite quota history: {e}"))
+                    }
+                });
                 if cancellation::is_cancelled() {
                     continue;
                 }
                 state.normalized = Arc::new(history::normalized(&state.raw_history));
                 state.merge(history::replay(state.store.quota_observations()));
+                if error.is_none() {
+                    if let Err(e) = state.sync_cycle_archive() {
+                        error = Some(format!("Quota cycle archive: {e}"));
+                    }
+                }
                 if error.is_none() && write_authorized {
                     if let Err(e) = state
                         .reprice(&pricing)
@@ -831,6 +828,19 @@ pub(crate) fn run(
                     history_changed =
                         state.merge(history::replay(state.store.quota_observations()));
                 }
+                if result.is_ok() && history_changed {
+                    if let Err(e) = state.sync_cycle_archive() {
+                        save_error(
+                            &events,
+                            state
+                                .db
+                                .as_ref()
+                                .map(TokenDb::path)
+                                .unwrap_or(Path::new("quota-cycle")),
+                            e,
+                        );
+                    }
+                }
                 let (report, mut error) = match result {
                     Ok(r) => (Some(r), None),
                     Err(e) => {
@@ -914,6 +924,19 @@ pub(crate) fn run(
                 save_path,
             } => {
                 let changed = state.merge(incoming);
+                if changed {
+                    if let Err(e) = state.sync_cycle_archive() {
+                        save_error(
+                            &events,
+                            state
+                                .db
+                                .as_ref()
+                                .map(TokenDb::path)
+                                .unwrap_or(Path::new("quota-cycle")),
+                            e,
+                        );
+                    }
+                }
                 let _ = events.send(Event::HistoryUpdated {
                     normalized: changed.then(|| state.normalized.clone()),
                 });

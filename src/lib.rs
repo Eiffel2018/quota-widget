@@ -9,6 +9,7 @@ pub mod tokens;
 
 pub mod background;
 pub mod cancellation;
+pub mod cycle_db;
 pub mod history;
 pub mod usage_views;
 

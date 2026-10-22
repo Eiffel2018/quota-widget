@@ -1099,7 +1099,7 @@ impl WidgetApp {
         if self.read_state {
             self.load_pending = self.send_work(WorkCommand::Load {
                 token_path: self.dir.join("tokens.json"),
-                history_path: Some(self.dir.join("history.json")),
+                history_path: None,
                 pricing: self.settings.pricing.clone(),
             });
         }
@@ -1268,7 +1268,7 @@ impl WidgetApp {
             metadata,
             pricing: self.settings.pricing.clone(),
             save_path: self.save_path("tokens.json"),
-            history_save_path: self.save_path("history.json"),
+            history_save_path: None,
         }) {
             self.import_pending = true;
         }
@@ -1473,7 +1473,7 @@ impl WidgetApp {
                             let events = std::mem::take(&mut self.quota.history);
                             self.send_work(WorkCommand::MergeHistory {
                                 events,
-                                save_path: self.save_path("history.json"),
+                                save_path: None,
                             });
                         }
                     }
@@ -1563,12 +1563,12 @@ impl WidgetApp {
                     self.persistent = true;
                     self.load_pending = self.send_work(WorkCommand::Load {
                         token_path: self.dir.join("tokens.json"),
-                        history_path: Some(self.dir.join("history.json")),
+                        history_path: None,
                         pricing: self.settings.pricing.clone(),
                     });
                     self.send_work(WorkCommand::MergeHistory {
                         events: self.history.as_ref().clone(),
-                        save_path: self.save_path("history.json"),
+                        save_path: None,
                     });
                     self.import_error = None;
                     self.notice = "已重新取得寫入權，正在更新本機用量。".into();
@@ -2205,23 +2205,13 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            format!(
-                                "每週額度 v{}",
-                                env!("CARGO_PKG_VERSION")
-                                    .strip_prefix("0.")
-                                    .unwrap_or(env!("CARGO_PKG_VERSION"))
-                            )
+                            "每週額度 v3.14".to_owned()
                         } else {
                             v.window_label.clone()
                         }
                     })
                     .unwrap_or_else(|| {
-                        format!(
-                            "每週額度 v{}",
-                            env!("CARGO_PKG_VERSION")
-                                .strip_prefix("0.")
-                                .unwrap_or(env!("CARGO_PKG_VERSION"))
-                        )
+                        "每週額度 v3.14".to_owned()
                     });
                 painter.circle_filled(
                     pt(22., 24.),
@@ -6137,13 +6127,17 @@ mod database_display_tests {
         assert!(reader.import_error.is_none(), "{:?}", reader.import_error);
         assert_eq!(reader.included_count(), 1);
         reader.worker.shutdown().unwrap();
-        let saved: serde_json::Value =
-            storage::load_json(&temp.path().join("history.json")).unwrap();
-        assert!(saved["events"]
-            .as_array()
+        let history_path = temp.path().join("history.json");
+        assert!(!history_path.exists(), "quota history must stay in SQLite");
+        let quota_db = quota_widget::token_db::TokenDb::open_readonly(
+            &quota_widget::token_db::TokenDb::database_path(&temp.path().join("tokens.json")),
+        )
+        .unwrap();
+        assert!(quota_db
+            .history_events()
             .unwrap()
             .iter()
-            .any(|event| event["observed_at_unix"] == live.observed_at_unix));
+            .any(|event| event.observed_at_unix == live.observed_at_unix));
     }
     #[test]
     fn long_context_export_labels_thresholds_without_changing_costs() {

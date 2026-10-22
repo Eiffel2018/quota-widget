@@ -6,6 +6,7 @@
 //! not create a database. Full-range queries are available for compatibility;
 //! paged queries do not hydrate historical audit shards.
 use crate::cancellation::{self, CancellationToken};
+use crate::model::HistoryEvent;
 use crate::tokens::{
     self, DirtyExport, Pricing, StoreHeader, ThreadShard, TokenEvent, TokenStore, TokenSummary,
 };
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS state(singleton INTEGER PRIMARY KEY CHECK(singleton=1
 CREATE TABLE IF NOT EXISTS global_parts(name TEXT PRIMARY KEY, digest BLOB NOT NULL, data BLOB NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS source_cursors(source_key TEXT PRIMARY KEY, digest BLOB NOT NULL, data BLOB NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS quota_chunks(ordinal INTEGER PRIMARY KEY, row_count INTEGER NOT NULL, first_ts INTEGER, last_ts INTEGER, digest BLOB NOT NULL, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS history_chunks(ordinal INTEGER PRIMARY KEY, digest BLOB NOT NULL, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS threads(thread_key INTEGER PRIMARY KEY, thread_id TEXT NOT NULL UNIQUE, digest BLOB NOT NULL, data BLOB NOT NULL, turn_usage BLOB, observation_count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS strings(sid INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS events(event_key INTEGER PRIMARY KEY, thread_key INTEGER NOT NULL REFERENCES threads ON DELETE CASCADE, ordinal INTEGER NOT NULL, id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, model_sid INTEGER NOT NULL REFERENCES strings, assumed INTEGER NOT NULL, effort_sid INTEGER REFERENCES strings, response_id TEXT, turn_id TEXT, source_kind_sid INTEGER REFERENCES strings, input NOT NULL, cached NOT NULL, uncached NOT NULL, output NOT NULL, reasoning NOT NULL, cost_usd REAL, flags_sid INTEGER NOT NULL REFERENCES strings, excluded INTEGER NOT NULL, anonymous_legacy INTEGER NOT NULL, coverage_start_timestamp_ms INTEGER);
@@ -414,6 +416,10 @@ impl TokenDb {
                 tx.execute_batch(SCHEMA).map_err(error)?;
                 tx.commit()?;
             }
+            // Additive migration for existing databases: quota history now lives
+            // beside token observations instead of being mirrored to JSON.
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS history_chunks(ordinal INTEGER PRIMARY KEY, digest BLOB NOT NULL, data BLOB NOT NULL);")
+                .map_err(error)?;
         }
         if existed {
             let version: Option<i64> = conn
@@ -456,6 +462,59 @@ impl TokenDb {
         let header = (*self.header_shared()?).clone();
         cancellation::check()?;
         Ok(header)
+    }
+    pub fn history_events(&self) -> io::Result<Vec<HistoryEvent>> {
+        cancellation::check()?;
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_chunks')",
+            [], |row| row.get(0),
+        ).map_err(error)?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::new();
+        let mut statement = self
+            .conn
+            .prepare("SELECT data FROM history_chunks ORDER BY ordinal")
+            .map_err(error)?;
+        for row in statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(error)?
+        {
+            cancellation::check()?;
+            events.extend(decode::<Vec<HistoryEvent>>(&checked_row(row)?)?);
+        }
+        Ok(events)
+    }
+    pub fn save_history_events(&self, events: &[HistoryEvent]) -> io::Result<()> {
+        cancellation::check()?;
+        if !self.writable {
+            return Err(error("History database is read-only"));
+        }
+        let tx = self.conn.unchecked_transaction().map_err(error)?;
+        for (ordinal, chunk) in events.chunks(QUOTA_CHUNK).enumerate() {
+            cancellation::check()?;
+            let body = encode(chunk)?;
+            let digest = hash(&body)?;
+            let old: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT digest FROM history_chunks WHERE ordinal=?",
+                    [ordinal as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(error)?;
+            if old.as_ref() != Some(&digest) {
+                let data = compress(&body)?;
+                tx.execute("INSERT INTO history_chunks VALUES(?,?,?) ON CONFLICT(ordinal) DO UPDATE SET digest=excluded.digest,data=excluded.data", params![ordinal as i64,digest,data]).map_err(error)?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM history_chunks WHERE ordinal>=?",
+            [events.len().div_ceil(QUOTA_CHUNK) as i64],
+        )
+        .map_err(error)?;
+        tx.commit().map_err(error)
     }
     pub(crate) fn header_shared(&self) -> io::Result<Arc<StoreHeader>> {
         let _snapshot = self.read_snapshot()?;
@@ -1685,6 +1744,31 @@ mod tests {
         let mut store = TokenStore::default();
         store.import_dir(dir, &Pricing::demo()).unwrap();
         store
+    }
+    #[test]
+    fn quota_history_round_trips_in_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("history.sqlite3");
+        let db = TokenDb::open(&path, true).unwrap();
+        let event: HistoryEvent = serde_json::from_value(serde_json::json!({
+            "session":"test-session",
+            "observed_at_unix":1234,
+            "source_key":"codex",
+            "epoch":1,
+            "kind":"QuotaDecrease",
+            "window_label":"primary",
+            "before":"50",
+            "after":"49",
+            "delta":"-1",
+            "partial":false
+        }))
+        .unwrap();
+        db.save_history_events(std::slice::from_ref(&event))
+            .unwrap();
+        assert_eq!(db.history_events().unwrap(), vec![event.clone()]);
+        drop(db);
+        let db = TokenDb::open_readonly(&path).unwrap();
+        assert_eq!(db.history_events().unwrap(), vec![event]);
     }
     fn event(id: &str, thread: &str, n: u64, excluded: bool) -> TokenEvent {
         TokenEvent {

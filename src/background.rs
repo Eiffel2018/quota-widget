@@ -1,8 +1,8 @@
 //! Background ownership of token import and state-file serialization.
 //!
 //! The GUI owns the process's `DataLock` and decides which commands may write.
-//! Passing a save path authorizes that state file and its sibling, rebuildable
-//! `quota-intervals.json` snapshot; read-only paths never authorize writes. Keep
+//! Passing a save path authorizes that state file; read-only paths never authorize
+//! writes. Keep
 //! the lock alive until `shutdown` (or `Drop`) has joined the worker, so queued
 //! atomic replacements cannot race a subsequently started instance.
 use crate::{
@@ -1168,12 +1168,21 @@ mod tests {
                 assert_eq!(TokenStore::load(&tokens).unwrap().events().len(), 1);
             }
             assert!(!storage::load_json::<Settings>(&settings_path).unwrap().dark);
-            assert_eq!(
-                storage::load_json::<LoadedHistory>(&history_path)
-                    .unwrap()
-                    .events,
-                vec![history_event()]
-            );
+            if database {
+                let db = crate::token_db::TokenDb::open_readonly(
+                    &crate::token_db::TokenDb::database_path(&tokens),
+                )
+                .unwrap();
+                assert_eq!(db.history_events().unwrap(), vec![history_event()]);
+                assert!(!history_path.exists());
+            } else {
+                assert_eq!(
+                    storage::load_json::<LoadedHistory>(&history_path)
+                        .unwrap()
+                        .events,
+                    vec![history_event()]
+                );
+            }
             assert!(worker.rx.try_iter().any(|event| matches!(
                 event,
                 Event::Updated {
