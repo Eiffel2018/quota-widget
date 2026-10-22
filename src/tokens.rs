@@ -1241,6 +1241,46 @@ impl TokenStore {
     pub fn dirty_export_checked(&self) -> io::Result<DirtyExport> {
         checked(|| self.dirty_export())
     }
+    /// Build a lossless current-cycle database export. Keep all quota history,
+    /// source cursors, names and model contexts, but trim older usage evidence;
+    /// one pre-boundary observation per task remains as a cumulative baseline.
+    pub fn cycle_compaction_export(&self, start: i64) -> io::Result<DirtyExport> {
+        checked(|| {
+            let cutoff_ms = start.saturating_mul(1000);
+            let pricing = self.last_pricing.clone().unwrap_or_default();
+            let mut threads = self.collect_loaded_shards(true);
+            for shard in cancel_iter(&mut threads) {
+                let baseline = shard
+                    .observations
+                    .iter()
+                    .filter(|row| row.timestamp_ms < cutoff_ms)
+                    .max_by_key(|row| (row.timestamp_ms, row.sequence))
+                    .cloned();
+                shard
+                    .observations
+                    .retain(|row| row.timestamp_ms >= cutoff_ms);
+                if let Some(row) = baseline {
+                    if !shard
+                        .observations
+                        .iter()
+                        .any(|current| current.identity == row.identity)
+                    {
+                        shard.observations.push(row);
+                    }
+                }
+                shard.events.retain(|event| event.timestamp >= start);
+                self.normalize_shard(shard, &pricing);
+                shard.events.retain(|event| event.timestamp >= start);
+            }
+            checkpoint()?;
+            let mut header = self.header();
+            header.revision = header
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("Token database revision overflow"))?;
+            Ok(DirtyExport { header, threads })
+        })?
+    }
     pub fn finish_hydration_for_export_checked(&mut self) -> io::Result<()> {
         checked(|| self.finish_hydration_for_export())
     }
@@ -4720,6 +4760,39 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn cycle_compaction_export_keeps_only_current_usage_and_one_baseline() {
+        let store = TokenStore::demo(1_000);
+        let cutoff = 850;
+        let export = store.cycle_compaction_export(cutoff).unwrap();
+        assert!(export
+            .threads
+            .iter()
+            .flat_map(|t| &t.events)
+            .all(|e| e.timestamp >= cutoff));
+        for shard in &export.threads {
+            assert!(
+                shard
+                    .observations
+                    .iter()
+                    .filter(|row| row.timestamp_ms < cutoff * 1000)
+                    .count()
+                    <= 1
+            );
+            assert!(shard
+                .observations
+                .iter()
+                .all(|row| row.timestamp_ms >= cutoff * 1000
+                    || shard
+                        .observations
+                        .iter()
+                        .filter(|prior| prior.timestamp_ms < cutoff * 1000)
+                        .count()
+                        == 1));
+        }
+        assert!(export.header.revision > store.revision);
+    }
 
     fn cancel_after<T>(checks: usize, work: impl FnOnce() -> T) -> T {
         struct Reset;

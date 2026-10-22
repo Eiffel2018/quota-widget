@@ -2205,13 +2205,13 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            "每週額度 v3.20".to_owned()
+                            "每週額度 v3.21".to_owned()
                         } else {
                             v.window_label.clone()
                         }
                     })
                     .unwrap_or_else(|| {
-                        "每週額度 v3.20".to_owned()
+                        "每週額度 v3.21".to_owned()
                     });
                 painter.circle_filled(
                     pt(22., 24.),
@@ -2347,7 +2347,7 @@ impl WidgetApp {
                     fg,
                 );
                 painter.line_segment([pt(21., 235.), pt(289., 235.)], Stroke::new(1_f32, line));
-                for (x,label) in [(21.,"Task／名稱"),(105.,"時間+8"),(163.,"用度"),(225.,"本%累計")] {txt(x,245.,label.into(),13.,fg);}
+                for (x,label) in [(21.,"對話"),(105.,"時間+8"),(163.,"用度"),(225.,"本%累計")] {txt(x,245.,label.into(),13.,fg);}
                 ui.interact(Rect::from_min_max(pt(21.,244.),pt(289.,261.)),ui.id().with("task-column-help"),Sense::hover()).on_hover_text("用度：最新 Response\n本%累計：自身估算 USD\n*：部分");
                 let table_bottom=263.+22.*visible as f32;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pt(21.,263.),pt(289.,table_bottom))),|ui| {

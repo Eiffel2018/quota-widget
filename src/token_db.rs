@@ -661,6 +661,15 @@ impl TokenDb {
         })?;
         Ok(result)
     }
+    pub fn has_events_before(&self, timestamp: i64) -> io::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE timestamp < ?1)",
+                [timestamp],
+                |row| row.get(0),
+            )
+            .map_err(error)
+    }
     pub fn query_page(
         &self,
         from: Option<i64>,
@@ -961,6 +970,31 @@ impl TokenDb {
                 .map_err(error)?;
         }
         Ok(())
+    }
+    /// Create a consistent SQLite backup, including committed WAL content.
+    pub fn backup_to(&self, destination: &Path) -> io::Result<()> {
+        if !self.writable {
+            return Err(error("SQLite backup requires the writer connection"));
+        }
+        if destination.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "SQLite backup destination already exists",
+            ));
+        }
+        let path = destination.to_string_lossy();
+        self.conn
+            .execute("VACUUM INTO ?1", [path.as_ref()])
+            .map_err(error)?;
+        Ok(())
+    }
+    pub fn vacuum(&self) -> io::Result<()> {
+        if !self.writable {
+            return Err(error("SQLite compaction requires the writer connection"));
+        }
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .map_err(error)
     }
 }
 
@@ -1744,6 +1778,22 @@ mod tests {
         let mut store = TokenStore::default();
         store.import_dir(dir, &Pricing::demo()).unwrap();
         store
+    }
+    #[test]
+    fn sqlite_cycle_backup_is_consistent_and_never_overwrites() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("tokens.sqlite3");
+        let backup = dir.path().join("tokens-backup.sqlite3");
+        let db = TokenDb::open(&source, true).unwrap();
+        db.backup_to(&backup).unwrap();
+        TokenDb::open_readonly(&backup)
+            .unwrap()
+            .integrity_check()
+            .unwrap();
+        assert_eq!(
+            db.backup_to(&backup).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
     }
     #[test]
     fn quota_history_round_trips_in_sqlite() {

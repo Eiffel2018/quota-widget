@@ -48,6 +48,69 @@ struct State {
     blocked: bool,
     write_authorized: bool,
 }
+fn reset_cycle_starts(events: &[HistoryEvent]) -> Vec<i64> {
+    let mut starts: Vec<i64> = events
+        .iter()
+        .filter(|event| {
+            event.kind == crate::model::HistoryKind::QuotaReset
+                && history::is_confirmed_quota_change(event)
+                && event
+                    .after
+                    .parse::<f64>()
+                    .is_ok_and(|after| (after - 100.0).abs() < 0.000001)
+                && event.evidence.as_ref().and_then(|e| e.window_duration_mins) == Some(10080)
+        })
+        .map(|event| event.observed_at_unix)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup_by(|current, prior| current.saturating_sub(*prior) <= 90);
+    starts
+}
+
+#[cfg(test)]
+mod reset_cycle_tests {
+    use super::*;
+    use crate::model::{HistoryEvidence, HistoryKind, HistoryReconciliation};
+
+    fn reset(at: i64, before: &str, after: &str, duration: i64) -> HistoryEvent {
+        HistoryEvent {
+            session: "test".into(),
+            observed_at_unix: at,
+            source_key: "codex".into(),
+            epoch: 1,
+            kind: HistoryKind::QuotaReset,
+            window_label: "weekly".into(),
+            before: before.into(),
+            after: after.into(),
+            delta: "1".into(),
+            partial: false,
+            before_observed_at_unix: None,
+            window_key: None,
+            evidence: Some(HistoryEvidence {
+                window_duration_mins: Some(duration),
+                ..HistoryEvidence::default()
+            }),
+            reconciliation: None,
+        }
+    }
+
+    #[test]
+    fn reset_split_uses_confirmed_weekly_returns_to_one_hundred_only() {
+        let mut conflict = reset(3_000, "30", "100", 10_080);
+        conflict.reconciliation = Some(HistoryReconciliation::ConflictingObservation);
+        assert_eq!(
+            reset_cycle_starts(&[
+                reset(1_000, "2", "100", 10_080),
+                reset(1_050, "99", "100", 10_080),
+                reset(2_000, "20", "100", 10_080),
+                reset(2_500, "20", "21", 10_080),
+                reset(2_800, "20", "100", 300),
+                conflict,
+            ]),
+            vec![1_000, 2_000]
+        );
+    }
+}
 impl State {
     fn new(write_authorized: bool) -> Self {
         let now = chrono::Utc::now().timestamp();
@@ -229,31 +292,30 @@ impl State {
         if !self.write_authorized || self.blocked || self.history_blocked {
             return Ok(());
         }
-        let latest_reset = self
-            .normalized
-            .iter()
-            .filter(|event| {
-                event.kind == crate::model::HistoryKind::QuotaReset
-                    && event
-                        .before
-                        .parse::<f64>()
-                        .ok()
-                        .zip(event.after.parse::<f64>().ok())
-                        .is_some_and(|(before, after)| after > before)
-                    && event.evidence.as_ref().and_then(|e| e.window_duration_mins) == Some(10080)
-            })
-            .map(|event| event.observed_at_unix)
-            .max();
-        let Some(start) = latest_reset else {
+        let starts = reset_cycle_starts(&self.normalized);
+        let Some(&start) = starts.last() else {
             return Ok(());
         };
+        let directory = self
+            .db
+            .as_ref()
+            .and_then(|db| db.path().parent())
+            .ok_or_else(|| io::Error::other("Token database has no parent directory"))?
+            .to_owned();
+        for (index, &cycle_start) in starts.iter().enumerate() {
+            let cycle_end = starts.get(index + 1).copied();
+            let mut archive = CycleDb::open(&directory, cycle_start)?;
+            if archive.needs_backfill()? {
+                let db = self
+                    .db
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("Token database is unavailable"))?;
+                let events = db.query_events(Some(cycle_start), cycle_end, true)?;
+                archive.backfill(&events)?;
+            }
+        }
         if self.cycle_start != Some(start) {
-            let directory = self
-                .db
-                .as_ref()
-                .and_then(|db| db.path().parent())
-                .ok_or_else(|| io::Error::other("Token database has no parent directory"))?;
-            self.cycle_db = Some(CycleDb::open(directory, start)?);
+            self.cycle_db = Some(CycleDb::open(&directory, start)?);
             self.cycle_start = Some(start);
         }
         let Some(cycle_db) = self.cycle_db.as_mut() else {
@@ -265,6 +327,38 @@ impl State {
             };
             let events = db.query_events(Some(start), None, true)?;
             cycle_db.backfill(&events)?;
+        }
+        let db = self
+            .db
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Token database is unavailable"))?;
+        if db.has_events_before(start)? {
+            let timestamp = chrono::DateTime::from_timestamp(start, 0)
+                .ok_or_else(|| io::Error::other("Invalid quota reset timestamp"))?
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                .format("%Y%m%d-%H%M%S");
+            let backup_path =
+                directory.join(format!("tokens-before-cycle-split-{timestamp}.sqlite3"));
+            if !backup_path.exists() {
+                db.backup_to(&backup_path)?;
+            }
+            let backup = TokenDb::open_readonly(&backup_path)?;
+            backup.integrity_check()?;
+            let revision = db.revision()?.unwrap_or(0);
+            let store = db.export_store()?;
+            let export = store.cycle_compaction_export(start)?;
+            let stats = db.commit(&export, revision)?;
+            db.checkpoint()?;
+            db.vacuum()?;
+            self.store = TokenStore::from_header(db.header()?);
+            if let Some(cycle_db) = self.cycle_db.as_mut() {
+                cycle_db.apply_changes(&stats.event_changes)?;
+            }
+            self.ranges.clear();
+            self.daily_cache = None;
+            self.day_totals = None;
+            self.grouped_day = None;
+            self.range_totals = None;
         }
         Ok(())
     }

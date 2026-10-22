@@ -1,6 +1,6 @@
-# Quota Widget 0.3.18
+# Quota Widget v3.21
 
-每日百分比表由 UTC+08 午夜開始，以當日首次出現的下降作分段邊界；最新分段先計先顯示，之後每完成一段即追加一行。當日以外的日期只在選取時載入；當前額度另列為時間未知的進行中分段。欄位顯示每個模型家族的唯一 Task 數和 USD。主視窗標題顯示 `v3.18`。
+每日百分比表由 UTC+08 午夜開始，以當日首次出現的下降作分段邊界；最新分段先計先顯示，之後每完成一段即追加一行。當日以外的日期只在選取時載入；當前額度另列為時間未知的進行中分段。欄位顯示每個模型家族的唯一對話數和 USD。主視窗標題顯示 `v3.21`。
 
 [更新說明](docs/RELEASE-0.3.18.md) · [Windows 驗證](VALIDATION-0.3.18.md)
 
@@ -99,7 +99,7 @@ Linux：桌面需 X11／Wayland 及 OpenGL。執行 quota-widget。
 
 資料目錄：Windows %LOCALAPPDATA%/quota-widget；Mac ~/Library/Application Support/quota-widget；Linux $XDG_CONFIG_HOME/quota-widget 或 ~/.config/quota-widget。
 
-settings.json 保存偏好／價格；tokens.sqlite3 保存去重後用量、壓縮原始用量證據、必要的模型／session 識別、明確 Task 名稱及上層關係、來源 offsets 和 quota 觀察事件。程式不會自動讀寫舊 history.json，也不會刪除它；如需舊記錄，須另行匯入。每次確認新的每週 quota reset 時，另建 quota-cycle-YYYYMMDD-HHMMSS.sqlite3，只存該週期的 TokenEvent 明細，保留舊週期檔。全域 tokens.sqlite3 繼續作為增量匯入索引，不會按週期重掃 Codex session。舊 tokens.json 原樣保留為轉換前備份；新的用量不再寫入它。資料庫開啟時可能有 -wal／-shm 側檔，請勿自行刪除；備份請先關閉程式或使用完整 export。名稱來自 metadata 或所選 sessions 同層 session_index.jsonl，不從對話正文猜測。沒有對話正文或憑證。匯出存到 exports/。請把含本機 session／來源路徑的資料視為私人資料。
+settings.json 保存偏好／價格；tokens.sqlite3 保存最新 reset 週期的去重用量、壓縮原始用量證據、必要的模型／session 識別、明確對話名稱及上層關係、來源 offsets 和 quota 觀察事件。程式不會自動讀寫舊 history.json，也不會刪除它；如需舊記錄，須另行匯入。確認 quota 回到 100% 時，舊週期的 TokenEvent 明細分別存入 quota-cycle-YYYYMMDD-HHMMSS.sqlite3，保留舊週期檔；主 tokens.sqlite3 只保留最新週期用量，來源 offsets 保留以增量匯入而不重掃 Codex session。舊 tokens.json 原樣保留為轉換前備份；新的用量不再寫入它。資料庫開啟時可能有 -wal／-shm 側檔，請勿自行刪除；程式會先建立週期整理前備份。名稱來自 metadata 或所選 sessions 同層 session_index.jsonl，不從對話正文猜測。沒有對話正文或憑證。匯出存到 exports/。請把含本機 session／來源路徑的資料視為私人資料。
 
 只有一個寫入者能持有該資料目錄的 OS 鎖；其他視窗改為唯讀。損壞的儲存檔不會以空資料覆寫。程式不自動刪除舊歷史；自行備份後可手動管理。Demo 不讀取或保存真實資料。
 
@@ -144,7 +144,7 @@ inspect 不修改來源或儲存檔；import 只修改明確指定 state 並取�
 
 完整區間才能直接比較；首次觀察、重設邊界、缺口、未知價格或假設模型都附限制。官方 quota 與 API 等價費用不是相同計費單位，單次粗粒度觀察不能證明訂閱扣額規則。不同額度視窗是同一使用量的不同觀察，請勿把它們相加。
 
-每百分比統計由已記錄的 quota 變化時間界定，TokenEvent 按區間即時彙總；週期 SQLite 是保留明細用，原始全域資料仍留在 tokens.sqlite3。舊版 quota-intervals.json 不再由資料庫工作器更新。扣額 JSON 包含 completed_intervals；CSV 同時另存 -models.csv，每列一個區間／模型，方便比較實驗。
+每百分比統計由已記錄的 quota 變化時間界定，TokenEvent 按區間即時彙總；各週期 SQLite 分別保留重設週期的明細，主 tokens.sqlite3 只留最新週期。舊版 quota-intervals.json 不再由資料庫工作器更新。扣額 JSON 包含 completed_intervals；CSV 同時另存 -models.csv，每列一個區間／模型，方便比較實驗。
 
 ## 合成樹狀驗證（不接觸真實帳戶）
 
