@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const COLLAPSED_HEIGHT: f32 = 184.;
+const COLLAPSED_HEIGHT: f32 = 158.;
 
 #[cfg(test)]
 fn reset_reminder_at(value: &str) -> Option<i64> {
@@ -2624,7 +2624,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.36".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.37".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(181., 35.)))
@@ -2818,7 +2818,7 @@ impl WidgetApp {
                 if reminder.is_none() {
                     if widget_icon(
                         ui,
-                        Rect::from_min_max(pt(125., 141.), pt(177., 165.)),
+                        Rect::from_min_max(pt(21., 117.), pt(73., 141.)),
                         WidgetIcon::Prediction,
                         Some(self.prediction_open),
                         "Reset預測",
@@ -2840,7 +2840,7 @@ impl WidgetApp {
                         .size()
                         .x;
                     painter.text(
-                        pt(21., 120.),
+                        pt(21., 105.),
                         Align2::LEFT_TOP,
                         tr(prediction_title),
                         FontId::proportional(font_size * (155. * sx / title_width.max(1.)).min(1.)),
@@ -2857,7 +2857,7 @@ impl WidgetApp {
                         fg
                     };
                     painter.text(
-                        pt(21., 141.),
+                        pt(21., 124.),
                         Align2::LEFT_TOP,
                         tr(reminder
                             .map(|target| reset_reminder_countdown(target, reminder_now))
@@ -2867,7 +2867,7 @@ impl WidgetApp {
                     );
                     if ui
                         .interact(
-                            Rect::from_min_max(pt(21., 117.), pt(176., 171.)),
+                            Rect::from_min_max(pt(21., 103.), pt(176., 150.)),
                             ui.id().with("reset-prediction"),
                             Sense::click(),
                         )
@@ -2892,7 +2892,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(181., 141.), pt(233., 165.)),
+                    Rect::from_min_max(pt(181., 117.), pt(233., 141.)),
                     WidgetIcon::Tasks,
                     Some(self.tasks_expanded),
                     "展開 / 收起對話列表",
@@ -2906,7 +2906,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(237., 141.), pt(289., 165.)),
+                    Rect::from_min_max(pt(237., 117.), pt(289., 141.)),
                     WidgetIcon::Recent,
                     Some(self.recent_expanded),
                     "展開 / 收起最近扣額",
@@ -2920,8 +2920,8 @@ impl WidgetApp {
                 }
                 if self.tasks_expanded || self.recent_expanded {
                     let content = Rect::from_min_max(
-                        pt(21., 184.),
-                        Pos2::new(pt(289., 184.).x, rect.bottom() - 12. * sy),
+                        pt(21., 158.),
+                        Pos2::new(pt(289., 158.).x, rect.bottom() - 12. * sy),
                     );
                     ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
                         egui::ScrollArea::vertical()
@@ -3414,12 +3414,15 @@ impl WidgetApp {
             self.prediction_presented = true;
             let mut builder = ViewportBuilder::default()
                 .with_title(tr("Reset預測"))
-                .with_inner_size([430., 230.])
+                .with_inner_size([350., 150.])
+                .with_resizable(false)
                 .with_visible(true)
                 .with_window_level(WindowLevel::AlwaysOnTop);
             if first {
                 builder = builder.with_active(true);
-                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                if let Some(position) = self.settings.prediction_position {
+                    builder = builder.with_position(position);
+                } else if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
                     builder = builder.with_position(rect.min);
                 }
             }
@@ -3430,11 +3433,16 @@ impl WidgetApp {
                     if first {
                         ctx.send_viewport_cmd(ViewportCommand::Focus);
                     }
+                    self.remember_prediction_position(ctx);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         self.prediction_open = false;
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| self.prediction_ui(ui));
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let content = ui.vertical(|ui| self.prediction_ui(ui));
+                        let size = content.response.rect.size() + Vec2::splat(16.);
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                    });
                 },
             );
         }
@@ -4461,6 +4469,20 @@ impl WidgetApp {
                 && self.settings.settings_position != Some(position)
             {
                 self.settings.settings_position = Some(position);
+                self.dirty = true;
+            }
+        }
+    }
+    fn remember_prediction_position(&mut self, ctx: &egui::Context) {
+        if ctx.viewport_id() != ViewportId::from_hash_of("reset-prediction-dialog") {
+            return;
+        }
+        if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+            let position = [rect.min.x, rect.min.y];
+            if position.iter().all(|v| v.is_finite())
+                && self.settings.prediction_position != Some(position)
+            {
+                self.settings.prediction_position = Some(position);
                 self.dirty = true;
             }
         }
@@ -6031,7 +6053,7 @@ mod widget_revision_tests {
         app.tasks_expanded = true;
         let ctx = egui::Context::default();
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 511.));
-        let pos = Pos2::new(60. * 430. / 310., 241. * 430. / 310.);
+        let pos = Pos2::new(60. * 430. / 310., 215. * 430. / 310.);
         let frame = |app: &mut WidgetApp, events: Vec<egui::Event>| {
             let input = egui::RawInput {
                 screen_rect: Some(rect),
@@ -8101,6 +8123,55 @@ mod responsive_close_tests {
         }
     }
     #[test]
+    fn prediction_dialog_remembers_position_and_sizes_to_content() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let output = Rc::clone(&captured);
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let mut input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(350., 230.))),
+                ..Default::default()
+            };
+            input.viewports.insert(
+                viewport.ids.this,
+                egui::ViewportInfo {
+                    outer_rect: Some(Rect::from_min_size(
+                        Pos2::new(410., 210.),
+                        Vec2::new(350., 230.),
+                    )),
+                    ..Default::default()
+                },
+            );
+            let _ = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            assert_eq!(viewport.builder.inner_size, Some(Vec2::new(350., 150.)));
+            assert_eq!(viewport.builder.resizable, Some(false));
+            output.borrow_mut().push(viewport.builder);
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        app.apply_theme(&ctx);
+        for attempt in 0..2 {
+            app.open_prediction();
+            let _ = ctx.run(Default::default(), |ctx| app.detail_windows(ctx));
+            assert_eq!(app.settings.prediction_position, Some([410., 210.]));
+            if attempt == 1 {
+                assert_eq!(
+                    captured.borrow().last().unwrap().position,
+                    Some(Pos2::new(410., 210.))
+                );
+            }
+            let saved: Settings =
+                serde_json::from_str(&serde_json::to_string(&app.settings).unwrap()).unwrap();
+            assert_eq!(saved.prediction_position, Some([410., 210.]));
+            app.open_prediction();
+            assert!(!app.prediction_open);
+        }
+    }
+    #[test]
     fn reminder_uses_user_time_at_utc_plus_eight_and_counts_elapsed_after_zero() {
         let target = reset_reminder_at("2030-04-02 01:00").unwrap();
         assert_eq!(
@@ -8216,11 +8287,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.36", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.36", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.37", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.37", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.36",
+                "Codex Quota v3.37",
                 "Interface font size",
             ),
         ] {
@@ -8268,8 +8339,8 @@ mod accessible_ui_tests {
 
     #[test]
     fn expanded_content_uses_window_height_instead_of_row_threshold() {
-        assert_eq!(widget_target_height(310., 0., Some(1080.)), 184.);
-        assert_eq!(widget_target_height(310., 300., Some(1080.)), 484.);
+        assert_eq!(widget_target_height(310., 0., Some(1080.)), 158.);
+        assert_eq!(widget_target_height(310., 300., Some(1080.)), 458.);
         assert_eq!(widget_target_height(310., 2000., Some(768.)), 708.);
         let mut settings = Settings {
             size: [450., 1000.],
@@ -8277,7 +8348,7 @@ mod accessible_ui_tests {
             ..Default::default()
         };
         prepare_widget_settings(&mut settings);
-        assert_eq!(settings.size, [300., 184. * 300. / 310.]);
+        assert_eq!(settings.size, [300., 158. * 300. / 310.]);
         prepare_widget_settings(&mut settings);
         assert_eq!(settings.size[0], 300., "narrowing is a one-time migration");
     }
@@ -8445,15 +8516,15 @@ mod accessible_ui_tests {
                 }],
             )
         };
-        let tasks = text(click(&mut app, Pos2::new(207., 161.)));
+        let tasks = text(click(&mut app, Pos2::new(207., 129.)));
         assert!(app.tasks_expanded && !app.recent_expanded);
         assert!(tasks.contains("對話"));
-        click(&mut app, Pos2::new(265., 161.));
+        click(&mut app, Pos2::new(265., 129.));
         let both = text(frame(&mut app, vec![]));
         assert!(app.tasks_expanded && app.recent_expanded);
         let recent_heading = format!("最近 {} 次扣額", app.main_cache.recent_events.len());
         assert!(both.contains(&recent_heading), "{both}");
-        click(&mut app, Pos2::new(207., 161.));
+        click(&mut app, Pos2::new(207., 129.));
         assert!(!app.tasks_expanded && app.recent_expanded);
         click(&mut app, Pos2::new(198., 22.));
         assert!(app.history_open);
@@ -8483,7 +8554,7 @@ mod accessible_ui_tests {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 510.))),
                     time: Some(time),
                     events: if time == 0. {
-                        vec![egui::Event::PointerMoved(Pos2::new(60., 300.))]
+                        vec![egui::Event::PointerMoved(Pos2::new(60., 264.))]
                     } else {
                         Vec::new()
                     },

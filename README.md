@@ -1,6 +1,6 @@
-# Quota Widget v3.36
+# Quota Widget v3.37
 
-Reset predictions now clear after a confirmed reset. Use **Reset預測** to enter an announcement time in PST (UTC−08:00) or your configured display UTC offset. Settings windows remember their last position; the settings button toggles the window open/closed. Bottom buttons share the same height and spacing.
+Reset predictions now clear after a confirmed reset. Use **Reset預測** to enter an announcement time in PST (UTC−08:00) or your configured display UTC offset. Settings windows remember their last position; the settings button toggles the window open/closed. The Reset dialog fits its contents and remembers its position. Reset and its timer share the left side of the shorter main widget.
 
 設定可即時切換繁體中文、简体中文及 English，並記住選擇。標題為「Codex 額度」／「Codex Quota」。消耗率在連續觀測不足時，使用同一重設週期最近已確認扣額計算歷史平均，並標示為歷史；不改動下一次扣額預測的即時樣本。
 
