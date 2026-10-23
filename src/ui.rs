@@ -432,11 +432,13 @@ fn daily_quota_segments(
                 .unwrap_or_else(|| event.observed_at_unix.saturating_mul(1000)),
         )
     });
+    let resets = quota_widget::history::reset_cycle_starts(&events);
     let mut seen = BTreeSet::new();
     let mut result = Vec::new();
     let mut start = day_start;
     for event in events.into_iter().filter(|event| {
-        event.kind == quota_widget::model::HistoryKind::QuotaDecrease
+        (event.kind == quota_widget::model::HistoryKind::QuotaDecrease
+            || resets.contains(&event.observed_at_unix))
             && event.observed_at_unix >= day_start
             && event.observed_at_unix < day_end
     }) {
@@ -456,6 +458,18 @@ fn daily_quota_segments(
         else {
             continue;
         };
+        if event.kind == quota_widget::model::HistoryKind::QuotaReset {
+            seen.clear();
+            start = event.observed_at_unix;
+            result.push(DailyQuotaSegment {
+                change: format!("{}% → {}%", event.before, event.after),
+                event: Some(event),
+                start,
+                end: start,
+                points: 0.0,
+            });
+            continue;
+        }
         if before <= after || event.observed_at_unix <= start {
             continue;
         }
@@ -2670,6 +2684,10 @@ impl WidgetApp {
             {
                 self.dirty = true;
             }
+            if ui.button("重新整理").clicked() {
+                self.history_cache.key = None;
+                self.history_cache.work_key = None;
+            }
             if ui.button("匯出當日 CSV").clicked() {
                 self.export_day(false, false);
             }
@@ -2839,6 +2857,14 @@ impl WidgetApp {
                 || active_segment_presentation(segment.change.clone(), segment.start, cost),
                 |event| interval_views::recovered_observation(event, segment.start, cost),
             );
+            let presentation = if segment.points == 0.0 {
+                let mut marker = presentation;
+                marker.status = "額度重設".into();
+                marker.tooltip = "額度重設；此行只標示新週期開始，不計 Token 費用。".into();
+                marker
+            } else {
+                presentation
+            };
             if cost.events > 0 && segment.points > 0.0 {
                 self.history_cache.weighted_usd += cost.known_usd;
                 self.history_cache.weighted_points += segment.points;
@@ -4590,6 +4616,41 @@ mod widget_revision_tests {
         assert_eq!((rows[2].start, rows[2].end), (start + 120, start + 600));
         assert_eq!(rows[3].change, "11% → 10%");
         assert_eq!((rows[3].start, rows[3].end), (start, start + 120));
+    }
+
+    #[test]
+    fn daily_segments_show_reset_and_first_drop_without_charging_the_old_cycle() {
+        let start = 1_792_684_800;
+        let mut reset = quota_drop(start + 100, "0", "100");
+        reset.kind = quota_widget::model::HistoryKind::QuotaReset;
+        reset.evidence = Some(quota_widget::model::HistoryEvidence {
+            window_duration_mins: Some(10080),
+            before_reset_at: Some(start + 50),
+            reset_at: Some(start + 604800),
+            ..Default::default()
+        });
+        let mut replay = reset.clone();
+        replay.observed_at_unix += 790;
+        let rows = daily_quota_segments(
+            &[
+                quota_drop(start + 10, "100", "99"),
+                reset,
+                replay,
+                quota_drop(start + 900, "100", "99"),
+            ],
+            start,
+            start + 86400,
+            None,
+            start + 1000,
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].change, "100% → 99%");
+        assert_eq!((rows[0].start, rows[0].end), (start + 100, start + 900));
+        assert_eq!(rows[1].change, "0% → 100%");
+        assert_eq!(
+            (rows[1].start, rows[1].end, rows[1].points),
+            (start + 100, start + 100, 0.0)
+        );
     }
 
     #[test]

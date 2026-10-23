@@ -932,3 +932,52 @@ mod recovery_tests {
         assert_eq!(visible_observations(&events).len(), 3);
     }
 }
+
+pub fn reset_cycle_starts(events: &[HistoryEvent]) -> Vec<i64> {
+    let mut ordered = events.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|event| event.observed_at_unix);
+    let mut previous_deadlines = std::collections::BTreeSet::new();
+    let mut starts: Vec<i64> = ordered
+        .into_iter()
+        .filter(|event| {
+            event.kind == crate::model::HistoryKind::QuotaReset
+                // Reset boundaries are inferred from the recorded quota drop
+                // itself. Imported/legacy observations may be marked as
+                // uncertain recovery even when they explicitly record
+                // 0-98% -> 100% for the weekly window.
+                && event.reconciliation
+                    != Some(crate::model::HistoryReconciliation::ConflictingObservation)
+                && event
+                    .after
+                    .parse::<f64>()
+                    .is_ok_and(|after| (after - 100.0).abs() < 0.000001)
+                // A 99% -> 100% rebound is not a quota reset. Codex may
+                // report that transiently while reconciling the same cycle.
+                && event
+                    .before
+                    .parse::<f64>()
+                    .is_ok_and(|before| (0.0..99.0).contains(&before))
+                && event.evidence.as_ref().and_then(|e| e.window_duration_mins) == Some(10080)
+        })
+        .filter(|event| {
+            // A stale pre-reset snapshot can replay the same reset many minutes later.
+            // Keep the first observation for that source/account/previous deadline.
+            event
+                .evidence
+                .as_ref()
+                .and_then(|e| e.before_reset_at)
+                .is_none_or(|previous| {
+                    previous_deadlines.insert((
+                        event.source_key.clone(),
+                        event.window_key.clone(),
+                        event.evidence.as_ref().and_then(|e| e.account_id.clone()),
+                        previous,
+                    ))
+                })
+        })
+        .map(|event| event.observed_at_unix)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup_by(|current, prior| current.saturating_sub(*prior) <= 90);
+    starts
+}

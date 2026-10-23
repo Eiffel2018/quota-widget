@@ -49,33 +49,7 @@ struct State {
     write_authorized: bool,
 }
 fn reset_cycle_starts(events: &[HistoryEvent]) -> Vec<i64> {
-    let mut starts: Vec<i64> = events
-        .iter()
-        .filter(|event| {
-            event.kind == crate::model::HistoryKind::QuotaReset
-                // Reset boundaries are inferred from the recorded quota drop
-                // itself. Imported/legacy observations may be marked as
-                // uncertain recovery even when they explicitly record
-                // 0-98% -> 100% for the weekly window.
-                && event.reconciliation
-                    != Some(crate::model::HistoryReconciliation::ConflictingObservation)
-                && event
-                    .after
-                    .parse::<f64>()
-                    .is_ok_and(|after| (after - 100.0).abs() < 0.000001)
-                // A 99% -> 100% rebound is not a quota reset. Codex may
-                // report that transiently while reconciling the same cycle.
-                && event
-                    .before
-                    .parse::<f64>()
-                    .is_ok_and(|before| (0.0..99.0).contains(&before))
-                && event.evidence.as_ref().and_then(|e| e.window_duration_mins) == Some(10080)
-        })
-        .map(|event| event.observed_at_unix)
-        .collect();
-    starts.sort_unstable();
-    starts.dedup_by(|current, prior| current.saturating_sub(*prior) <= 90);
-    starts
+    history::reset_cycle_starts(events)
 }
 
 #[cfg(test)]
@@ -103,6 +77,16 @@ mod reset_cycle_tests {
             }),
             reconciliation: None,
         }
+    }
+
+    #[test]
+    fn replayed_pre_reset_snapshot_does_not_open_another_cycle() {
+        let mut first = reset(1000, "0", "100", 10080);
+        first.evidence.as_mut().unwrap().before_reset_at = Some(900);
+        let mut replay = first.clone();
+        replay.observed_at_unix = 1790;
+        replay.evidence.as_mut().unwrap().reset_at = Some(9999);
+        assert_eq!(reset_cycle_starts(&[replay, first]), vec![1000]);
     }
 
     #[test]
