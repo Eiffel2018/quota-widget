@@ -146,6 +146,30 @@ mod tests {
     }
 
     #[test]
+    fn history_reads_archived_ranges_without_opening_other_cycles_or_creating_files() {
+        let dir = TempDir::new().unwrap();
+        let start = 1_800_000_000;
+        let mut first = CycleDb::open(dir.path(), start).unwrap();
+        first
+            .backfill(&[event("first", start + 10), event("edge", start + 20)])
+            .unwrap();
+        let mut second = CycleDb::open(dir.path(), start + 100).unwrap();
+        second.backfill(&[event("next", start + 110)]).unwrap();
+        let rows = query_archived_events(dir.path(), start + 10, start + 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "first");
+        assert_eq!(rows[0].cost_usd, Some(0.01));
+        assert_eq!(rows[0].input, 10);
+        assert_eq!(
+            query_archived_events(dir.path(), start, start + 120)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
     fn cycle_archive_keeps_only_events_at_or_after_reset_and_upserts_by_id() {
         let dir = TempDir::new().unwrap();
         let mut db = CycleDb::open(dir.path(), 1_800_000_000).unwrap();
@@ -177,4 +201,90 @@ mod tests {
             true
         );
     }
+}
+
+/// Read just the archived reset cycles intersecting [start, end), without creating files.
+pub fn query_archived_events(
+    directory: &Path,
+    start: i64,
+    end: i64,
+) -> io::Result<Vec<TokenEvent>> {
+    let mut cycles = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let Some(stamp) = name
+            .strip_prefix("quota-cycle-")
+            .and_then(|n| n.strip_suffix(".sqlite3"))
+        else {
+            continue;
+        };
+        let Ok(dt) = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S") else {
+            continue;
+        };
+        cycles.push((dt.and_utc().timestamp() - 8 * 3600, path));
+    }
+    cycles.sort();
+    let mut events = Vec::new();
+    for (index, (cycle_start, path)) in cycles.iter().enumerate() {
+        if *cycle_start >= end
+            || cycles
+                .get(index + 1)
+                .is_some_and(|(next, _)| *next <= start)
+        {
+            continue;
+        }
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(sql_error)?;
+        conn.busy_timeout(std::time::Duration::from_millis(250))
+            .map_err(sql_error)?;
+        let mut stmt = conn.prepare("SELECT id,timestamp,model,session,model_assumed,reasoning_effort,response_id,turn_id,source_kind,input,cached,uncached,output,reasoning,cost_usd,partial_flags FROM cycle_events WHERE timestamp>=? AND timestamp<? ORDER BY timestamp,id").map_err(sql_error)?;
+        let rows = stmt
+            .query_map(params![start, end], |r| {
+                fn count(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<u64> {
+                    match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Integer(n) if n >= 0 => Ok(n as u64),
+                        rusqlite::types::ValueRef::Blob(b) if b.len() == 8 => {
+                            Ok(u64::from_be_bytes(b.try_into().unwrap()))
+                        }
+                        _ => Err(rusqlite::Error::InvalidQuery),
+                    }
+                }
+                let flags: String = r.get(15)?;
+                let partial_flags = serde_json::from_str(&flags).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        15,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(TokenEvent {
+                    id: r.get(0)?,
+                    timestamp: r.get(1)?,
+                    model: r.get(2)?,
+                    session: r.get(3)?,
+                    model_assumed: r.get(4)?,
+                    reasoning_effort: r.get(5)?,
+                    response_id: r.get(6)?,
+                    turn_id: r.get(7)?,
+                    source_kind: r.get(8)?,
+                    input: count(r, 9)?,
+                    cached: count(r, 10)?,
+                    uncached: count(r, 11)?,
+                    output: count(r, 12)?,
+                    reasoning: count(r, 13)?,
+                    cost_usd: r.get(14)?,
+                    partial_flags,
+                    coverage_start_timestamp_ms: None,
+                })
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let event = row.map_err(sql_error)?;
+            if !event.is_excluded_auto_review() {
+                events.push(event);
+            }
+        }
+    }
+    Ok(events)
 }

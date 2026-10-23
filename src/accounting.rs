@@ -100,7 +100,7 @@ mod tests {
 }
 
 /// Known recorded cost is always numeric. Unknown/missing coverage is separate.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObservedCost {
     pub known_usd: f64,
     pub unknown_events: usize,

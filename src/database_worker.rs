@@ -741,18 +741,8 @@ pub(crate) fn run(
                     started,
                     None,
                 );
-                let result = TokenDb::open_or_migrate(&token_path, write_authorized, &mut |p| {
-                    let _ = events.send(Event::Progress(Progress {
-                        operation: Operation::Load,
-                        stage: ProgressStage::Migrating,
-                        elapsed: started.elapsed(),
-                        files_done: p.done,
-                        files_total: p.total,
-                        lines_read: 0,
-                        observations: 0,
-                        events: 0,
-                    }));
-                });
+                let result =
+                    TokenDb::open_current(&TokenDb::database_path(&token_path), write_authorized);
                 let mut error = None;
                 match result {
                     Ok(Some(db)) => match db.header() {
@@ -762,7 +752,7 @@ pub(crate) fn run(
                         }
                         Err(e) => error = Some(e.to_string()),
                     },
-                    Ok(None) => error = Some("SQLite migration needs the application's writer lock; original JSON was preserved. Close the other instance and reopen.".into()),
+                    Ok(None) => error = Some("SQLite database needs the application's writer lock. Close the other instance and reopen.".into()),
                     Err(e) => error = Some(e.to_string()),
                 }
                 state.blocked = error.is_some();

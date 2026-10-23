@@ -333,6 +333,7 @@ pub struct TokenDb {
     path: PathBuf,
     writable: bool,
     header_cache: RefCell<Option<Arc<StoreHeader>>>,
+    projection_header_cache: RefCell<Option<Arc<StoreHeader>>>,
     _shared_read_lock: Option<File>,
 }
 impl TokenDb {
@@ -442,6 +443,7 @@ impl TokenDb {
             path: path.to_owned(),
             writable,
             header_cache: RefCell::new(None),
+            projection_header_cache: RefCell::new(None),
             _shared_read_lock: read_lock,
         })
     }
@@ -515,6 +517,36 @@ impl TokenDb {
         )
         .map_err(error)?;
         tx.commit().map_err(error)
+    }
+    /// Event projection needs attribution policy, never import cursors or quota history.
+    fn projection_header_shared(&self) -> io::Result<Arc<StoreHeader>> {
+        let revision = self.revision()?;
+        if let Some(header) = self.projection_header_cache.borrow().as_ref() {
+            if revision == Some(header.revision) {
+                return Ok(Arc::clone(header));
+            }
+        }
+        let bytes: Vec<u8> = self
+            .conn
+            .query_row(
+                "SELECT data FROM global_parts WHERE name='header'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(error)?;
+        let mut value: serde_json::Value = decode(&bytes)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| error("Invalid stored header"))?;
+        object.insert("sources".into(), serde_json::json!({}));
+        object.insert("quota".into(), serde_json::json!([]));
+        let header: StoreHeader = json_decode(&encode(&value)?)?;
+        if revision != Some(header.revision) {
+            return Err(error("Header revision does not match transaction revision"));
+        }
+        let header = Arc::new(header);
+        *self.projection_header_cache.borrow_mut() = Some(Arc::clone(&header));
+        Ok(header)
     }
     pub(crate) fn header_shared(&self) -> io::Result<Arc<StoreHeader>> {
         let _snapshot = self.read_snapshot()?;
@@ -613,7 +645,7 @@ impl TokenDb {
         mut visit: impl FnMut(TokenEvent) -> io::Result<bool>,
     ) -> io::Result<()> {
         let _snapshot = self.read_snapshot()?;
-        let header = self.header_shared()?;
+        let header = self.projection_header_shared()?;
         let policy = header.event_policy();
         let order = if descending { "DESC" } else { "ASC" };
         let mut conditions = Vec::new();
@@ -733,12 +765,12 @@ impl TokenDb {
     }
     pub fn days(&self) -> io::Result<Vec<i64>> {
         let _snapshot = self.read_snapshot()?;
-        let enabled = !self.header_shared()?.response_threads.is_empty();
+        let enabled = !self.projection_header_shared()?.response_threads.is_empty();
         self.conn.prepare("SELECT DISTINCT p.day FROM day_counts p JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0) ORDER BY p.day").map_err(error)?.query_map([enabled],|row|row.get(0)).map_err(error)?.map(checked_row).collect()
     }
     pub fn models(&self) -> io::Result<Vec<String>> {
         let _snapshot = self.read_snapshot()?;
-        let enabled = !self.header_shared()?.response_threads.is_empty();
+        let enabled = !self.projection_header_shared()?.response_threads.is_empty();
         self.conn.prepare("SELECT DISTINCT m.value FROM model_counts p JOIN strings m ON m.sid=p.model_sid JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0) ORDER BY m.value").map_err(error)?.query_map([enabled],|row|row.get(0)).map_err(error)?.map(checked_row).collect()
     }
     pub fn latest_per_thread(
@@ -746,7 +778,7 @@ impl TokenDb {
         include_excluded: bool,
     ) -> io::Result<BTreeMap<String, TokenEvent>> {
         let _snapshot = self.read_snapshot()?;
-        let header = self.header_shared()?;
+        let header = self.projection_header_shared()?;
         let policy = header.event_policy();
         let enabled = !header.response_threads.is_empty();
         let sql = format!(
@@ -772,7 +804,7 @@ impl TokenDb {
         include_excluded: bool,
     ) -> io::Result<BTreeMap<String, TokenEvent>> {
         let _snapshot = self.read_snapshot()?;
-        let header = self.header_shared()?;
+        let header = self.projection_header_shared()?;
         let policy = header.event_policy();
         let enabled = !header.response_threads.is_empty();
         let sql = format!(
@@ -1316,7 +1348,7 @@ impl TokenDb {
         excluded_only: bool,
     ) -> io::Result<Vec<TokenEvent>> {
         let _snapshot = self.read_snapshot()?;
-        let header = self.header_shared()?;
+        let header = self.projection_header_shared()?;
         let policy = header.event_policy();
         // Force the existing thread/time index: an excluded/time index could
         // otherwise scan a whole busy day just to find one selected task.
@@ -1371,7 +1403,7 @@ impl TokenDb {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let header = self.header_shared()?;
+        let header = self.projection_header_shared()?;
         let policy = header.event_policy();
         let enabled = !header.response_threads.is_empty();
         let mut filter = String::from(
@@ -1413,7 +1445,7 @@ impl TokenDb {
         excluded_only: bool,
     ) -> io::Result<usize> {
         let _snapshot = self.read_snapshot()?;
-        let enabled = !self.header_shared()?.response_threads.is_empty();
+        let enabled = !self.projection_header_shared()?.response_threads.is_empty();
         let whole_days = from.is_none_or(|value| hk_day(value) == value)
             && to.is_none_or(|value| hk_day(value) == value);
         let (table, time_column, aggregate) = if from.is_none() && to.is_none() {
@@ -1476,7 +1508,7 @@ impl TokenDb {
     }
     pub fn earliest_included_timestamp(&self) -> io::Result<Option<i64>> {
         let _snapshot = self.read_snapshot()?;
-        let enabled = !self.header_shared()?.response_threads.is_empty();
+        let enabled = !self.projection_header_shared()?.response_threads.is_empty();
         self.conn.query_row("SELECT MIN(p.first_ts) FROM event_partitions p JOIN threads t ON t.thread_key=p.thread_key LEFT JOIN thread_policy q ON q.thread_id=t.thread_id WHERE p.excluded=0 AND (?=0 OR p.anonymous_legacy=0 OR COALESCE(q.anonymous,0)=0)",[enabled],|row|row.get(0)).map_err(error)
     }
     fn verify_legacy_stamp(&self, legacy: &Path) -> io::Result<()> {
@@ -1507,6 +1539,32 @@ impl TokenDb {
             ));
         }
         Ok(())
+    }
+    /// Runtime SQLite entry point. Never inspects or imports legacy JSON files.
+    pub fn open_current(path: &Path, allow_write: bool) -> io::Result<Option<Self>> {
+        if !path.exists() && !allow_write {
+            return Ok(None);
+        }
+        let mut db = Self::open(path, allow_write)?;
+        if !db.is_active()? {
+            if !allow_write {
+                return Err(error("Token database is not active"));
+            }
+            let nonempty: bool = db.conn.query_row("SELECT EXISTS(SELECT 1 FROM state UNION ALL SELECT 1 FROM events UNION ALL SELECT 1 FROM global_parts)", [], |row| row.get(0)).map_err(error)?;
+            if nonempty {
+                return Err(error(
+                    "Token database is not active; existing data preserved",
+                ));
+            }
+            db.commit(
+                &DirtyExport {
+                    header: TokenStore::default().header_checked()?,
+                    threads: Vec::new(),
+                },
+                0,
+            )?;
+        }
+        Ok(Some(db))
     }
     /// Open an already verified SQLite cache, migrate an explicit legacy JSON,
     /// or create an empty authorized cache. Read-only mode never migrates/creates.
@@ -1866,6 +1924,28 @@ mod tests {
             threads: grouped.into_values().collect(),
         }
     }
+    #[test]
+    fn bounded_usage_query_does_not_decode_quota_history_or_import_cursors() {
+        let dir = TempDir::new().unwrap();
+        let mut db = TokenDb::open(&dir.path().join("tokens.sqlite3"), true).unwrap();
+        db.commit(&export(vec![event("kept", "thread", 10, false)], 1), 0)
+            .unwrap();
+        db.conn
+            .execute("INSERT INTO quota_chunks VALUES(0,1,0,1,x'00',x'00')", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO source_cursors VALUES('unused',x'00',x'00')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.query_events(None, None, false).unwrap().len(), 1);
+        assert!(
+            db.header().is_err(),
+            "Full importer header still validates corrupt metadata"
+        );
+    }
+
     #[test]
     fn cancelled_empty_cache_initialization_is_safe_to_restart() {
         let dir = TempDir::new().unwrap();

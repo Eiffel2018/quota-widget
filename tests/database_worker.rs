@@ -98,6 +98,7 @@ fn database_worker_migration_restart_append_and_paging_reconcile() {
     let mut full = TokenStore::default();
     full.import_dir(&root, &pricing).unwrap();
     full.save(&path).unwrap();
+    drop(TokenDb::open_or_migrate(&path, true, &mut |_| {}).unwrap());
     let original = fs::read(&path).unwrap();
     let mut worker = Worker::spawn_database_with_progress(true);
     load(&worker, &path, &pricing);
@@ -181,6 +182,7 @@ fn database_worker_prices_known_partial_subtotal_and_reprice_persist() {
     let mut full = TokenStore::default();
     full.import_dir(&root, &pricing).unwrap();
     full.save(&path).unwrap();
+    drop(TokenDb::open_or_migrate(&path, true, &mut |_| {}).unwrap());
     let mut worker = Worker::spawn_database_with_progress(true);
     load(&worker, &path, &pricing);
     let before = view(&worker, t, 0);
@@ -221,6 +223,7 @@ fn database_worker_read_error_preserves_every_original() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("tokens.json");
     fs::write(&path, b"broken legacy").unwrap();
+    fs::write(path.with_extension("sqlite3"), b"broken sqlite").unwrap();
     let mut worker = Worker::spawn_database_with_progress(true);
     worker
         .send(Command::Load {
@@ -235,7 +238,10 @@ fn database_worker_read_error_preserves_every_original() {
     ));
     worker.shutdown().unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"broken legacy");
-    assert!(!path.with_extension("sqlite3").exists());
+    assert_eq!(
+        fs::read(path.with_extension("sqlite3")).unwrap(),
+        b"broken sqlite"
+    );
 }
 
 #[test]
@@ -250,6 +256,7 @@ fn database_worker_group_caches_and_advance_time_reconcile_after_append() {
     let mut full = TokenStore::default();
     full.import_dir(&root, &pricing).unwrap();
     full.save(&path).unwrap();
+    drop(TokenDb::open_or_migrate(&path, true, &mut |_| {}).unwrap());
     let mut worker = Worker::spawn_database_with_progress(true);
     load(&worker, &path, &pricing);
     let request = |group, now| ViewRequest {
@@ -338,4 +345,17 @@ fn database_worker_group_caches_and_advance_time_reconcile_after_append() {
         assert!((d.main_cost.known_usd - d.daily.summary.priced_cost_usd).abs() < 1e-9);
     }
     worker.shutdown().unwrap();
+}
+
+#[test]
+fn runtime_ignores_legacy_json_without_migrating_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tokens.json");
+    fs::write(&path, b"obsolete malformed JSON").unwrap();
+    fs::write(temp.path().join("history.json"), b"obsolete history").unwrap();
+    let mut worker = Worker::spawn_database_with_progress(true);
+    let snapshot = load(&worker, &path, &Pricing::default());
+    assert_eq!(snapshot.database.as_ref().unwrap().total_included, 0);
+    worker.shutdown().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"obsolete malformed JSON");
 }
