@@ -27,3 +27,6 @@ pub mod display_cache;
 pub mod grouped_day_cache;
 
 pub mod quota_index;
+
+pub mod consumption;
+pub mod i18n;

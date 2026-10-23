@@ -12,6 +12,7 @@ use std::{
 #[serde(default)]
 pub struct Settings {
     pub dark: bool,
+    pub language: crate::i18n::Language,
     pub on_top: bool,
     pub codex_path: String,
     pub position: Option<[f32; 2]>,
@@ -38,6 +39,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             dark: true,
+            language: crate::i18n::Language::Traditional,
             on_top: true,
             codex_path: String::new(),
             position: None,

@@ -20,7 +20,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
+// Notifications trigger an earlier read; polling covers changes made in other clients.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const LOOP_INTERVAL: Duration = Duration::from_millis(40);
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);

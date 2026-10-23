@@ -1,0 +1,353 @@
+未知	Unknown	未知
+進行中	In progress	进行中
+0 筆 Token 記錄	0 token records	0 笔 Token 记录
+尚未觀察到下一次下降	No next drop observed yet	尚未观察到下一次下降
+正在載入已儲存紀錄	Loading saved records	正在载入已储存记录
+正在轉換舊資料	Migrating legacy data	正在转换旧资料
+正在列出來源檔案	Listing source files	正在列出来源文件
+正在掃描 Token	Scanning tokens	正在扫描 Token
+正在整理用量	Processing usage	正在整理用量
+正在讀取 Task 名稱	Loading conversation names	正在读取 Task 名称
+正在建立顯示資料	Preparing display	正在建立显示资料
+正在計算扣額區間	Calculating quota intervals	正在计算扣额区间
+正在儲存本機紀錄	Saving local records	正在储存本机记录
+本機資料處理完成	Local processing complete	本机资料处理完成
+首次載入／驗證舊資料（原檔保留）	Loading / verifying existing data (originals retained)	首次载入／验证旧资料（原档保留）
+未知（價格未設定）	Unknown (price not configured)	未知（价格未设定）
+狀態：部分	Status: partial	状态：部分
+開始時間未知	Start time unknown	开始时间未知
+結束時間未知	End time unknown	结束时间未知
+設定檔無法讀取；已停用寫入，原檔保留。	Cannot read settings; writes disabled, originals retained.	设定档无法读取；已停用写入，原档保留。
+額度連線有問題 · 點此檢查	Quota connection issue · click to inspect	额度连线有问题 · 点此检查
+正在連接額度來源…	Connecting to quota source…	正在连接额度来源…
+CONNECTED · 等待額度	CONNECTED · waiting for quota	CONNECTED · 等待额度
+已連線 · 等待額度資料…	Connected · waiting for quota data…	已连线 · 等待额度资料…
+額度未連線 · 點此設定	Quota disconnected · click to configure	额度未连线 · 点此设定
+尚未取得額度 · 點此檢查	No quota data yet · click to inspect	尚未取得额度 · 点此检查
+本機歷史背景處理已中斷；請重新啟動程式。畫面保留已載入資料。	Local history worker stopped; restart the app. Loaded data remains visible.	本机历史背景处理已中断；请重新启动程序。画面保留已载入资料。
+帳戶已變更	Account changed	帐户已变更
+正在載入已儲存的本機紀錄…	Loading saved local records…	正在载入已储存的本机记录…
+正在掃描所選本機 Token 來源…	Scanning selected local token source…	正在扫描所选本机 Token 来源…
+等待本機 Token 掃描。	Waiting for local token scan.	等待本机 Token 扫描。
+背景處理中斷 · 點此檢查	Background worker stopped · click to inspect	背景处理中断 · 点此检查
+正在載入本機紀錄…	Loading local records…	正在载入本机记录…
+本機匯入有錯誤 · 點此檢查	Local import error · click to inspect	本机导入有错误 · 点此检查
+本機匯入有警告 · 點此檢查	Local import warning · click to inspect	本机导入有警告 · 点此检查
+正在掃描本機 Token…	Scanning local tokens…	正在扫描本机 Token…
+本機匯入已停用 · 點此設定	Local import disabled · click to configure	本机导入已停用 · 点此设定
+只有排除用量 · 點此檢查	Only excluded usage · click to inspect	只有排除用量 · 点此检查
+尚未匯入用量 · 點此設定	No usage imported · click to configure	尚未导入用量 · 点此设定
+近期範圍無用量 · 點此檢查	No recent usage · click to inspect	近期范围无用量 · 点此检查
+匯入診斷／來源	Import diagnostics / source	导入诊断／来源
+清除已讀警告	Dismiss warnings	清除已读警告
+額度已重設至 100%；提示音播放失敗。	Quota reset to 100%; alert sound failed.	额度已重置至 100%；提示音播放失败。
+資料格式不支援	Unsupported data format	资料格式不支援
+CLI 回傳的額度格式不支援；請在設定檢查來源。	Unsupported CLI quota format; check the source in settings.	CLI 回传的额度格式不支援；请在设定检查来源。
+背景匯出中斷；請重新匯出。	Background export stopped; please retry.	背景导出中断；请重新导出。
+已重新取得寫入權，正在更新本機用量。	Write access restored; updating local usage.	已重新取得写入权，正在更新本机用量。
+所選來源未找到 JSONL 檔案；請檢查來源路徑及檔案存取狀態。	No JSONL files found; check the source path and access permissions.	所选来源未找到 JSONL 文件；请检查来源路径及文件存取状态。
+（假設）	(assumed)	（假设）
+（單次長上下文）	(single long context)	（单次长上下文）
+名稱未記錄	Name not recorded	名称未记录
+舊版／未知	Legacy / unknown	旧版／未知
+已記錄 Turn 累計快照	Recorded turn snapshot	已记录 Turn 累计快照
+可用 Response 合計	Available response total	可用 Response 合计
+（資料不完整）	(incomplete data)	（资料不完整）
+距本次重設	Since reset	距本次重置
+距上次扣額	Since last drop	距上次扣额
+最近 5 次扣額	Last 5 quota drops	最近 5 次扣额
+設定 / 連接	Settings / connection	设定 / 连接
+更新額度	Refresh quota	更新额度
+深色外觀	Dark appearance	深色外观
+保持最上層	Always on top	保持最上层
+關閉小工具	Close widget	关闭小工具
+Codex 額度 v3.34	Codex Quota v3.34	Codex 额度 v3.34
+扣額紀錄	Quota history	扣额记录
+Token明細	Token details	Token明细
+— 等待量測	— Awaiting samples	— 等待量测
+不限	Unlimited	不限
+等待量測	Awaiting samples	等待量测
+未設定	Not set	未设定
+下次 reset 預測：	Next reset prediction:	下次 reset 预测：
+自行設定預測時間（UTC+08）；按此修改或清除	Set your predicted time (UTC+08); click to edit or clear	自行设定预测时间（UTC+08）；按此修改或清除
+展開 / 收起對話列表	Expand / collapse conversations	展开 / 收起对话列表
+展開 / 收起最近扣額	Expand / collapse recent drops	展开 / 收起最近扣额
+更新中	Updating	更新中
+對話	Conversation	对话
+時間+8	Time +8	时间+8
+用度	Usage	用量
+本%累計	Current % total	本%累计
+上層：未知	Parent: unknown	上层：未知
+◀ 前一天	◀ Previous day	◀ 前一天
+後一天 ▶	Next day ▶	後一天 ▶
+今天	Today	今天
+所選日期晚於今天；可按「今天」查看當日紀錄。	Selected date is in the future; click Today for current records.	所选日期晚於今天；可按「今天」查看当日记录。
+Quota Widget · 扣額紀錄	Quota Widget · Quota history	Quota Widget · 扣额记录
+Quota Widget · Token 明細	Quota Widget · Token details	Quota Widget · Token 明细
+Quota Widget · 設定 / 連接	Quota Widget · Settings / connection	Quota Widget · 设定 / 连接
+時間 UTC+08:00 · Token 成本估算 USD	Time UTC+08:00 · Estimated token cost in USD	时间 UTC+08:00 · Token 成本估算 USD
+來源 / 額度視窗	Source / quota window	来源 / 额度窗口
+舊版	Legacy	旧版
+目前小工具選擇	Current widget selection	目前小工具选择
+每%用度表	Usage per %	每%用量表
+全部額度觀察	All quota observations	全部额度观察
+忽略相同百分比	Hide unchanged percentages	忽略相同百分比
+重新整理	Refresh	重新整理
+匯出當日 CSV	Export daily CSV	导出当日 CSV
+匯出當日 JSON	Export daily JSON	导出当日 JSON
+無法讀取此區間的 Token 資料；請重新開啟扣額記錄重試。	Cannot read interval tokens; reopen quota history to retry.	无法读取此区间的 Token 资料；请重新开启扣额记录重试。
+額度重設	Quota reset	额度重置
+額度重設；此行只標示新週期開始，不計 Token 費用。	Quota reset; this row marks a new cycle and has no token cost.	额度重置；此行只标示新周期开始，不计 Token 费用。
+額度紀錄：0	Quota records: 0	额度记录：0
+模型分項	Model breakdown	模型分项
+扣額區間 · 模型分項	Quota interval · Model breakdown	扣额区间 · 模型分项
+模型家族	Model family	模型家族
+筆數	Count	笔数
+正在計算今日分段	Calculating today's intervals	正在计算今日分段
+已完成區間：0	Completed intervals: 0	已完成区间：0
+額度變化	Quota change	额度变化
+變化時間（UTC+08）	Change time (UTC+08)	变化时间（UTC+08）
+Luna（所有版本合併）	Luna (all versions)	Luna（所有版本合并）
+Sol（所有版本合併）	Sol (all versions)	Sol（所有版本合并）
+Astra（所有版本合併）	Astra (all versions)	Astra（所有版本合并）
+所有模型總計	All models total	所有模型总计
+Token 明細 · UTC+08:00	Token details · UTC+08:00	Token 明细 · UTC+08:00
+重新掃描	Rescan	重新扫描
+編輯價格	Edit pricing	编辑价格
+Response／舊版事件	Response / legacy event	Response／旧版事件
+Turn（當日）	Turn (daily)	Turn（当日）
+Task／Thread（當日）	Conversation / thread (daily)	Task／Thread（当日）
+查看排除紀錄（codex-auto-review）	Show excluded records (codex-auto-review)	查看排除记录（codex-auto-review）
+上一頁	Previous page	上一页
+下一頁	Next page	下一页
+所選明細尚未載入；請查看上方診斷。	Details not loaded; see diagnostics above.	所选明细尚未载入；请查看上方诊断。
+重試載入	Retry	重试载入
+狀態：已排除	Status: excluded	状态：已排除
+模型	Model	模型
+推理強度	Reasoning effort	推理强度
+輸入	Input	输入
+快取	Cached	缓存
+未快取	Uncached	未缓存
+輸出	Output	输出
+推理	Reasoning	推理
+估算 USD	Estimated USD	估算 USD
+未知 Turn	Unknown turn	未知 Turn
+當日事件合計	Daily event total	当日事件合计
+狀態：完整	Status: complete	状态：完整
+Token 紀錄：0	Token records: 0	Token 记录：0
+自訂價格	Custom pricing	自订价格
+介面字體大小	Interface font size	界面字体大小
+Aa 中文預覽	Aa Font preview	Aa 中文预览
+自訂重設提醒（UTC+08）	Custom reset reminder (UTC+08)	自订重置提醒（UTC+08）
+輸入 YYYY-MM-DD HH:MM；留空停用。時間由你設定。超時後以紅色 >時:分:秒 顯示超出時間。	Enter YYYY-MM-DD HH:MM; leave blank to disable. Set the time manually. Overdue time appears in red as >H:MM:SS.	输入 YYYY-MM-DD HH:MM；留空停用。时间由你设定。超时後以红色 >时:分:秒 显示超出时间。
+日期或時間格式不正確	Invalid date or time	日期或时间格式不正确
+清除提醒	Clear reminder	清除提醒
+真正重設至 100% 時播放提示音	Play a sound when quota actually resets to 100%	真正重置至 100% 时播放提示音
+試播提示音	Test sound	试播提示音
+提示音播放失敗，請檢查系統音效設定。	Sound playback failed; check system sound settings.	提示音播放失败，请检查系统音效设定。
+官方 Codex CLI（唯讀）	Official Codex CLI (read only)	官方 Codex CLI（唯读）
+重新連線	Reconnect	重新连线
+停止連線	Disconnect	停止连线
+額度來源 / 視窗	Quota source / window	额度来源 / 窗口
+等待來源	Waiting for source	等待来源
+本機 Token 歷史	Local token history	本机 Token 历史
+啟用唯讀增量匯入	Enable incremental import (read only)	启用唯读增量导入
+掃描所有可用歷史	Scan all available history	扫描所有可用历史
+預設日期範圍	Default date range	默认日期范围
+ 天	 days	 天
+估算單價 · USD / 1M tokens	Estimated pricing · USD / 1M tokens	估算单价 · USD / 1M tokens
+Standard（重設全部）	Standard (reset all)	Standard（重置全部）
+Fast（重設全部）	Fast (reset all)	Fast（重置全部）
+未提供	Not provided	未提供
+官方價格與服務等級	Official pricing and service tiers	官方价格与服务等级
+長上下文 >272K：輸入／快取 ×2 · 輸出 ×1.5	Long context >272K: input / cached ×2 · output ×1.5	长上下文 >272K：输入／缓存 ×2 · 输出 ×1.5
+模型單價	Model pricing	模型单价
+未快取輸入	Uncached input	未缓存输入
+快取輸入	Cached input	缓存输入
+已確認此模型價格	Pricing confirmed for this model	已确认此模型价格
+輸出（已含推理）	Output (includes reasoning)	输出（已含推理）
+套用模型價格	Apply model pricing	套用模型价格
+模型覆寫	Model overrides	模型覆写
+儲存設定	Save settings	储存设定
+示範／暫存模式不寫入檔案。請在一般模式匯出。	Demo / temporary mode does not write files. Export in normal mode.	示范／暂存模式不写入文件。请在一般模式导出。
+正在匯出，請稍候。	Exporting, please wait.	正在导出，请稍候。
+正在背景匯出…	Exporting in background…	正在背景导出…
+所選日期無效	Invalid selected date	所选日期无效
+匯出失敗；請檢查資料夾權限。	Export failed; check folder permissions.	导出失败；请检查文件夹权限。
+DEMO：不讀取任何真實歷史	DEMO: no real history is read	DEMO：不读取任何真实历史
+正在關閉…	Closing…	正在关闭…
+語言 / Language	Language	语言 / Language
+無	None	无
+低	Low	低
+中	Medium	中
+高	High	高
+已更新	Updated	已更新
+資料過期	Stale data	资料过期
+不可用	Unavailable	不可用
+等待重設資料	Waiting for reset data	等待重置资料
+歷史平均	Historical average	历史平均
+重設 {reset}	Reset {reset}	重置 {reset}
+消耗 {short_rate}	Usage {short_rate}	消耗 {short_rate}
+點數 {short_credit}	Credits {short_credit}	点数 {short_credit}
+{r:.2} 百分點 / 小時	{r:.2} percentage points / hour	{r:.2} 百分点 / 小时
+{r:.2}%/時	{r:.2}%/h	{r:.2}%/时
+{r:.2}%/時（歷史）	{r:.2}%/h (history)	{r:.2}%/时（历史）
+狀態：{}	Status: {}	状态：{}
+匯入警告：{}	Import warnings: {}	导入警告：{}
+用量來源：{}	Usage source: {}	用量来源：{}
+儲存目錄：{}	Storage directory: {}	储存目录：{}
+用量：{} · 排除：{} · 額度：{}	Usage: {} · excluded: {} · quota: {}	用量：{} · 排除：{} · 额度：{}
+{} 秒	{} seconds	{} 秒
+{} · {} 秒	{} · {} seconds	{} · {} 秒
+{label} · {seconds} 秒	{label} · {seconds} seconds	{label} · {seconds} 秒
+{} · {}/{} 檔 · {} 秒	{} · {}/{} files · {} seconds	{} · {}/{} 档 · {} 秒
+{} 耗時 {:.1} 秒	{} took {:.1} seconds	{} 耗时 {:.1} 秒
+最近 {} 次扣額	Last {} quota drops	最近 {} 次扣额
+{} {} 分鐘	{} {} minutes	{} {} 分钟
+自啟動 {} 分鐘	{} minutes since startup	自启动 {} 分钟
+本%累計 {}{}	Current % total {}{}	本%累计 {}{}
+紀錄：{} 筆	Records: {}	记录：{} 笔
+所列區間加權平均：{}{} / 百分點	Weighted interval average: {}{} / percentage point	所列区间加权平均：{}{} / 百分点
+樣本：{} 個區間 · {} 百分點{}	Sample: {} intervals · {} percentage points{}	样本：{} 个区间 · {} 百分点{}
+ · Token 覆蓋不完整，僅供下限估算	 · Incomplete token coverage; lower bound only	 · Token 覆盖不完整，仅供下限估算
+下次下降約 {}（估算，{}）	Next drop around {} (estimate, {})	下次下降约 {}（估算，{}）
+{} 筆 Response\n$0.0000	{} responses\n$0.0000	{} 笔 Response\n$0.0000
+{} 筆 Response\n{}	{} responses\n{}	{} 笔 Response\n{}
+{}\n點擊查看詳情	{}\nClick for details	{}\n点击查看详情
+事件：{} · 價格未知：{}	Events: {} · unknown pricing: {}	事件：{} · 价格未知：{}
+目前篩選：0 · 已載入：{} · 當日：{}	Filtered: 0 · loaded: {} · daily: {}	目前筛选：0 · 已载入：{} · 当日：{}
+價格基準：{}	Pricing basis: {}	价格基准：{}
+排除：{} 筆	Excluded: {}	排除：{} 笔
+第 {} 頁 · 正在載入…	Page {} · loading…	第 {} 页 · 正在载入…
+第 {} / {} 頁 · {} 組 · 每頁最多 500 列	Page {} / {} · {} groups · up to 500 rows per page	第 {} / {} 页 · {} 组 · 每页最多 500 列
+正在載入 {} 的明細…	Loading details for {}…	正在载入 {} 的明细…
+目前：{} · 核對 {}	Current: {} · verified {}	目前：{} · 核对 {}
+{model}（未設定價格）	{model} (pricing not configured)	{model}（未设定价格）
+價格已套用：{}	Pricing applied: {}	价格已套用：{}
+背景匯入失敗：{error}	Background import failed: {error}	背景导入失败：{error}
+本機匯入已停用。{}	Local import disabled. {}	本机导入已停用。{}
+額度來源狀態：{}	Quota source status: {}	额度来源状态：{}
+資料目錄被另一個視窗使用；目前只讀。{e}	Another window owns this data directory; read only. {e}	资料目录被另一个窗口使用；目前只读。{e}
+已載入 {} 筆用量、{} 筆額度觀察。	Loaded {} usage records and {} quota observations.	已载入 {} 笔用量、{} 笔额度观察。
+儲存檔無法讀取；已停用寫入並保留原檔。{error}	Cannot read saved data; writes disabled and originals retained. {error}	储存档无法读取；已停用写入并保留原档。{error}
+儲存失敗，畫面仍保留資料：{error}	Save failed; displayed data retained: {error}	储存失败，画面仍保留资料：{error}
+匯入曾失敗：{error}	Previous import failed: {error}	导入曾失败：{error}
+已匯出：{}	Exported: {}	已导出：{}
+匯出失敗；未產生不完整檔案：{error}	Export failed; no incomplete file created: {error}	导出失败；未产生不完整文件：{error}
+無法啟動背景匯出：{error}	Cannot start background export: {error}	无法启动背景导出：{error}
+{}% → {}% · 額度補回 / 新週期	{}% → {}% · Quota replenished / new cycle	{}% → {}% · 额度补回 / 新周期
+{}% → {}% · 扣除 {} 百分點 · {}	{}% → {}% · {} percentage points used · {}	{}% → {}% · 扣除 {} 百分点 · {}
+{}% → {}% · 狀態：差異	{}% → {}% · Status: discrepancy	{}% → {}% · 状态：差异
+{} → {} · 實際下降 {} 百分點	{} → {} · Actual drop: {} percentage points	{} → {} · 实际下降 {} 百分点
+{} · {} · 週期 {}{}	{} · {} · Cycle {}{}	{} · {} · 周期 {}{}
+ · 不作累計分界	 · Not an accounting boundary	 · 不作累计分界
+區間 Token 小計 {}	Interval token subtotal {}	区间 Token 小计 {}
+{} · 統一扣額估算 {} · 區間 Token 小計 {}	{} · Quota estimate {} · Interval token subtotal {}	{} · 统一扣额估算 {} · 区间 Token 小计 {}
+統一扣額估算 {} · {} · {}	Quota estimate {} · {} · {}	统一扣额估算 {} · {} · {}
+模型：{}{}	Model: {}{}	模型：{}{}
+上層: {parent_id}	Parent: {parent_id}	上层: {parent_id}
+上層（部分）: {}	Parent (partial): {}	上层（部分）: {}
+上層（循環）: {parent_id}	Parent (cycle): {parent_id}	上层（循环）: {parent_id}
+[{}] 子代理 {}	[{}] Subagents {}	[{}] 子代理 {}
+{}\n時段：{} → {}	{}\nInterval: {} → {}	{}\n时段：{} → {}
+{}\n來源：{} · 觀察工作階段：{}	{}\nSource: {} · Observation session: {}	{}\n来源：{} · 观察工作阶段：{}
+{}\n來源：{}\n用量：{} · 排除：{}\n{}	{}\nSource: {}\nUsage: {} · excluded: {}\n{}	{}\n来源：{}\n用量：{} · 排除：{}\n{}
+{short_rate}（歷史）	{short_rate} (history)	{short_rate}（历史）
+今日目前仍在此額度；以午夜或上一個首次下降時間作為起點，統計至現在。下一個百分比變化尚未發生，因此時間未知。	Still at this quota today; counting from midnight or the last first-drop boundary until now. The next drop has not happened, so its time is unknown.	今日目前仍在此额度；以午夜或上一个首次下降时间作为起点，统计至现在。下一个百分比变化尚未发生，因此时间未知。
+正在轉換舊資料：task {}/{}（原檔保留）	Migrating legacy data: conversation {}/{} (originals retained)	正在转换旧资料：task {}/{}（原档保留）
+{label}\nResponse：{turn_count} 筆\n0 筆 · $0.0000	{label}\nResponses: {turn_count}\n0 records · $0.0000	{label}\nResponse：{turn_count} 笔\n0 笔 · $0.0000
+{label}\nResponse：{turn_count} 筆\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}	{label}\nResponses: {turn_count}\nToken records: {}\nEstimate: {}\nInput: {}\nCached: {}\nOutput: {}{}	{label}\nResponse：{turn_count} 笔\nToken 记录：{} 笔\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}
+\n價格未設定：{} 筆	\nPricing not configured: {} records	\n价格未设定：{} 笔
+小計 {} * · 部分	Subtotal {} * · partial	小计 {} * · 部分
+{} · {}/百分點	{} · {}/percentage point	{} · {}/百分点
+{} · {} 秒 · 檔案 {}/{} · 行 {} · 觀察 {} · 用量 {}	{} · {} seconds · files {}/{} · lines {} · observations {} · usage {}	{} · {} 秒 · 文件 {}/{} · 行 {} · 观察 {} · 用量 {}
+曾略過 {} 行格式不支援或無效的用量記錄。	Skipped {} unsupported or invalid usage lines.	曾略过 {} 行格式不支援或无效的用量记录。
+已掃描 {} 檔（未變更 {}），讀取 {} 行，本輪新增 {} 筆；格式問題 {}，未完成行 {}。目前載入 {} 筆用量。	Scanned {} files ({} unchanged), read {} lines, added {} records; {} format issues, {} incomplete lines. {} usage records loaded.	已扫描 {} 档（未变更 {}），读取 {} 行，本轮新增 {} 笔；格式问题 {}，未完成行 {}。目前载入 {} 笔用量。
+最近 5 次扣額 · UTC+8\n	Last 5 quota drops · UTC+8\n	最近 5 次扣额 · UTC+8\n
+已完成區間：0\n	Completed intervals: 0\n	已完成区间：0\n
+\n{} · {}\n估算 USD {} · 每% {} · {}\n區間 Token 小計 {}\n	\n{} · {}\nEstimated USD {} · per % {} · {}\nInterval token subtotal {}\n	\n{} · {}\n估算 USD {} · 每% {} · {}\n区间 Token 小计 {}\n
+ / 百分點	 / percentage point	 / 百分点
+\n覆蓋：部分（額度缺口）	\nCoverage: partial (quota gap)	\n覆盖：部分（额度缺口）
+\n狀態：更新中	\nStatus: updating	\n状态：更新中
+{model}\n狀態：排除\n單價：未知	{model}\nStatus: excluded\nUnit price: unknown	{model}\n状态：排除\n单价：未知
+{model}\n{}；USD / 1M：輸入{}／快取{}／輸出{}{}	{model}\n{}; USD / 1M: input {} / cached {} / output {}{}	{model}\n{}；USD / 1M：输入{}／缓存{}／输出{}{}
+{model}\n單價：未知	{model}\nUnit price: unknown	{model}\n单价：未知
+\n{}\nReasoning effort: {}\n香港時間: {}	\n{}\nReasoning effort: {}\nTime UTC+08: {}	\n{}\nReasoning effort: {}\n香港时间: {}
+\n最新 Response: {}\nInput: {}\nCached: {}\nUncached: {}\nOutput: {}\nReasoning: {}	\nLatest response: {}\nInput: {}\nCached: {}\nUncached: {}\nOutput: {}\nReasoning: {}	\n最新 Response: {}\nInput: {}\nCached: {}\nUncached: {}\nOutput: {}\nReasoning: {}
+\nTurn Input: 未知\nTurn Output: 未知	\nTurn input: unknown\nTurn output: unknown	\nTurn Input: 未知\nTurn Output: 未知
+\n狀態：部分	\nStatus: partial	\n状态：部分
+重設：{reset}\n估計消耗：{rate}\n點數：{credit_text}{}	Reset: {reset}\nEstimated usage: {rate}\nCredits: {credit_text}{}	重置：{reset}\n估计消耗：{rate}\n点数：{credit_text}{}
+\n自訂提醒：{} UTC+08	\nCustom reminder: {} UTC+08	\n自订提醒：{} UTC+08
+用度：最新 Response\n本%累計：自身估算 USD\n*：部分	Usage: latest response\nCurrent % total: own estimated USD\n*: partial	用量：最新 Response\n本%累计：自身估算 USD\n*：部分
+{}\nTask ID: {}\n狀態：無近期用量\nInput: 未知\nCached: 未知\nUncached: 未知\nOutput: 未知\nReasoning: 未知\nTurn Input: 未知\nTurn Output: 未知	{}\nTask ID: {}\nStatus: no recent usage\nInput: unknown\nCached: unknown\nUncached: unknown\nOutput: unknown\nReasoning: unknown\nTurn input: unknown\nTurn output: unknown	{}\nTask ID: {}\n状态：无近期用量\nInput: 未知\nCached: 未知\nUncached: 未知\nOutput: 未知\nReasoning: 未知\nTurn Input: 未知\nTurn Output: 未知
+顯示子代理：{descendant_count}\n直接分支：{direct_child_count}\n範圍：近2h／本%\n本%累計：{}{}	Subagents shown: {descendant_count}\nDirect children: {direct_child_count}\nScope: recent 2h / current %\nCurrent % total: {}{}	显示子代理：{descendant_count}\n直接分支：{direct_child_count}\n范围：近2h／本%\n本%累计：{}{}
+{} 筆 · 已記錄輸入 {}（快取 {}／未快取 {}）· 輸出 {}（推理 {}）· 已可估部分 {}{}	{} records · input {} (cached {} / uncached {}) · output {} (reasoning {}) · known cost {}{}	{} 笔 · 已记录输入 {}（缓存 {}／未缓存 {}）· 输出 {}（推理 {}）· 已可估部分 {}{}
+；{} 筆費用未知	; {} records with unknown cost	；{} 笔费用未知
+Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 筆費用未知\n{}	Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} to {}\nModel: {}\nKnown cost {}; {} records with unknown cost\n{}	Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 笔费用未知\n{}
+額度下降	Quota drop	额度下降
+點數下降	Credit decrease	点数下降
+額度回補	Quota replenished	额度回补
+點數增加	Credit increase	点数增加
+點數	Credits	点数
+1 週	1 week	1 周
+{} 天	{} days	{} 天
+{} 小時	{} hours	{} 小时
+{minutes} 分鐘	{minutes} minutes	{minutes} 分钟
+主要	Primary	主要
+次要	Secondary	次要
+$未知	$Unknown	$未知
+平均 {}/百分點	Average {}/percentage point	平均 {}/百分点
+{}/百分點	{}/percentage point	{}/百分点
+部分	Partial	部分
+平均	Average	平均
+完整	Complete	完整
+額度視窗：{}\n額度變化：{}\n下降：{} 百分點\n起點：{}\n終點：{}\n歷時：{}\n已知小計：{}\n每百分點：{}\n狀態：{}\n記錄來源：{}\n觀察工作階段：{}	Quota window: {}\nQuota change: {}\nDrop: {} percentage points\nStart: {}\nEnd: {}\nDuration: {}\nKnown subtotal: {}\nPer percentage point: {}\nStatus: {}\nRecord source: {}\nObservation session: {}	额度窗口：{}\n额度变化：{}\n下降：{} 百分点\n起点：{}\n终点：{}\n历时：{}\n已知小计：{}\n每百分点：{}\n状态：{}\n记录来源：{}\n观察工作阶段：{}
+{marker} {}/百分點	{marker} {}/percentage point	{marker} {}/百分点
+本段估算 · 下限	Interval estimate · lower bound	本段估算 · 下限
+本段估算	Interval estimate	本段估算
+未有足夠區間 Token 資料	Insufficient interval token data	未有足够区间 Token 资料
+未有 Token 記錄	No token records	未有 Token 记录
+ · 部分	 · Partial	 · 部分
+\n本段 Token 費用估算：{}\n本段 USD / 百分點：{}\n估算狀態：{}	\nInterval token cost estimate: {}\nInterval USD / percentage point: {}\nEstimate status: {}	\n本段 Token 费用估算：{}\n本段 USD / 百分点：{}\n估算状态：{}
+\n本段有價 Token 成本：${:.4} ÷ {} 百分點\n算法：本段有價 Token 成本 ÷ 本段百分點\n估值期間：{} 至 {}\n估值用途：根據本段記錄估算，並非官方固定美元換算率	\nPriced interval token cost: ${:.4} ÷ {} percentage points\nFormula: priced interval token cost ÷ interval percentage points\nEstimate period: {} to {}\nBased on interval records; not an official fixed dollar conversion rate	\n本段有价 Token 成本：${:.4} ÷ {} 百分点\n算法：本段有价 Token 成本 ÷ 本段百分点\n估值期间：{} 至 {}\n估值用途：根据本段记录估算，并非官方固定美元换算率
+待確認	Pending confirmation	待确认
+未能確認歸屬	Attribution unconfirmed	未能确认归属
+日誌補回 · 未確認	Recovered from log · unconfirmed	日志补回 · 未确认
+日誌記錄的額度下降；帳戶或週期邊界未能確認。時間為日誌觀察時間，未計入扣額或單價校準，原始 Token 記錄保留。	Logged quota drop; account or cycle boundary unconfirmed. Log observation time shown; excluded from quota and price calibration. Original tokens retained.	日志记录的额度下降；帐户或周期边界未能确认。时间为日志观察时间，未计入扣额或单价校准，原始 Token 记录保留。
+{}{} / 百分點	{}{} / percentage point	{}{} / 百分点
+無 Token 記錄	No token records	无 Token 记录
+區間沒有 Token 記錄	No token records in interval	区间没有 Token 记录
+已按相鄰百分比變化重建時間區間，但本機沒有該區間的 Token 記錄，因此無法估算費用。	Interval rebuilt from adjacent percentage changes, but no local token records are available to estimate its cost.	已按相邻百分比变化重建时间区间，但本机没有该区间的 Token 记录，因此无法估算费用。
+歷史 Token 估算 · 額度部分未確認	Historical token estimate · quota partly unconfirmed	历史 Token 估算 · 额度部分未确认
+按相鄰歷史百分比下降時間統計本機 Token 紀錄；額度快照的帳戶／連續性未完全確認，金額只作估算。	Local tokens counted between adjacent historical drops; snapshot account / continuity not fully confirmed. Amounts are estimates.	按相邻历史百分比下降时间统计本机 Token 记录；额度快照的帐户／连续性未完全确认，金额只作估算。
+目前來源或額度視窗不可用。	Current source or quota window unavailable.	目前来源或额度窗口不可用。
+觀測時間異常，等待有效資料。	Invalid observation time; waiting for valid data.	观测时间异常，等待有效资料。
+資料已超過 90 秒未更新，暫停預估。	Data older than 90 seconds; prediction paused.	资料已超过 90 秒未更新，暂停预估。
+已到伺服器提供的重設時間，等待實際更新。	Server reset time reached; waiting for an actual update.	已到伺服器提供的重置时间，等待实际更新。
+尚無有效剩餘額度。	No valid remaining quota yet.	尚无有效剩余额度。
+剩餘額度不足 1 百分點。	Less than 1 percentage point remains.	剩余额度不足 1 百分点。
+需觀測至少 2 次下降；首次下降只建立基準。	At least 2 drops required; the first establishes a baseline.	需观测至少 2 次下降；首次下降只建立基准。
+下降資料無效，等待新的連續觀測。	Invalid drop data; waiting for new continuous observations.	下降资料无效，等待新的连续观测。
+下降時間區間無效。	Invalid drop interval.	下降时间区间无效。
+下降時間必須嚴格遞增。	Drop times must increase strictly.	下降时间必须严格递增。
+預估時間超出可表示範圍。	Predicted time is out of range.	预估时间超出可表示范围。
+依近期實際下降估算下一個百分點；使用節奏變化時會偏離。	Next percentage point estimated from recent drops; changing usage patterns affect accuracy.	依近期实际下降估算下一个百分点；使用节奏变化时会偏离。
+依目前速度，重設時間可能早於下一次 1 百分點下降。	At this rate, reset may occur before the next percentage point drop.	依目前速度，重置时间可能早於下一次 1 百分点下降。
+已超過上次估算時間；可能暫停使用，保留區間並等待新下降。	Previous estimate is overdue; usage may be paused. Keeping the interval until a new drop.	已超过上次估算时间；可能暂停使用，保留区间并等待新下降。
+首次觀察，未涵蓋完整扣額區間	Initial observation does not cover a full quota interval	首次观察，未涵盖完整扣额区间
+缺少已記錄的起點	Recorded start boundary missing	缺少已记录的起点
+同秒額度邊界無法區分	Cannot distinguish boundaries within the same second	同秒额度边界无法区分
+額度觀察 session 已變更	Quota observation session changed	额度观察 session 已变更
+額度週期已變更	Quota cycle changed	额度周期已变更
+區間含不確定額度觀察	Interval contains uncertain quota observations	区间含不确定额度观察
+額度觀察覆蓋不完整	Incomplete quota observation coverage	额度观察覆盖不完整
+前後額度邊界不連續	Quota boundaries are not continuous	前後额度边界不连续
+Token 記錄晚於區間起點	Token coverage starts after the interval	Token 记录晚於区间起点
+區間沒有可歸屬 Token 記錄	No attributable tokens in interval	区间没有可归属 Token 记录
+部分模型費用未知	Some model costs unknown	部分模型费用未知
+部分模型使用假設值	Some model identities assumed	部分模型使用假设值
+部分 Token 記錄不完整	Some token records incomplete	部分 Token 记录不完整
+Token 記錄有覆蓋缺口	Gaps in token coverage	Token 记录有覆盖缺口
+起迄時間無法形成區間	Invalid start / end interval	起迄时间无法形成区间
+回補後首個區間，不與一般扣額區間比較	First interval after replenishment; excluded from normal comparisons	回补後首个区间，不与一般扣额区间比较
+多個帳戶的 Token 歸屬無法確認	Token attribution across accounts unconfirmed	多个帐户的 Token 归属无法确认
