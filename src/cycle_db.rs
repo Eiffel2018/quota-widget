@@ -167,6 +167,25 @@ mod tests {
             3
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        // A rebuilt index identifies real reset files, ignoring a leftover
+        // duplicate file whose timestamp would otherwise split the range.
+        let conn = Connection::open(dir.path().join("tokens.sqlite3")).unwrap();
+        conn.execute_batch("CREATE TABLE quota_cycle_files(cycle_start INTEGER PRIMARY KEY,cycle_file TEXT NOT NULL);").unwrap();
+        for db in [&first, &second] {
+            conn.execute(
+                "INSERT INTO quota_cycle_files VALUES(?,?)",
+                params![db.start, db.path().file_name().unwrap().to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        let mut stale = CycleDb::open(dir.path(), start + 50).unwrap();
+        stale.backfill(&[event("wrong-cycle", start + 60)]).unwrap();
+        assert_eq!(
+            query_archived_events(dir.path(), start, start + 120)
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -209,8 +228,14 @@ pub fn query_archived_events(
     start: i64,
     end: i64,
 ) -> io::Result<Vec<TokenEvent>> {
-    let mut cycles = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
+    let indexed = crate::quota_index::cycle_paths(directory)?;
+    let mut cycles = indexed.clone().unwrap_or_default();
+    let entries = if indexed.is_none() {
+        Some(std::fs::read_dir(directory)?)
+    } else {
+        None
+    };
+    for entry in entries.into_iter().flatten() {
         let path = entry?.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let Some(stamp) = name

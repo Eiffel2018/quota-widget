@@ -417,6 +417,7 @@ impl TokenDb {
                 tx.execute_batch(SCHEMA).map_err(error)?;
                 tx.commit()?;
             }
+            crate::quota_index::initialize(&conn)?;
             // Additive migration for existing databases: quota history now lives
             // beside token observations instead of being mirrored to JSON.
             conn.execute_batch("CREATE TABLE IF NOT EXISTS history_chunks(ordinal INTEGER PRIMARY KEY, digest BLOB NOT NULL, data BLOB NOT NULL);")
@@ -464,6 +465,12 @@ impl TokenDb {
         let header = (*self.header_shared()?).clone();
         cancellation::check()?;
         Ok(header)
+    }
+    pub fn index_quota_cycles(&self, starts: &[i64], history: &[HistoryEvent]) -> io::Result<()> {
+        if !self.writable {
+            return Err(error("Quota index is read-only"));
+        }
+        crate::quota_index::sync_cycles(&self.conn, starts, history)
     }
     pub fn history_events(&self) -> io::Result<Vec<HistoryEvent>> {
         cancellation::check()?;
@@ -1120,11 +1127,22 @@ fn persist_header(
             let data = compress(&body)?;
             stats.compressed_bytes_written += data.len();
             tx.execute("INSERT INTO quota_chunks VALUES(?,?,?,?,?,?) ON CONFLICT(ordinal) DO UPDATE SET row_count=excluded.row_count,first_ts=excluded.first_ts,last_ts=excluded.last_ts,digest=excluded.digest,data=excluded.data",params![ordinal as i64,chunk.len() as i64,chunk.iter().map(|q|q.timestamp).min(),chunk.iter().map(|q|q.timestamp).max(),digest,data]).map_err(error)?;
+            crate::quota_index::sync_chunk(tx, ordinal as i64, &digest, chunk)?;
             stats.quota_chunks_written += 1;
         }
     }
     tx.execute(
         "DELETE FROM quota_chunks WHERE ordinal>=?",
+        [header.quota.len().div_ceil(QUOTA_CHUNK) as i64],
+    )
+    .map_err(error)?;
+    tx.execute(
+        "DELETE FROM quota_observation_index WHERE chunk>=?",
+        [header.quota.len().div_ceil(QUOTA_CHUNK) as i64],
+    )
+    .map_err(error)?;
+    tx.execute(
+        "DELETE FROM quota_index_chunks WHERE ordinal>=?",
         [header.quota.len().div_ceil(QUOTA_CHUNK) as i64],
     )
     .map_err(error)?;
@@ -2963,4 +2981,10 @@ mod tests {
             .is_ok());
         assert!(db.query_events_all(None, None, true).is_err());
     }
+}
+
+pub(crate) fn decode_index_chunk(
+    data: &[u8],
+) -> io::Result<Vec<crate::tokens::ImportedQuotaObservation>> {
+    decode(data)
 }

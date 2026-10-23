@@ -293,6 +293,9 @@ impl State {
             return Ok(());
         }
         let starts = reset_cycle_starts(&self.normalized);
+        if let Some(db) = self.db.as_ref() {
+            db.index_quota_cycles(&starts, &self.normalized)?;
+        }
         let Some(&start) = starts.last() else {
             return Ok(());
         };
