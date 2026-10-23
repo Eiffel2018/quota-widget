@@ -2546,7 +2546,7 @@ impl WidgetApp {
                     );
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(186., 10.), pt(210., 34.)),
+                    Rect::from_min_max(pt(181., 10.), pt(205., 34.)),
                     WidgetIcon::History,
                     None,
                     "扣額紀錄",
@@ -2559,7 +2559,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(214., 10.), pt(238., 34.)),
+                    Rect::from_min_max(pt(209., 10.), pt(233., 34.)),
                     WidgetIcon::Tokens,
                     None,
                     "Token明細",
@@ -2572,7 +2572,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(270., 10.), pt(294., 34.)),
+                    Rect::from_min_max(pt(265., 10.), pt(289., 34.)),
                     WidgetIcon::Close,
                     None,
                     "關閉小工具",
@@ -2624,7 +2624,7 @@ impl WidgetApp {
                     FontId::proportional(unit_font * number_fit),
                     fg,
                 );
-                let bar = Rect::from_min_max(pt(145., 97.), pt(294., 100.));
+                let bar = Rect::from_min_max(pt(145., 97.), pt(289., 100.));
                 painter.rect_filled(bar, 3., line);
                 if let Some(p) = view.as_ref().and_then(|v| v.remaining_percent) {
                     painter.rect_filled(
@@ -2678,7 +2678,7 @@ impl WidgetApp {
                 ];
                 for (index, text) in summary.into_iter().enumerate() {
                     let y = 40. + index as f32 * 17.;
-                    let available = 149. * sx;
+                    let available = 144. * sx;
                     let measured = painter
                         .layout_no_wrap(text.clone(), FontId::proportional(font_size), fg)
                         .size()
@@ -2693,7 +2693,7 @@ impl WidgetApp {
                     );
                 }
                 ui.interact(
-                    Rect::from_min_max(pt(145., 40.), pt(294., 104.)),
+                    Rect::from_min_max(pt(145., 40.), pt(289., 104.)),
                     ui.id().with("quota-details"),
                     Sense::hover(),
                 )
@@ -2740,7 +2740,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(242., 10.), pt(266., 34.)),
+                    Rect::from_min_max(pt(237., 10.), pt(261., 34.)),
                     WidgetIcon::Settings,
                     None,
                     "設定 / 連接",
@@ -2753,7 +2753,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(182., 149.), pt(232., 173.)),
+                    Rect::from_min_max(pt(185., 141.), pt(235., 165.)),
                     WidgetIcon::Tasks,
                     Some(self.tasks_expanded),
                     "展開 / 收起對話列表",
@@ -2767,7 +2767,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(240., 149.), pt(290., 173.)),
+                    Rect::from_min_max(pt(239., 141.), pt(289., 165.)),
                     WidgetIcon::Recent,
                     Some(self.recent_expanded),
                     "展開 / 收起最近扣額",
