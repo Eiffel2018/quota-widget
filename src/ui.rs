@@ -516,20 +516,20 @@ fn interval_task_counts(events: &[&TokenEvent]) -> [usize; 4] {
         .iter()
         .filter(|event| !event.is_excluded_auto_review())
     {
-        // A Codex turn can emit many response/token rows; count it once per
-        // model, using the session only for legacy rows without a turn ID.
-        let turn = (
-            event.session.as_str(),
-            event.turn_id.as_deref().unwrap_or(event.session.as_str()),
-        );
-        total.insert(turn);
+        // Count usage responses, not conversations or user turns. One turn may
+        // produce many billable responses while the agent runs tools.
+        let response = match event.response_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => (true, id),
+            None => (false, event.id.as_str()),
+        };
+        total.insert(response);
         let model = event.model.to_ascii_lowercase();
         if model.ends_with("-sol") {
-            sol.insert(turn);
+            sol.insert(response);
         } else if model.ends_with("-luna") {
-            luna.insert(turn);
+            luna.insert(response);
         } else if model.ends_with("-astra") {
-            astra.insert(turn);
+            astra.insert(response);
         }
     }
     [sol.len(), luna.len(), astra.len(), total.len()]
@@ -671,10 +671,10 @@ fn model_usage_tooltip(
     turn_count: usize,
 ) -> String {
     let Some(model) = model else {
-        return format!("{label}\n使用回合：{turn_count}\n0 筆 · $0.0000");
+        return format!("{label}\nResponse：{turn_count} 筆\n0 筆 · $0.0000");
     };
     format!(
-        "{label}\n使用回合：{turn_count}\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
+        "{label}\nResponse：{turn_count} 筆\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
         model.events,
         interval_model_cost(model),
         model.input,
@@ -3232,10 +3232,15 @@ impl WidgetApp {
                         let family_cell =
                             |family_index: usize, usage: Option<&intervals::ModelIntervalUsage>| {
                                 usage.map_or_else(
-                                    || format!("{}次\n$0.0000", row.task_counts[family_index]),
+                                    || {
+                                        format!(
+                                            "{} 筆 Response\n$0.0000",
+                                            row.task_counts[family_index]
+                                        )
+                                    },
                                     |model| {
                                         format!(
-                                            "{}次\n{}",
+                                            "{} 筆 Response\n{}",
                                             row.task_counts[family_index],
                                             interval_model_cost(model)
                                         )
@@ -3248,7 +3253,11 @@ impl WidgetApp {
                             family_cell(1, family_models[0].as_ref()),
                             family_cell(0, family_models[1].as_ref()),
                             family_cell(2, family_models[2].as_ref()),
-                            format!("{}次\n{}", row.task_counts[3], interval_model_cost(&total)),
+                            format!(
+                                "{} 筆 Response\n{}",
+                                row.task_counts[3],
+                                interval_model_cost(&total)
+                            ),
                         ];
                         let hints = [
                             view.tooltip.clone(),
@@ -4674,7 +4683,7 @@ mod widget_revision_tests {
     }
 
     #[test]
-    fn interval_counts_unique_turns_per_model_family() {
+    fn interval_counts_usage_records_per_model_family() {
         let make =
             |id: &str, session: &str, turn: Option<&str>, model: &str, flags: Vec<String>| {
                 TokenEvent {
@@ -4714,7 +4723,25 @@ mod widget_revision_tests {
             ),
         ];
         let refs: Vec<_> = events.iter().collect();
-        assert_eq!(interval_task_counts(&refs), [2, 2, 1, 4]);
+        assert_eq!(interval_task_counts(&refs), [3, 3, 1, 7]);
+        let responses: Vec<_> = (0..169)
+            .map(|i| {
+                let mut event = make(
+                    &format!("event-{i}"),
+                    "one-chat",
+                    Some("one-turn"),
+                    "gpt-6.1-sol",
+                    vec![],
+                );
+                event.response_id = Some(format!("response-{i}"));
+                event
+            })
+            .collect();
+        let mut replay = responses[0].clone();
+        replay.id = "replayed-response".into();
+        let mut refs: Vec<_> = responses.iter().collect();
+        refs.push(&replay);
+        assert_eq!(interval_task_counts(&refs), [169, 0, 0, 169]);
     }
 
     #[test]
