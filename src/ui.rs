@@ -94,6 +94,10 @@ fn prepare_widget_settings(settings: &mut Settings) {
         settings.size[0] *= 2. / 3.;
         settings.compact_layout_version = 1;
     }
+    if settings.compact_layout_version < 2 {
+        settings.size[0] *= 0.94;
+        settings.compact_layout_version = 2;
+    }
     settings.size[0] = settings.size[0].clamp(280., 1000.);
     settings.size[1] = COLLAPSED_HEIGHT * settings.size[0] / 310.;
 }
@@ -369,6 +373,16 @@ struct HistoryCache {
     has_lower_bound: bool,
     calculation_error: Option<String>,
 }
+#[derive(Default)]
+struct RecentUsage {
+    key: Option<(u64, u64, String, String, i32)>,
+    segments: Vec<DailyQuotaSegment>,
+    costs: Vec<Option<accounting::ObservedCost>>,
+    receiver: Option<mpsc::Receiver<std::io::Result<CachedSegmentUsage>>>,
+    next: usize,
+    error: Option<String>,
+}
+
 type HistoryCacheKey = (NaiveDate, String, bool, bool);
 #[derive(Clone)]
 struct DailyQuotaSegment {
@@ -544,6 +558,7 @@ struct WidgetApp {
     quota_error: Option<String>,
     tasks_expanded: bool,
     recent_expanded: bool,
+    recent_usage: RecentUsage,
     history_open: bool,
     history_selection: Option<(String, Option<String>, String)>,
     tokens_open: bool,
@@ -1360,6 +1375,7 @@ impl WidgetApp {
             history_selection: None,
             tasks_expanded: false,
             recent_expanded: false,
+            recent_usage: RecentUsage::default(),
             history_open: args.iter().any(|s| s == "--show-history"),
             tokens_open: args.iter().any(|s| s == "--show-tokens"),
             settings_open: args.iter().any(|s| s == "--show-settings"),
@@ -2459,29 +2475,144 @@ impl WidgetApp {
         }
         text
     }
-    fn recent_detail_text(&self) -> String {
-        let age = if let Some(event) = &self.main_cache.boundary {
-            format!(
-                "{} {} 分鐘",
-                if reset_event(event) {
-                    "距本次重設"
-                } else {
-                    "距上次扣額"
-                },
-                (now() - event.observed_at_unix).max(0) / 60
-            )
-        } else {
-            format!("自啟動 {} 分鐘", (now() - self.demo_start).max(0) / 60)
-        };
-        let details = self.main_cache.recent_tooltip.replacen(
-            "最近 5 次扣額",
-            &format!("最近 {} 次扣額", self.main_cache.recent_events.len()),
-            1,
+    fn refresh_recent_usage(&mut self, ctx: &egui::Context) {
+        let key = (
+            self.token_generation,
+            self.history_generation,
+            self.settings.bucket.clone(),
+            self.settings.window.clone(),
+            display_time::offset_minutes(),
         );
-        format!("{age}\n\n{details}")
+        if self.recent_usage.key.as_ref() != Some(&key) {
+            let all = self.matching_history();
+            let mut segments = Vec::new();
+            for event in &self.main_cache.recent_events {
+                let Some(day) = local_day(event.observed_at_unix) else {
+                    continue;
+                };
+                let Some((start, end)) = display_time::day_bounds(day) else {
+                    continue;
+                };
+                let key = intervals::history_event_key(event);
+                if let Some(segment) = daily_quota_segments(&all, start, end, None, now())
+                    .into_iter()
+                    .find(|s| {
+                        s.event
+                            .as_ref()
+                            .is_some_and(|e| intervals::history_event_key(e) == key)
+                    })
+                {
+                    segments.push(segment);
+                }
+            }
+            let costs = segments
+                .iter()
+                .map(|segment| {
+                    self.recent_usage
+                        .segments
+                        .iter()
+                        .position(|old| old.start == segment.start && old.end == segment.end)
+                        .and_then(|i| self.recent_usage.costs.get(i).copied().flatten())
+                })
+                .collect();
+            self.recent_usage = RecentUsage {
+                key: Some(key),
+                costs,
+                segments,
+                ..Default::default()
+            };
+            if let Some(database) = &self.tokens.database {
+                self.recent_usage.receiver = Some(start_history_usage(
+                    database.database_path.clone(),
+                    self.recent_usage.segments.clone(),
+                    self._lock.is_some(),
+                    ctx.clone(),
+                ));
+            } else {
+                self.recent_usage.costs = self
+                    .recent_usage
+                    .segments
+                    .iter()
+                    .map(|s| Some(self.tokens.cost_index.observed(s.start, s.end)))
+                    .collect();
+            }
+        }
+        while let Some(receiver) = &self.recent_usage.receiver {
+            match receiver.try_recv() {
+                Ok(Ok(usage)) => {
+                    let index = self.recent_usage.next;
+                    if let Some(cost) = self.recent_usage.costs.get_mut(index) {
+                        *cost = Some(usage.cost);
+                    }
+                    self.recent_usage.next += 1;
+                }
+                Ok(Err(error)) => {
+                    self.recent_usage.error = Some(error.to_string());
+                    self.recent_usage.receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.recent_usage.receiver = None;
+                }
+            }
+        }
+    }
+    fn recent_usage_table(&self, ui: &mut egui::Ui) {
+        ui.label(tr(format!(
+            "最近 {} 次扣額",
+            self.recent_usage.segments.len()
+        )));
+        egui::Grid::new("recent-quota-summary")
+            .striped(true)
+            .num_columns(3)
+            .min_col_width(0.)
+            .show(ui, |ui| {
+                for header in ["額度變化", "結算時間", "Total"] {
+                    ui.strong(tr(header));
+                }
+                ui.end_row();
+                for (segment, cost) in self
+                    .recent_usage
+                    .segments
+                    .iter()
+                    .zip(&self.recent_usage.costs)
+                {
+                    let event = segment.event.as_ref().expect("completed recent segment");
+                    ui.label(format!("{}% → {}%", event.before, event.after));
+                    let date = chrono::DateTime::from_timestamp(segment.end, 0)
+                        .map(|d| d.with_timezone(&display_time::timezone()));
+                    ui.label(
+                        date.map(|d| d.format("%H:%M").to_string())
+                            .unwrap_or_default(),
+                    )
+                    .on_hover_text(
+                        date.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                            .unwrap_or_default(),
+                    );
+                    if let Some(cost) = cost {
+                        ui.label(format!("${:.2}", cost.known_usd))
+                            .on_hover_text(tr(format!(
+                                "記錄：{} 筆 · 未定價：{} 筆{}",
+                                cost.events,
+                                cost.unknown_events,
+                                if cost.partial { " · 部分資料" } else { "" }
+                            )));
+                    } else {
+                        ui.label(if self.recent_usage.error.is_some() {
+                            tr("讀取失敗")
+                        } else {
+                            tr("計算中")
+                        });
+                    }
+                    ui.end_row();
+                }
+            });
     }
     fn widget(&mut self, ctx: &egui::Context) {
         self.refresh_main_cache();
+        if self.recent_expanded {
+            self.refresh_recent_usage(ctx);
+        }
         let palette = accessibility::palette(self.settings.dark);
         let (bg, fg, muted, line, accent) = (
             palette.background,
@@ -2517,11 +2648,6 @@ impl WidgetApp {
                 );
                 let monitor_height = ctx.input(|i| i.viewport().monitor_size.map(|size| size.y));
                 let mut details = 0.;
-                let recent_text = if self.recent_expanded {
-                    self.recent_detail_text()
-                } else {
-                    String::new()
-                };
                 if self.tasks_expanded {
                     details += (24. * sy).max(font_size * 1.4)
                         + (22. * sy).max(font_size * 1.4)
@@ -2529,16 +2655,8 @@ impl WidgetApp {
                         + 52. * sy;
                 }
                 if self.recent_expanded {
-                    details += painter
-                        .layout(
-                            recent_text.clone(),
-                            FontId::proportional(font_size),
-                            fg,
-                            268. * sx,
-                        )
-                        .size()
-                        .y
-                        + 16. * sy;
+                    details += (self.recent_usage.segments.len() as f32 + 2.)
+                        * (font_size * 1.5).max(24. * sy);
                 }
                 if self.tasks_expanded || self.recent_expanded {
                     details += 42. * sy;
@@ -2624,7 +2742,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.37".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.38".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(181., 35.)))
@@ -2637,7 +2755,7 @@ impl WidgetApp {
                     );
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(181., 10.), pt(205., 34.)),
+                    Rect::from_min_max(pt(125., 117.), pt(149., 141.)),
                     WidgetIcon::History,
                     None,
                     "扣額紀錄",
@@ -2650,7 +2768,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(209., 10.), pt(233., 34.)),
+                    Rect::from_min_max(pt(153., 117.), pt(177., 141.)),
                     WidgetIcon::Tokens,
                     None,
                     "Token明細",
@@ -2719,6 +2837,16 @@ impl WidgetApp {
                     FontId::proportional(unit_font * number_fit),
                     fg,
                 );
+                if let Some(boundary) = &self.main_cache.boundary {
+                    let elapsed = (now() - boundary.observed_at_unix).max(0) / 60;
+                    painter.text(
+                        pt(21., 97.),
+                        Align2::LEFT_TOP,
+                        tr(format!("已過 {} 分鐘", elapsed)),
+                        FontId::proportional(font_size * 0.8),
+                        fg,
+                    );
+                }
                 let bar = Rect::from_min_max(pt(145., 97.), pt(289., 100.));
                 painter.rect_filled(bar, 3., line);
                 if let Some(p) = view.as_ref().and_then(|v| v.remaining_percent) {
@@ -2792,8 +2920,8 @@ impl WidgetApp {
                         .x;
                     let fitted = (font_size * (available / measured.max(1.)).min(1.)).min(16. * sx);
                     painter.text(
-                        pt(145., y),
-                        Align2::LEFT_TOP,
+                        pt(289., y),
+                        Align2::RIGHT_TOP,
                         tr(text),
                         FontId::proportional(fitted),
                         fg,
@@ -2840,10 +2968,12 @@ impl WidgetApp {
                         .size()
                         .x;
                     painter.text(
-                        pt(21., 105.),
+                        pt(21., 111.),
                         Align2::LEFT_TOP,
                         tr(prediction_title),
-                        FontId::proportional(font_size * (155. * sx / title_width.max(1.)).min(1.)),
+                        FontId::proportional(
+                            font_size * (100. * sx / title_width.max(1.)).min(0.8),
+                        ),
                         fg,
                     );
                     let reminder_now = now();
@@ -2857,7 +2987,7 @@ impl WidgetApp {
                         fg
                     };
                     painter.text(
-                        pt(21., 124.),
+                        pt(21., 130.),
                         Align2::LEFT_TOP,
                         tr(reminder
                             .map(|target| reset_reminder_countdown(target, reminder_now))
@@ -2867,7 +2997,7 @@ impl WidgetApp {
                     );
                     if ui
                         .interact(
-                            Rect::from_min_max(pt(21., 103.), pt(176., 150.)),
+                            Rect::from_min_max(pt(21., 109.), pt(121., 154.)),
                             ui.id().with("reset-prediction"),
                             Sense::click(),
                         )
@@ -2954,14 +3084,7 @@ impl WidgetApp {
                                     if self.tasks_expanded {
                                         ui.separator();
                                     }
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(tr(&recent_text))
-                                                .size(font_size)
-                                                .color(fg),
-                                        )
-                                        .wrap(),
-                                    );
+                                    self.recent_usage_table(ui);
                                 }
                                 if let Some(progress) = self.compact_status_text() {
                                     ui.separator();
@@ -5591,7 +5714,7 @@ mod async_export_tests {
 #[cfg(test)]
 mod widget_revision_tests {
     use super::*;
-    fn history_fixture() -> HistoryEvent {
+    pub(super) fn history_fixture() -> HistoryEvent {
         serde_json::from_value(serde_json::json!({"session":"synthetic","observed_at_unix":1792252800,"before_observed_at_unix":1792249200,"source_key":"codex","window_label":"week","window_key":"primary","epoch":0,"kind":"QuotaDecrease","before":"2","after":"1","delta":"1"})).unwrap()
     }
     #[test]
@@ -6895,6 +7018,65 @@ mod database_display_tests {
                 points: 1.,
             })
             .collect();
+        let mut recent_app = app();
+        Arc::get_mut(&mut recent_app.tokens)
+            .unwrap()
+            .database
+            .as_mut()
+            .unwrap()
+            .database_path = path.clone();
+        let mut event = super::widget_revision_tests::history_fixture();
+        event.observed_at_unix = base + 110;
+        event.before_observed_at_unix = Some(base + 100);
+        event.before = "89".into();
+        event.after = "88".into();
+        let mut prior = event.clone();
+        prior.observed_at_unix = base + 100;
+        prior.before_observed_at_unix = Some(base + 90);
+        prior.before = "90".into();
+        prior.after = "89".into();
+        recent_app.history = Arc::new(vec![prior, event.clone()]);
+        recent_app.main_cache.recent_events = vec![event];
+        let ctx = egui::Context::default();
+        recent_app.refresh_recent_usage(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recent_app
+            .recent_usage
+            .costs
+            .first()
+            .is_none_or(|cost| cost.is_none())
+        {
+            assert!(Instant::now() < deadline, "recent SQLite summary timed out");
+            std::thread::sleep(Duration::from_millis(10));
+            recent_app.refresh_recent_usage(&ctx);
+        }
+        let cost = recent_app.recent_usage.costs[0].unwrap();
+        assert_eq!(cost.events, 2);
+        let expected = accounting::CostIndex::new(store.events()).observed(base + 100, base + 110);
+        assert!((cost.known_usd - expected.known_usd).abs() < 1e-12);
+        assert_eq!(cost.unknown_events, expected.unknown_events);
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| recent_app.recent_usage_table(ui));
+        });
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.job.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(labels.contains(&"89% → 88%"));
+        assert!(labels.contains(&"結算時間"));
+        assert!(labels.contains(&"Total"));
+        assert!(labels.contains(&"$0.00"));
+        assert!(!labels.iter().any(|label| label.contains("未知")));
+        let key = recent_app.recent_usage.key.clone();
+        recent_app.refresh_recent_usage(&ctx);
+        assert_eq!(recent_app.recent_usage.key, key);
         let _reader = quota_widget::token_db::TokenDb::open_readonly(&path).unwrap();
         let mut previous = Vec::new();
         for pass in 0..2 {
@@ -8287,11 +8469,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.37", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.37", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.38", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.38", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.37",
+                "Codex Quota v3.38",
                 "Interface font size",
             ),
         ] {
@@ -8348,9 +8530,9 @@ mod accessible_ui_tests {
             ..Default::default()
         };
         prepare_widget_settings(&mut settings);
-        assert_eq!(settings.size, [300., 158. * 300. / 310.]);
+        assert_eq!(settings.size, [282., 158. * 282. / 310.]);
         prepare_widget_settings(&mut settings);
-        assert_eq!(settings.size[0], 300., "narrowing is a one-time migration");
+        assert_eq!(settings.size[0], 282., "narrowing is a one-time migration");
     }
 
     #[test]
@@ -8377,7 +8559,14 @@ mod accessible_ui_tests {
                     if let egui::Shape::Text(text) = clipped.shape {
                         for section in &text.galley.job.sections {
                             assert!(
-                                section.format.font_id.size >= minimum - 0.01,
+                                section.format.font_id.size
+                                    >= minimum
+                                        * if text.galley.job.text.starts_with("已過 ") {
+                                            0.8
+                                        } else {
+                                            1.0
+                                        }
+                                        - 0.01,
                                 "{}",
                                 text.galley.job.text
                             );
@@ -8526,13 +8715,13 @@ mod accessible_ui_tests {
         assert!(both.contains(&recent_heading), "{both}");
         click(&mut app, Pos2::new(207., 129.));
         assert!(!app.tasks_expanded && app.recent_expanded);
-        click(&mut app, Pos2::new(198., 22.));
+        click(&mut app, Pos2::new(137., 129.));
         assert!(app.history_open);
-        click(&mut app, Pos2::new(226., 22.));
+        click(&mut app, Pos2::new(165., 129.));
         assert!(app.tokens_open);
-        click(&mut app, Pos2::new(198., 22.));
+        click(&mut app, Pos2::new(137., 129.));
         assert!(!app.history_open && app.tokens_open);
-        click(&mut app, Pos2::new(226., 22.));
+        click(&mut app, Pos2::new(165., 129.));
         assert!(!app.tokens_open);
         click(&mut app, Pos2::new(254., 22.));
         assert!(app.settings_open);

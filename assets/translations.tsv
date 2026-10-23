@@ -61,7 +61,7 @@ CLI 回傳的額度格式不支援；請在設定檢查來源。	Unsupported CLI
 深色外觀	Dark appearance	深色外观
 保持最上層	Always on top	保持最上层
 關閉小工具	Close widget	关闭小工具
-Codex 額度 v3.37	Codex Quota v3.37	Codex 额度 v3.37
+Codex 額度 v3.38	Codex Quota v3.38	Codex 额度 v3.38
 扣額紀錄	Quota history	扣额记录
 Token明細	Token details	Token明细
 — 等待量測	— Awaiting samples	— 等待量测
@@ -362,3 +362,6 @@ Token 明細 · {}	Token details · {}	Token 明细 · {}
 最近 5 次扣額 · {}	Last 5 quota drops · {}	最近 5 次扣额 · {}
 時間{}	Time {}	时间{}
 顯示時間: {}	Display time: {}	显示时间: {}
+
+結算時間	Settled at	结算时间
+已過 {} 分鐘	{} min elapsed	已过 {} 分钟
