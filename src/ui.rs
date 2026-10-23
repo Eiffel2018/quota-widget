@@ -104,6 +104,7 @@ enum WidgetIcon {
     Tokens,
     Tasks,
     Recent,
+    Prediction,
     Settings,
     Close,
 }
@@ -123,14 +124,22 @@ fn widget_icon(
             ui.spacing_mut().button_padding = Vec2::ZERO;
             ui.put(
                 rect,
-                egui::Button::new(tr("")).fill(fill).min_size(rect.size()),
+                egui::Button::new(tr(""))
+                    .selected(expanded == Some(true))
+                    .fill(if expanded == Some(true) {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        fill
+                    })
+                    .min_size(rect.size()),
             )
         })
         .inner
         .on_hover_text(tr(help));
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, help));
     let side = rect.height() * 0.55;
-    let center = if expanded.is_some() {
+    let disclosure = matches!(icon, WidgetIcon::Tasks | WidgetIcon::Recent);
+    let center = if disclosure && expanded.is_some() {
         Pos2::new(rect.left() + rect.height() * 0.65, rect.center().y)
     } else {
         rect.center()
@@ -172,12 +181,25 @@ fn widget_icon(
             line(r.center(), r.center() - Vec2::new(0., side * 0.3));
             line(r.center(), r.center() + Vec2::new(side * 0.25, 0.));
         }
+        WidgetIcon::Prediction => {
+            // Embolden only this compact label; retain its requested 80% height.
+            let font = FontId::proportional(rect.height() * 0.7 * 0.8);
+            for dx in [-0.25, 0.25] {
+                painter.text(
+                    rect.center() + Vec2::new(dx, 0.),
+                    Align2::CENTER_CENTER,
+                    "Reset",
+                    font.clone(),
+                    foreground,
+                );
+            }
+        }
         WidgetIcon::Close => {
             line(r.left_top(), r.right_bottom());
             line(r.right_top(), r.left_bottom());
         }
     }
-    if let Some(open) = expanded {
+    if let Some(open) = expanded.filter(|_| disclosure) {
         let c = Pos2::new(rect.right() - rect.height() * 0.5, rect.center().y);
         let d = rect.height() * 0.15;
         let sign = if open { -1. } else { 1. };
@@ -2571,7 +2593,7 @@ impl WidgetApp {
                 }
                 drag.context_menu(|ui| {
                     if ui.button(tr("設定 / 連接")).clicked() {
-                        self.open_settings();
+                        self.toggle_settings();
                         ui.close();
                     }
                     if ui.button(tr("更新額度")).clicked() {
@@ -2602,7 +2624,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.35".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.36".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(181., 35.)))
@@ -2794,12 +2816,16 @@ impl WidgetApp {
                         .unwrap_or_default()
                 )));
                 if reminder.is_none() {
-                    if ui
-                        .put(
-                            Rect::from_min_max(pt(21., 128.), pt(166., 161.)),
-                            egui::Button::new(RichText::new(tr("Reset預測")).size(font_size)),
-                        )
-                        .clicked()
+                    if widget_icon(
+                        ui,
+                        Rect::from_min_max(pt(125., 141.), pt(177., 165.)),
+                        WidgetIcon::Prediction,
+                        Some(self.prediction_open),
+                        "Reset預測",
+                        fg,
+                        line,
+                    )
+                    .clicked()
                     {
                         self.open_prediction();
                     }
@@ -2855,18 +2881,18 @@ impl WidgetApp {
                     ui,
                     Rect::from_min_max(pt(237., 10.), pt(261., 34.)),
                     WidgetIcon::Settings,
-                    None,
+                    Some(self.settings_open),
                     "設定 / 連接",
                     fg,
                     line,
                 )
                 .clicked()
                 {
-                    self.open_settings();
+                    self.toggle_settings();
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(185., 141.), pt(235., 165.)),
+                    Rect::from_min_max(pt(181., 141.), pt(233., 165.)),
                     WidgetIcon::Tasks,
                     Some(self.tasks_expanded),
                     "展開 / 收起對話列表",
@@ -2880,7 +2906,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(239., 141.), pt(289., 165.)),
+                    Rect::from_min_max(pt(237., 141.), pt(289., 165.)),
                     WidgetIcon::Recent,
                     Some(self.recent_expanded),
                     "展開 / 收起最近扣額",
@@ -3359,12 +3385,15 @@ impl WidgetApp {
                 .with_visible(true)
                 .with_window_level(WindowLevel::AlwaysOnTop);
             if first {
-                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                if let Some(position) = self.settings.settings_position {
+                    builder = builder.with_position(position);
+                } else if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
                     builder = builder.with_position(rect.min);
                 }
                 builder = builder.with_active(true);
             }
             ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ctx, _| {
+                self.remember_settings_position(ctx);
                 if first {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
@@ -4422,11 +4451,38 @@ impl WidgetApp {
         self.request_reprice();
         self.dirty = true;
     }
+    fn remember_settings_position(&mut self, ctx: &egui::Context) {
+        if ctx.viewport_id() != ViewportId::from_hash_of("settings") {
+            return;
+        }
+        if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+            let position = [rect.min.x, rect.min.y];
+            if position.iter().all(|v| v.is_finite())
+                && self.settings.settings_position != Some(position)
+            {
+                self.settings.settings_position = Some(position);
+                self.dirty = true;
+            }
+        }
+    }
+    fn toggle_settings(&mut self) {
+        if self.settings_open {
+            self.settings_open = false;
+            self.settings_presented = false;
+        } else {
+            self.open_settings();
+        }
+    }
     fn open_settings(&mut self) {
         self.settings_open = true;
         self.settings_presented = false;
     }
     fn open_prediction(&mut self) {
+        if self.prediction_open {
+            self.prediction_open = false;
+            self.prediction_presented = false;
+            return;
+        }
         self.prediction_pst = false;
         self.prediction_input = self
             .settings
@@ -7992,9 +8048,16 @@ mod responsive_close_tests {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(760., 700.))),
                 ..Default::default()
             };
-            input
-                .viewports
-                .insert(viewport.ids.this, Default::default());
+            input.viewports.insert(
+                viewport.ids.this,
+                egui::ViewportInfo {
+                    outer_rect: Some(Rect::from_min_size(
+                        Pos2::new(430., 180.),
+                        Vec2::new(760., 700.),
+                    )),
+                    ..Default::default()
+                },
+            );
             let rendered = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
             let text = rendered
                 .shapes
@@ -8015,8 +8078,8 @@ mod responsive_close_tests {
         let ctx = egui::Context::default();
         ctx.set_embed_viewports(false);
         app.apply_theme(&ctx);
-        for _ in 0..2 {
-            app.open_settings();
+        for attempt in 0..2 {
+            app.toggle_settings();
             let _ = ctx.run(Default::default(), |ctx| app.detail_windows(ctx));
             assert!(app.settings_open);
             let rows = captured.borrow();
@@ -8026,7 +8089,15 @@ mod responsive_close_tests {
             assert_eq!(builder.window_level, Some(WindowLevel::AlwaysOnTop));
             assert!(text.contains("顯示時區"), "{text}");
             assert!(text.contains("Reset預測"), "{text}");
-            app.settings_open = false;
+            if attempt == 1 {
+                assert_eq!(builder.position, Some(Pos2::new(430., 180.)));
+            }
+            assert_eq!(app.settings.settings_position, Some([430., 180.]));
+            let saved: Settings =
+                serde_json::from_str(&serde_json::to_string(&app.settings).unwrap()).unwrap();
+            assert_eq!(saved.settings_position, Some([430., 180.]));
+            app.toggle_settings();
+            assert!(!app.settings_open);
         }
     }
     #[test]
@@ -8145,11 +8216,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.35", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.35", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.36", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.36", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.35",
+                "Codex Quota v3.36",
                 "Interface font size",
             ),
         ] {
@@ -8394,6 +8465,8 @@ mod accessible_ui_tests {
         assert!(!app.tokens_open);
         click(&mut app, Pos2::new(254., 22.));
         assert!(app.settings_open);
+        click(&mut app, Pos2::new(254., 22.));
+        assert!(!app.settings_open);
     }
 
     #[test]
