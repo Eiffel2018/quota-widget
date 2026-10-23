@@ -252,6 +252,7 @@ struct WidgetApp {
     dates_cache: BTreeSet<NaiveDate>,
     layout: LayoutConvergence,
     bridge: Option<Bridge>,
+    quota_retry_at: Option<Instant>,
     status: String,
     quota_error: Option<String>,
     history_open: bool,
@@ -1059,6 +1060,7 @@ impl WidgetApp {
             dates_cache: BTreeSet::new(),
             layout: LayoutConvergence::default(),
             bridge: None,
+            quota_retry_at: None,
             status: "OFFLINE".into(),
             quota_error: None,
             history_selection: None,
@@ -1216,6 +1218,7 @@ impl WidgetApp {
         ctx.set_style(style);
     }
     fn connect(&mut self) {
+        self.quota_retry_at = None;
         self.bridge = None;
         self.quota.reset_continuity();
         self.main_cache.key = None;
@@ -1240,6 +1243,14 @@ impl WidgetApp {
             .as_ref()
             .is_none_or(|bridge| bridge.commands.send(BridgeCommand::Refresh).is_err())
         {
+            self.connect();
+        }
+    }
+    fn retry_quota_connection(&mut self, t: Instant) {
+        if self.demo || self.offline || self.closing_since.is_some() || self.bridge.is_some() {
+            return;
+        }
+        if self.quota_retry_at.is_some_and(|deadline| t >= deadline) {
             self.connect();
         }
     }
@@ -1507,6 +1518,14 @@ impl WidgetApp {
                 }
             }
             BridgeEvent::Error(e) => {
+                self.quota_retry_at = matches!(
+                    e,
+                    quota_widget::bridge::BridgeError::Transport
+                        | quota_widget::bridge::BridgeError::Timeout
+                        | quota_widget::bridge::BridgeError::StartFailed
+                        | quota_widget::bridge::BridgeError::Unavailable
+                )
+                .then(|| Instant::now() + Duration::from_secs(30));
                 self.status = "OFFLINE".into();
                 self.quota_error = Some(format!("CLI：{e}"));
                 self.notice = self.quota_error.clone().unwrap();
@@ -1567,6 +1586,7 @@ impl WidgetApp {
             }
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
+        self.retry_quota_connection(Instant::now());
         self.retry_write_lock();
         if !self.demo && !self.import_pending && self.last_import.elapsed() > Duration::from_secs(5)
         {
@@ -6604,6 +6624,28 @@ mod quota_connection_recovery_tests {
         };
         WidgetApp::new(settings, root.into(), false, false, true, vec![])
     }
+    #[test]
+    fn transient_quota_failure_retries_after_delay_but_manual_offline_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.offline = false;
+        app.handle_bridge_event(BridgeEvent::Error(BridgeError::Transport));
+        app.handle_bridge_event(BridgeEvent::Stopped);
+        let due = app.quota_retry_at.unwrap();
+        app.retry_quota_connection(due - Duration::from_secs(1));
+        assert!(app.bridge.is_none());
+        app.offline = true;
+        app.retry_quota_connection(due);
+        assert!(app.bridge.is_none());
+        app.offline = false;
+        app.retry_quota_connection(due);
+        assert!(app.bridge.is_some());
+        assert!(app.quota_retry_at.is_none());
+        app.bridge = None;
+        app.handle_bridge_event(BridgeEvent::Error(BridgeError::NotFound));
+        assert!(app.quota_retry_at.is_none());
+    }
+
     #[test]
     fn quota_refresh_reconnects_a_dead_sender_instead_of_silently_ignoring_it() {
         let root = tempfile::tempdir().unwrap();
