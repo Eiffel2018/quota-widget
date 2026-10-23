@@ -15,6 +15,8 @@ pub struct Settings {
     pub on_top: bool,
     pub codex_path: String,
     pub position: Option<[f32; 2]>,
+    pub history_position: Option<[f32; 2]>,
+    pub tokens_position: Option<[f32; 2]>,
     pub size: [f32; 2],
     #[serde(deserialize_with = "deserialize_bucket")]
     pub bucket: String,
@@ -38,6 +40,8 @@ impl Default for Settings {
             on_top: true,
             codex_path: String::new(),
             position: None,
+            history_position: None,
+            tokens_position: None,
             size: [300., 184. * 300. / 310.],
             bucket: default_bucket(),
             window: "weekly".into(),

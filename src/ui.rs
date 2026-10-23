@@ -40,8 +40,13 @@ fn reset_reminder_countdown(target: i64, current: i64) -> String {
     if target <= current {
         "已到時間".into()
     } else {
-        let minutes = (target - current + 59) / 60;
-        format!("{}時{:02}分", minutes / 60, minutes % 60)
+        let seconds = target - current;
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
     }
 }
 
@@ -2491,7 +2496,7 @@ impl WidgetApp {
                     Sense::click_and_drag(),
                 );
                 let title_drag = ui.interact(
-                    Rect::from_min_max(pt(4., 4.), pt(208., 37.)),
+                    Rect::from_min_max(pt(4., 4.), pt(180., 37.)),
                     ui.id().with("title-drag"),
                     Sense::click_and_drag(),
                 );
@@ -2528,10 +2533,10 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "每週額度 v3.31".into());
+                    .unwrap_or_else(|| "每週額度 v3.32".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
-                    .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(209., 35.)))
+                    .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(181., 35.)))
                     .text(
                         pt(33., 14.),
                         Align2::LEFT_TOP,
@@ -2541,29 +2546,29 @@ impl WidgetApp {
                     );
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(214., 10.), pt(238., 34.)),
+                    Rect::from_min_max(pt(186., 10.), pt(210., 34.)),
                     WidgetIcon::History,
                     None,
                     "扣額紀錄",
-                    fg,
-                    line,
+                    if self.history_open { bg } else { fg },
+                    if self.history_open { accent } else { line },
                 )
                 .clicked()
                 {
-                    self.history_open = true;
+                    self.set_history_open(!self.history_open);
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(242., 10.), pt(266., 34.)),
+                    Rect::from_min_max(pt(214., 10.), pt(238., 34.)),
                     WidgetIcon::Tokens,
                     None,
                     "Token明細",
-                    fg,
-                    line,
+                    if self.tokens_open { bg } else { fg },
+                    if self.tokens_open { accent } else { line },
                 )
                 .clicked()
                 {
-                    self.tokens_open = true;
+                    self.tokens_open = !self.tokens_open;
                 }
                 if widget_icon(
                     ui,
@@ -2619,7 +2624,7 @@ impl WidgetApp {
                     FontId::proportional(unit_font * number_fit),
                     fg,
                 );
-                let bar = Rect::from_min_max(pt(21., 109.), pt(289., 113.));
+                let bar = Rect::from_min_max(pt(145., 97.), pt(294., 100.));
                 painter.rect_filled(bar, 3., line);
                 if let Some(p) = view.as_ref().and_then(|v| v.remaining_percent) {
                     painter.rect_filled(
@@ -2666,14 +2671,11 @@ impl WidgetApp {
                     .map(|r| format!("{r:.2}%/時"))
                     .unwrap_or_else(|| "等待量測".into());
                 let reminder = reset_reminder_at(&self.settings.reset_reminder_local);
-                let mut summary = vec![
+                let summary = [
                     format!("重設 {reset}"),
                     format!("消耗 {short_rate}"),
                     format!("點數 {short_credit}"),
                 ];
-                if let Some(target) = reminder {
-                    summary.push(format!("提醒 {}", reset_reminder_countdown(target, now())));
-                }
                 for (index, text) in summary.into_iter().enumerate() {
                     let y = 40. + index as f32 * 17.;
                     let available = 149. * sx;
@@ -2681,7 +2683,7 @@ impl WidgetApp {
                         .layout_no_wrap(text.clone(), FontId::proportional(font_size), fg)
                         .size()
                         .x;
-                    let fitted = font_size * (available / measured.max(1.)).min(1.);
+                    let fitted = (font_size * (available / measured.max(1.)).min(1.)).min(16. * sx);
                     painter.text(
                         pt(145., y),
                         Align2::LEFT_TOP,
@@ -2704,9 +2706,41 @@ impl WidgetApp {
                         ))
                         .unwrap_or_default()
                 ));
+                let prediction_title = "下次 reset 預測：";
+                let title_width = painter
+                    .layout_no_wrap(prediction_title.into(), FontId::proportional(font_size), fg)
+                    .size()
+                    .x;
+                painter.text(
+                    pt(21., 120.),
+                    Align2::LEFT_TOP,
+                    prediction_title,
+                    FontId::proportional(font_size * (155. * sx / title_width.max(1.)).min(1.)),
+                    fg,
+                );
+                painter.text(
+                    pt(21., 141.),
+                    Align2::LEFT_TOP,
+                    reminder
+                        .map(|target| reset_reminder_countdown(target, now()))
+                        .unwrap_or_else(|| "未設定".into()),
+                    FontId::proportional((18. * scale * font_multiplier).max(font_size)),
+                    fg,
+                );
+                if ui
+                    .interact(
+                        Rect::from_min_max(pt(21., 117.), pt(176., 171.)),
+                        ui.id().with("reset-prediction"),
+                        Sense::click(),
+                    )
+                    .on_hover_text("自行設定預測時間（UTC+08）；按此修改或清除")
+                    .clicked()
+                {
+                    self.settings_open = true;
+                }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(272., 122.), pt(294., 144.)),
+                    Rect::from_min_max(pt(242., 10.), pt(266., 34.)),
                     WidgetIcon::Settings,
                     None,
                     "設定 / 連接",
@@ -2719,7 +2753,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(80., 151.), pt(135., 175.)),
+                    Rect::from_min_max(pt(182., 149.), pt(232., 173.)),
                     WidgetIcon::Tasks,
                     Some(self.tasks_expanded),
                     "展開 / 收起對話列表",
@@ -2733,7 +2767,7 @@ impl WidgetApp {
                 }
                 if widget_icon(
                     ui,
-                    Rect::from_min_max(pt(175., 151.), pt(230., 175.)),
+                    Rect::from_min_max(pt(240., 149.), pt(290., 173.)),
                     WidgetIcon::Recent,
                     Some(self.recent_expanded),
                     "展開 / 收起最近扣額",
@@ -3127,17 +3161,48 @@ impl WidgetApp {
         }
         self.dates_cache.clone()
     }
+    fn set_history_open(&mut self, open: bool) {
+        self.history_open = open;
+        if !open {
+            // Reopening explicitly refreshes the selected day once.
+            self.history_cache.key = None;
+            self.history_cache.work_key = None;
+            self.history_cache.usage_receiver = None;
+        }
+    }
+    fn remember_detail_position(&mut self, ctx: &egui::Context, history: bool) {
+        if ctx.viewport_id() == ViewportId::ROOT {
+            return;
+        }
+        if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+            let position = [rect.min.x, rect.min.y];
+            let saved = if history {
+                &mut self.settings.history_position
+            } else {
+                &mut self.settings.tokens_position
+            };
+            if *saved != Some(position) && position.iter().all(|v| v.is_finite()) {
+                *saved = Some(position);
+                self.dirty = true;
+            }
+        }
+    }
     fn detail_windows(&mut self, ctx: &egui::Context) {
         if self.history_open {
+            let mut viewport = ViewportBuilder::default()
+                .with_title("Quota Widget · 扣額紀錄")
+                .with_inner_size([1120., 760.])
+                .with_min_inner_size([560., 400.]);
+            if let Some(position) = self.settings.history_position {
+                viewport = viewport.with_position(position);
+            }
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("quota-history"),
-                ViewportBuilder::default()
-                    .with_title("Quota Widget · 扣額紀錄")
-                    .with_inner_size([1120., 760.])
-                    .with_min_inner_size([560., 400.]),
+                viewport,
                 |ctx, _| {
+                    self.remember_detail_position(ctx, true);
                     if ctx.input(|i| i.viewport().close_requested()) {
-                        self.history_open = false;
+                        self.set_history_open(false);
                     } else {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             self.history_ui(ui);
@@ -3145,23 +3210,23 @@ impl WidgetApp {
                     }
                 },
             );
-            if !self.history_open {
-                // Reopening explicitly refreshes the selected day once.
-                self.history_cache.key = None;
-                self.history_cache.work_key = None;
-                self.history_cache.usage_receiver = None;
-            }
         }
         if self.tokens_open {
+            let mut viewport = ViewportBuilder::default()
+                .with_title("Quota Widget · Token 明細")
+                .with_inner_size([1120., 650.])
+                .with_min_inner_size([680., 420.]);
+            if let Some(position) = self.settings.tokens_position {
+                viewport = viewport.with_position(position);
+            }
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("token-history"),
-                ViewportBuilder::default()
-                    .with_title("Quota Widget · Token 明細")
-                    .with_inner_size([1120., 650.])
-                    .with_min_inner_size([680., 420.]),
+                viewport,
                 |ctx, _| {
+                    self.remember_detail_position(ctx, false);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         self.tokens_open = false;
+                        return;
                     }
                     egui::CentralPanel::default().show(ctx, |ui| {
                         self.token_ui(ui);
@@ -7516,6 +7581,38 @@ mod quota_connection_recovery_tests {
 mod responsive_close_tests {
     use super::*;
     #[test]
+    fn detail_window_positions_remain_independent_and_persist() {
+        let mut app = super::widget_revision_tests::demo_app();
+        let ctx = egui::Context::default();
+        for (history, name, x) in [
+            (true, "quota-history", 120.),
+            (false, "token-history", 850.),
+        ] {
+            let id = ViewportId::from_hash_of(name);
+            let mut input = egui::RawInput {
+                viewport_id: id,
+                ..Default::default()
+            };
+            input.viewports.insert(
+                id,
+                egui::ViewportInfo {
+                    outer_rect: Some(Rect::from_min_size(
+                        Pos2::new(x, 220.),
+                        Vec2::new(1120., 760.),
+                    )),
+                    ..Default::default()
+                },
+            );
+            let _ = ctx.run(input, |ctx| app.remember_detail_position(ctx, history));
+        }
+        assert!(app.dirty);
+        let saved: Settings =
+            serde_json::from_str(&serde_json::to_string(&app.settings).unwrap()).unwrap();
+        assert_eq!(saved.history_position, Some([120., 220.]));
+        assert_eq!(saved.tokens_position, Some([850., 220.]));
+        assert_eq!(saved.position, app.settings.position);
+    }
+    #[test]
     fn reminder_uses_user_time_at_utc_plus_eight_and_stops_at_zero() {
         let target = reset_reminder_at("2030-04-02 01:00").unwrap();
         assert_eq!(
@@ -7524,8 +7621,8 @@ mod responsive_close_tests {
                 .to_rfc3339(),
             "2030-04-01T17:00:00+00:00"
         );
-        assert_eq!(reset_reminder_countdown(target, target - 3660), "1時01分");
-        assert_eq!(reset_reminder_countdown(target, target - 1), "0時01分");
+        assert_eq!(reset_reminder_countdown(target, target - 3660), "1:01:00");
+        assert_eq!(reset_reminder_countdown(target, target - 1), "0:00:01");
         assert_eq!(reset_reminder_countdown(target, target), "已到時間");
         assert_eq!(reset_reminder_countdown(target, target + 90), "已到時間");
         assert!(reset_reminder_at("").is_none());
@@ -7806,20 +7903,26 @@ mod accessible_ui_tests {
                 }],
             )
         };
-        let tasks = text(click(&mut app, Pos2::new(107., 163.)));
+        let tasks = text(click(&mut app, Pos2::new(207., 161.)));
         assert!(app.tasks_expanded && !app.recent_expanded);
         assert!(tasks.contains("對話"));
-        click(&mut app, Pos2::new(202., 163.));
+        click(&mut app, Pos2::new(265., 161.));
         let both = text(frame(&mut app, vec![]));
         assert!(app.tasks_expanded && app.recent_expanded);
         let recent_heading = format!("最近 {} 次扣額", app.main_cache.recent_events.len());
         assert!(both.contains(&recent_heading), "{both}");
-        click(&mut app, Pos2::new(107., 163.));
+        click(&mut app, Pos2::new(207., 161.));
         assert!(!app.tasks_expanded && app.recent_expanded);
-        click(&mut app, Pos2::new(226., 22.));
+        click(&mut app, Pos2::new(198., 22.));
         assert!(app.history_open);
-        click(&mut app, Pos2::new(254., 22.));
+        click(&mut app, Pos2::new(226., 22.));
         assert!(app.tokens_open);
+        click(&mut app, Pos2::new(198., 22.));
+        assert!(!app.history_open && app.tokens_open);
+        click(&mut app, Pos2::new(226., 22.));
+        assert!(!app.tokens_open);
+        click(&mut app, Pos2::new(254., 22.));
+        assert!(app.settings_open);
     }
 
     #[test]
