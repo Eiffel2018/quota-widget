@@ -26,6 +26,7 @@ pub struct Settings {
     #[serde(default)]
     pub compact_layout_version: u32,
     pub font_scale_percent: u32,
+    pub reset_reminder_local: String,
     pub sessions_path: String,
     pub import_enabled: bool,
     pub pricing: Pricing,
@@ -45,6 +46,7 @@ impl Default for Settings {
             task_visible_rows: 10,
             compact_layout_version: 1,
             font_scale_percent: 100,
+            reset_reminder_local: String::new(),
             sessions_path: default_sessions().to_string_lossy().into(),
             import_enabled: true,
             pricing: Pricing::official_standard(),

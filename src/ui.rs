@@ -30,6 +30,21 @@ use std::{
 
 const COLLAPSED_HEIGHT: f32 = 184.;
 
+fn reset_reminder_at(value: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M")
+        .ok()
+        .map(|v| v.and_utc().timestamp() - 8 * 3600)
+}
+
+fn reset_reminder_countdown(target: i64, current: i64) -> String {
+    if target <= current {
+        "已到時間".into()
+    } else {
+        let minutes = (target - current + 59) / 60;
+        format!("{}時{:02}分", minutes / 60, minutes % 60)
+    }
+}
+
 fn widget_target_height(width: f32, details: f32, monitor: Option<f32>) -> f32 {
     let desired = COLLAPSED_HEIGHT * width / 310. + details;
     let maximum = monitor
@@ -2400,15 +2415,6 @@ impl WidgetApp {
                 let scale = sx.clamp(0.85, 2.5);
                 let painter = ui.painter().clone();
                 let pt = |x: f32, y: f32| Pos2::new(rect.left() + x * sx, rect.top() + y * sy);
-                let txt = |x, y, text: String, size: f32, color| {
-                    painter.text(
-                        pt(x, y),
-                        Align2::LEFT_TOP,
-                        text,
-                        FontId::proportional((size * scale * font_multiplier).max(font_size)),
-                        color,
-                    );
-                };
                 painter.rect(
                     rect.shrink(1.),
                     22.,
@@ -2522,7 +2528,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "每週額度 v3.30".into());
+                    .unwrap_or_else(|| "每週額度 v3.31".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(209., 35.)))
@@ -2584,26 +2590,33 @@ impl WidgetApp {
                         }
                     })
                     .unwrap_or_else(|| "—".into());
+                let number_font = 60. * scale * font_multiplier.min(1.);
+                let unit_font = 28. * scale * font_multiplier.min(1.);
+                let number_width = painter
+                    .layout_no_wrap(percent.clone(), FontId::proportional(number_font), fg)
+                    .size()
+                    .x;
+                let unit_width = painter
+                    .layout_no_wrap("%".into(), FontId::proportional(unit_font), fg)
+                    .size()
+                    .x;
+                let number_fit = (115. * sx / (number_width + unit_width + 5. * sx)).min(1.);
                 painter.text(
                     pt(20., 38.),
                     Align2::LEFT_TOP,
                     percent.clone(),
-                    FontId::proportional(60. * scale * font_multiplier.min(1.)),
+                    FontId::proportional(number_font * number_fit),
                     fg,
                 );
                 let percent_width = painter
-                    .layout_no_wrap(
-                        percent,
-                        FontId::proportional(60. * scale * font_multiplier.min(1.)),
-                        fg,
-                    )
+                    .layout_no_wrap(percent, FontId::proportional(number_font * number_fit), fg)
                     .size()
                     .x;
                 painter.text(
                     pt(25. + percent_width / sx, 66.),
                     Align2::LEFT_TOP,
                     "%",
-                    FontId::proportional(28. * scale * font_multiplier.min(1.)),
+                    FontId::proportional(unit_font * number_fit),
                     fg,
                 );
                 let bar = Rect::from_min_max(pt(21., 109.), pt(289., 113.));
@@ -2618,17 +2631,11 @@ impl WidgetApp {
                         accent,
                     );
                 }
-                txt(21., 125., "重設".into(), 13., muted);
-                txt(
-                    78.,
-                    125.,
-                    view.as_ref()
-                        .and_then(|v| v.reset_at)
-                        .map(|t| duration(t - now()))
-                        .unwrap_or_else(|| "—".into()),
-                    13.,
-                    fg,
-                );
+                let reset = view
+                    .as_ref()
+                    .and_then(|v| v.reset_at)
+                    .map(|t| duration(t - now()))
+                    .unwrap_or_else(|| "—".into());
                 let rate = view
                     .as_ref()
                     .and_then(|v| v.rate_per_hour)
@@ -2647,12 +2654,56 @@ impl WidgetApp {
                         }
                     })
                     .unwrap_or_else(|| "—".into());
+                let short_credit = credit_text
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| credit_text.clone());
+                let short_rate = view
+                    .as_ref()
+                    .and_then(|v| v.rate_per_hour)
+                    .map(|r| format!("{r:.2}%/時"))
+                    .unwrap_or_else(|| "等待量測".into());
+                let reminder = reset_reminder_at(&self.settings.reset_reminder_local);
+                let mut summary = vec![
+                    format!("重設 {reset}"),
+                    format!("消耗 {short_rate}"),
+                    format!("點數 {short_credit}"),
+                ];
+                if let Some(target) = reminder {
+                    summary.push(format!("提醒 {}", reset_reminder_countdown(target, now())));
+                }
+                for (index, text) in summary.into_iter().enumerate() {
+                    let y = 40. + index as f32 * 17.;
+                    let available = 149. * sx;
+                    let measured = painter
+                        .layout_no_wrap(text.clone(), FontId::proportional(font_size), fg)
+                        .size()
+                        .x;
+                    let fitted = font_size * (available / measured.max(1.)).min(1.);
+                    painter.text(
+                        pt(145., y),
+                        Align2::LEFT_TOP,
+                        text,
+                        FontId::proportional(fitted),
+                        fg,
+                    );
+                }
                 ui.interact(
-                    Rect::from_min_max(pt(21., 121.), pt(265., 146.)),
+                    Rect::from_min_max(pt(145., 40.), pt(294., 104.)),
                     ui.id().with("quota-details"),
                     Sense::hover(),
                 )
-                .on_hover_text(format!("估計消耗：{rate}\n點數：{credit_text}"));
+                .on_hover_text(format!(
+                    "重設：{reset}\n估計消耗：{rate}\n點數：{credit_text}{}",
+                    reminder
+                        .map(|_| format!(
+                            "\n自訂提醒：{} UTC+08",
+                            self.settings.reset_reminder_local
+                        ))
+                        .unwrap_or_default()
+                ));
                 if widget_icon(
                     ui,
                     Rect::from_min_max(pt(272., 122.), pt(294., 144.)),
@@ -4190,6 +4241,24 @@ impl WidgetApp {
             }
             ui.label("Aa 中文預覽");
         });
+        ui.separator();
+        ui.strong("自訂重設提醒（UTC+08）");
+        ui.label("輸入 YYYY-MM-DD HH:MM；留空停用。時間由你設定。到時顯示「已到時間」。");
+        if ui
+            .text_edit_singleline(&mut self.settings.reset_reminder_local)
+            .changed()
+        {
+            self.dirty = true;
+        }
+        if !self.settings.reset_reminder_local.trim().is_empty()
+            && reset_reminder_at(&self.settings.reset_reminder_local).is_none()
+        {
+            ui.colored_label(Color32::YELLOW, "日期或時間格式不正確");
+        }
+        if ui.button("清除提醒").clicked() {
+            self.settings.reset_reminder_local.clear();
+            self.dirty = true;
+        }
         ui.separator();
         ui.strong("官方 Codex CLI（唯讀）");
         ui.label(self.quota_diagnostic_text());
@@ -7446,6 +7515,23 @@ mod quota_connection_recovery_tests {
 #[cfg(test)]
 mod responsive_close_tests {
     use super::*;
+    #[test]
+    fn reminder_uses_user_time_at_utc_plus_eight_and_stops_at_zero() {
+        let target = reset_reminder_at("2030-04-02 01:00").unwrap();
+        assert_eq!(
+            chrono::DateTime::from_timestamp(target, 0)
+                .unwrap()
+                .to_rfc3339(),
+            "2030-04-01T17:00:00+00:00"
+        );
+        assert_eq!(reset_reminder_countdown(target, target - 3660), "1時01分");
+        assert_eq!(reset_reminder_countdown(target, target - 1), "0時01分");
+        assert_eq!(reset_reminder_countdown(target, target), "已到時間");
+        assert_eq!(reset_reminder_countdown(target, target + 90), "已到時間");
+        assert!(reset_reminder_at("").is_none());
+        assert!(reset_reminder_at("2030-02-30 01:00").is_none());
+        assert!(Settings::default().reset_reminder_local.is_empty());
+    }
     fn app(root: &std::path::Path) -> WidgetApp {
         WidgetApp::new(
             Settings {
