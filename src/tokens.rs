@@ -612,7 +612,7 @@ impl Counts {
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
-struct SourceCursor {
+pub(crate) struct SourceCursor {
     offset: u64,
     generation: u64,
     prefix_len: usize,
@@ -916,7 +916,7 @@ struct RecordedTaskParent {
 pub struct StoreHeader {
     version: u32,
     normalization_version: u32,
-    sources: BTreeMap<String, SourceCursor>,
+    pub(crate) sources: BTreeMap<String, SourceCursor>,
     recorded_task_models: BTreeMap<String, BTreeSet<String>>,
     recorded_names: BTreeMap<String, RecordedTaskName>,
     recorded_parents: BTreeMap<String, RecordedTaskParent>,
@@ -937,6 +937,19 @@ pub struct StoreHeader {
     excluded_tasks: BTreeSet<String>,
 }
 impl StoreHeader {
+    /// SQLite stores cursors and quota payloads separately. Do not serialize
+    /// those large collections just to remove them from the metadata object.
+    pub(crate) fn database_metadata(&self) -> Value {
+        serde_json::json!({
+            "version":self.version, "normalization_version":self.normalization_version,
+            "recorded_task_models":self.recorded_task_models, "recorded_names":self.recorded_names,
+            "recorded_parents":self.recorded_parents, "metadata_path":self.metadata_path,
+            "metadata_cursor":self.metadata_cursor, "metadata_names":self.metadata_names,
+            "revision":self.revision, "next_sequence":self.next_sequence, "pricing":self.pricing,
+            "response_threads":self.response_threads, "anonymous_threads":self.anonymous_threads,
+            "anonymous_bounds_ms":self.anonymous_bounds_ms, "excluded_tasks":self.excluded_tasks
+        })
+    }
     /// Apply the only cross-thread usage dependency without rewriting all rows.
     /// False means that anonymous legacy usage is retained for audit but is not
     /// additive alongside authoritative responses with unprovable ownership.

@@ -462,7 +462,11 @@ impl TokenDb {
         read_revision(&self.conn)
     }
     pub fn header(&self) -> io::Result<StoreHeader> {
-        let header = (*self.header_shared()?).clone();
+        let shared = self.header_shared()?;
+        // Move the one full importer header instead of retaining a second copy
+        // of every quota payload and cursor in the connection's read cache.
+        self.header_cache.borrow_mut().take();
+        let header = Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone());
         cancellation::check()?;
         Ok(header)
     }
@@ -526,7 +530,7 @@ impl TokenDb {
         tx.commit().map_err(error)
     }
     /// Event projection needs attribution policy, never import cursors or quota history.
-    fn projection_header_shared(&self) -> io::Result<Arc<StoreHeader>> {
+    pub(crate) fn projection_header_shared(&self) -> io::Result<Arc<StoreHeader>> {
         let revision = self.revision()?;
         if let Some(header) = self.projection_header_cache.borrow().as_ref() {
             if revision == Some(header.revision) {
@@ -575,7 +579,9 @@ impl TokenDb {
         let object = header
             .as_object_mut()
             .ok_or_else(|| error("Invalid stored header"))?;
-        let mut sources = serde_json::Map::new();
+        object.insert("sources".into(), serde_json::json!({}));
+        object.insert("quota".into(), serde_json::json!([]));
+        let mut header: StoreHeader = json_decode(&encode(&header)?)?;
         let mut statement = self
             .conn
             .prepare("SELECT source_key,data FROM source_cursors ORDER BY source_key")
@@ -587,10 +593,9 @@ impl TokenDb {
             .map_err(error)?
         {
             let (key, bytes) = checked_row(row)?;
-            sources.insert(key, decode(&bytes)?);
+            header.sources.insert(key, decode(&bytes)?);
         }
-        object.insert("sources".into(), serde_json::Value::Object(sources));
-        let mut quota = Vec::<serde_json::Value>::new();
+
         let mut statement = self
             .conn
             .prepare("SELECT data FROM quota_chunks ORDER BY ordinal")
@@ -599,10 +604,13 @@ impl TokenDb {
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(error)?
         {
-            quota.extend(decode::<Vec<serde_json::Value>>(&checked_row(row)?)?);
+            header
+                .quota
+                .extend(decode::<Vec<crate::tokens::ImportedQuotaObservation>>(
+                    &checked_row(row)?,
+                )?);
         }
-        object.insert("quota".into(), serde_json::Value::Array(quota));
-        let header: StoreHeader = json_decode(&encode(&header)?)?;
+
         if revision != Some(header.revision) {
             return Err(error("Header revision does not match transaction revision"));
         }
@@ -888,7 +896,7 @@ impl TokenDb {
                 "Read-only token database",
             ));
         }
-        let old_header = self.header_shared().ok();
+        let old_header = self.projection_header_shared().ok();
         cancellation::check()?;
         let tx = self
             .conn
@@ -1066,19 +1074,10 @@ fn persist_header(
                 .map_err(error)?;
         }
     }
-    let mut value = to_value(header)?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| error("Invalid token header"))?;
-    let sources = object
-        .remove("sources")
-        .unwrap_or_else(|| serde_json::json!({}));
-    for (key, cursor) in sources
-        .as_object()
-        .ok_or_else(|| error("Invalid source cursor map"))?
-    {
+    let value = header.database_metadata();
+    for (key, cursor) in &header.sources {
         cancellation::check()?;
-        let body = encode(cursor)?;
+        let body = encode(&to_value(cursor)?)?;
         let digest = hash(&body)?;
         let old: Option<Vec<u8>> = tx
             .query_row(
@@ -1105,12 +1104,11 @@ fn persist_header(
         .collect::<io::Result<_>>()?;
     for key in old_keys {
         cancellation::check()?;
-        if !sources.as_object().expect("checked").contains_key(&key) {
+        if !header.sources.contains_key(&key) {
             tx.execute("DELETE FROM source_cursors WHERE source_key=?", [key])
                 .map_err(error)?;
         }
     }
-    object.remove("quota");
     for (ordinal, chunk) in header.quota.chunks(QUOTA_CHUNK).enumerate() {
         cancellation::check()?;
         let body = encode(chunk)?;
@@ -1942,6 +1940,25 @@ mod tests {
             threads: grouped.into_values().collect(),
         }
     }
+    #[test]
+    fn compact_metadata_preserves_all_fields_and_full_header_is_not_retained() {
+        let temp = TempDir::new().unwrap();
+        let mut db = TokenDb::open(&temp.path().join("tokens.sqlite3"), true).unwrap();
+        let data = export(vec![event("response", "thread", 10, false)], 1);
+        let mut expected = serde_json::to_value(&data.header).unwrap();
+        expected.as_object_mut().unwrap().remove("sources");
+        expected.as_object_mut().unwrap().remove("quota");
+        assert_eq!(data.header.database_metadata(), expected);
+        db.commit(&data, 0).unwrap();
+        let restored = db.header().unwrap();
+        assert_eq!(restored.database_metadata(), expected);
+        assert!(
+            db.header_cache.borrow().is_none(),
+            "full import evidence must be moved to its owner"
+        );
+        assert_eq!(db.query_events(None, None, false).unwrap().len(), 1);
+    }
+
     #[test]
     fn bounded_usage_query_does_not_decode_quota_history_or_import_cursors() {
         let dir = TempDir::new().unwrap();

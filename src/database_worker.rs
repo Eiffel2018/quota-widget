@@ -173,7 +173,11 @@ impl State {
         }
         // Commit diffs are canonical raw rows. Reapply the unchanged projection
         // policy and current prices before adjusting the displayed aggregates.
-        if let Some(header) = self.db.as_ref().and_then(|db| db.header_shared().ok()) {
+        if let Some(header) = self
+            .db
+            .as_ref()
+            .and_then(|db| db.projection_header_shared().ok())
+        {
             let policy = header.event_policy();
             let project = |event: &Option<TokenEvent>| {
                 event.as_ref().and_then(|e| {
@@ -240,7 +244,7 @@ impl State {
             self.pricing = pricing.clone();
             return Ok(());
         };
-        let header = db.header_shared()?;
+        let header = db.projection_header_shared()?;
         if header.pricing.as_ref() == Some(pricing) {
             self.pricing = pricing.clone();
             return Ok(());
@@ -371,7 +375,7 @@ impl State {
             io::Error::other("Token database unavailable; original data preserved")
         })?;
         let _read_snapshot = db.read_snapshot()?;
-        let header = db.header_shared()?;
+        let header = db.projection_header_shared()?;
         let counts = db.counts()?;
         let mut latest: Vec<TokenEvent> = db
             .latest_per_thread_before(self.request.now, false)?
