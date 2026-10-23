@@ -98,7 +98,11 @@ fn prepare_widget_settings(settings: &mut Settings) {
         settings.size[0] *= 0.94;
         settings.compact_layout_version = 2;
     }
-    settings.size[0] = settings.size[0].clamp(280., 1000.);
+    if settings.compact_layout_version < 3 {
+        settings.size[0] *= 0.92;
+        settings.compact_layout_version = 3;
+    }
+    settings.size[0] = settings.size[0].clamp(250., 1000.);
     settings.size[1] = COLLAPSED_HEIGHT * settings.size[0] / 310.;
 }
 
@@ -284,7 +288,7 @@ impl LayoutConvergence {
             self.next_retry = None;
             self.converged = false;
             self.quiet_since = Some(t);
-            plan.minimum = Some(Vec2::new(280., COLLAPSED_HEIGHT * actual.x / 310.));
+            plan.minimum = Some(Vec2::new(250., COLLAPSED_HEIGHT * actual.x / 310.));
         }
         if self
             .observed_size
@@ -1254,7 +1258,7 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
     prepare_widget_settings(&mut settings);
     let mut viewport = ViewportBuilder::default()
         .with_inner_size(settings.size)
-        .with_min_inner_size([280., COLLAPSED_HEIGHT * 280. / 310.])
+        .with_min_inner_size([250., COLLAPSED_HEIGHT * 250. / 310.])
         .with_max_inner_size([1000., 2000.])
         .with_decorations(false)
         .with_transparent(true)
@@ -2742,10 +2746,10 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.38".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.39".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
-                    .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(181., 35.)))
+                    .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
                     .text(
                         pt(33., 14.),
                         Align2::LEFT_TOP,
@@ -2894,13 +2898,6 @@ impl WidgetApp {
                 let short_rate = measured_rate
                     .map(|r| format!("{r:.2}%/時"))
                     .unwrap_or_else(|| "等待量測".into());
-                let short_rate = if view.as_ref().is_some_and(|v| v.rate_per_hour.is_none())
-                    && historical_rate.is_some()
-                {
-                    format!("{short_rate}（歷史）")
-                } else {
-                    short_rate
-                };
                 let short_rate = tr(short_rate);
                 let rate = tr(rate);
                 let short_credit = tr(short_credit);
@@ -7806,7 +7803,7 @@ mod database_display_tests {
         );
         assert_eq!(
             first.minimum,
-            Some(Vec2::new(280., COLLAPSED_HEIGHT * 430. / 310.))
+            Some(Vec2::new(250., COLLAPSED_HEIGHT * 430. / 310.))
         );
         assert!(
             first.size.is_none(),
@@ -8469,11 +8466,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.38", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.38", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.39", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.39", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.38",
+                "Codex Quota v3.39",
                 "Interface font size",
             ),
         ] {
@@ -8530,9 +8527,13 @@ mod accessible_ui_tests {
             ..Default::default()
         };
         prepare_widget_settings(&mut settings);
-        assert_eq!(settings.size, [282., 158. * 282. / 310.]);
+        assert_eq!(settings.size, [282. * 0.92, 158. * (282. * 0.92) / 310.]);
         prepare_widget_settings(&mut settings);
-        assert_eq!(settings.size[0], 282., "narrowing is a one-time migration");
+        assert_eq!(
+            settings.size[0],
+            282. * 0.92,
+            "narrowing is a one-time migration"
+        );
     }
 
     #[test]
