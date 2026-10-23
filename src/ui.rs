@@ -195,8 +195,7 @@ struct HistoryCache {
     table_rows: Vec<TableIntervalRow>,
     pending_segments: Vec<DailyQuotaSegment>,
     day_token_indices: Vec<usize>,
-    token_db_signature: Option<(PathBuf, u64, Option<std::time::SystemTime>)>,
-    token_db: Option<quota_widget::token_db::TokenDb>,
+    usage_receiver: Option<mpsc::Receiver<std::io::Result<CachedSegmentUsage>>>,
     next_segment: usize,
     weighted_usd: f64,
     weighted_points: f64,
@@ -271,6 +270,74 @@ fn segment_cache_path(
     Ok(dir
         .join("history-cache")
         .join(format!("{:x}.json", hash.finalize())))
+}
+
+// One bounded worker for the selected day. Dropping its receiver when changing
+// days stops the old calculation after its current query, with no stale UI rows.
+fn start_history_usage(
+    path: PathBuf,
+    segments: Vec<DailyQuotaSegment>,
+    writable_cache: bool,
+    ctx: egui::Context,
+) -> mpsc::Receiver<std::io::Result<CachedSegmentUsage>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut database = None;
+        for segment in segments {
+            let result = (|| {
+                let cache = segment_cache_path(&path, segment.start, segment.end).ok();
+                if let Some(usage) = cache
+                    .as_ref()
+                    .and_then(|cache| storage::load_json::<CachedSegmentUsage>(cache).ok())
+                {
+                    return Ok(usage);
+                }
+                if database.is_none() {
+                    database = Some(quota_widget::token_db::TokenDb::open_readonly(&path)?);
+                }
+                let start = segment.start.saturating_add(1);
+                let end = segment.end.saturating_add(1);
+                let mut events: BTreeMap<String, TokenEvent> =
+                    quota_widget::cycle_db::query_archived_events(
+                        path.parent().unwrap_or(std::path::Path::new(".")),
+                        start,
+                        end,
+                    )?
+                    .into_iter()
+                    .map(|event| (event.id.clone(), event))
+                    .collect();
+                for event in
+                    database
+                        .as_ref()
+                        .unwrap()
+                        .query_events(Some(start), Some(end), false)?
+                {
+                    events.insert(event.id.clone(), event);
+                }
+                let mut events: Vec<_> = events.into_values().collect();
+                events.sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+                let refs: Vec<_> = events.iter().collect();
+                let usage = CachedSegmentUsage {
+                    models: intervals::model_usage(refs.iter().copied()),
+                    counts: interval_task_counts(&refs),
+                    cost: accounting::CostIndex::new(&events).observed(segment.start, segment.end),
+                };
+                if let Some(cache) = cache.as_ref().filter(|_| writable_cache) {
+                    let _ = storage::save_json(cache, &usage);
+                }
+                Ok(usage)
+            })();
+            let failed = result.is_err();
+            if sender.send(result).is_err() {
+                break;
+            }
+            ctx.request_repaint();
+            if failed {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 struct WidgetApp {
@@ -2299,13 +2366,13 @@ impl WidgetApp {
                     .as_ref()
                     .map(|v| {
                         if v.window_duration_mins == Some(10080) {
-                            "每週額度 v3.28".to_owned()
+                            "每週額度 v3.29".to_owned()
                         } else {
                             v.window_label.clone()
                         }
                     })
                     .unwrap_or_else(|| {
-                        "每週額度 v3.28".to_owned()
+                        "每週額度 v3.29".to_owned()
                     });
                 painter.circle_filled(
                     pt(22., 24.),
@@ -2635,6 +2702,7 @@ impl WidgetApp {
                 // Reopening explicitly refreshes the selected day once.
                 self.history_cache.key = None;
                 self.history_cache.work_key = None;
+                self.history_cache.usage_receiver = None;
             }
         }
         if self.tokens_open {
@@ -2671,26 +2739,6 @@ impl WidgetApp {
                 },
             );
         }
-    }
-    fn history_token_db(
-        &mut self,
-        path: &std::path::Path,
-    ) -> std::io::Result<&quota_widget::token_db::TokenDb> {
-        let metadata = std::fs::metadata(path)?;
-        let signature = (path.to_path_buf(), metadata.len(), metadata.modified().ok());
-        if self.history_cache.token_db_signature.as_ref() != Some(&signature) {
-            self.history_cache.token_db = None;
-            self.history_cache.token_db_signature = Some(signature);
-        }
-        if self.history_cache.token_db.is_none() {
-            self.history_cache.token_db =
-                Some(quota_widget::token_db::TokenDb::open_readonly(path)?);
-        }
-        Ok(self
-            .history_cache
-            .token_db
-            .as_ref()
-            .expect("database opened above"))
     }
     fn history_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("扣額紀錄");
@@ -2830,6 +2878,7 @@ impl WidgetApp {
             self.history_cache.pending_segments.clear();
             self.history_cache.day_token_indices.clear();
             self.history_cache.next_segment = 0;
+            self.history_cache.usage_receiver = None;
             self.history_cache.weighted_usd = 0.0;
             self.history_cache.weighted_points = 0.0;
             self.history_cache.weighted_samples = 0;
@@ -2868,98 +2917,70 @@ impl WidgetApp {
                     }
                 }
             }
+            if let Some(view) = self
+                .tokens
+                .database
+                .as_ref()
+                .filter(|_| self.history_intervals)
+            {
+                self.history_cache.usage_receiver = Some(start_history_usage(
+                    view.database_path.clone(),
+                    self.history_cache.pending_segments.clone(),
+                    self._lock.is_some(),
+                    ui.ctx().clone(),
+                ));
+            }
             self.history_cache.work_key = Some(key.clone());
         }
-        if self.history_cache.work_key.as_ref() == Some(&key)
+        let calculation_frame = Instant::now();
+        while self.history_cache.work_key.as_ref() == Some(&key)
             && self.history_cache.next_segment < self.history_cache.pending_segments.len()
         {
             let segment =
                 self.history_cache.pending_segments[self.history_cache.next_segment].clone();
-            let database_path = self
-                .tokens
-                .database
-                .as_ref()
-                .map(|view| view.database_path.clone());
-            let cache_path = database_path
-                .as_ref()
-                .and_then(|path| segment_cache_path(path, segment.start, segment.end).ok());
-            let cached = cache_path
-                .as_ref()
-                .and_then(|path| storage::load_json::<CachedSegmentUsage>(path).ok());
-            let (models, task_counts, cost) = if let Some(cached) = cached {
-                (cached.models, cached.counts, cached.cost)
+            let usage = if let Some(receiver) = &self.history_cache.usage_receiver {
+                match receiver.try_recv() {
+                    Ok(usage) => usage,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        ui.ctx().request_repaint_after(Duration::from_millis(50));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Err(std::io::Error::other("History worker stopped"))
+                    }
+                }
             } else {
-                let loaded_segment = if let Some(path) = database_path {
-                    self.history_token_db(&path).and_then(|db| {
-                        let start = segment.start.saturating_add(1);
-                        let end = segment.end.saturating_add(1);
-                        let mut events: BTreeMap<String, TokenEvent> =
-                            quota_widget::cycle_db::query_archived_events(
-                                path.parent().unwrap_or(std::path::Path::new(".")),
-                                start,
-                                end,
-                            )?
-                            .into_iter()
-                            .map(|event| (event.id.clone(), event))
-                            .collect();
-                        // The active database wins where the archive overlaps a recent import.
-                        for event in db.query_events(Some(start), Some(end), false)? {
-                            events.insert(event.id.clone(), event);
-                        }
-                        let mut events: Vec<_> = events.into_values().collect();
-                        events.sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
-                        Ok(events)
-                    })
-                } else {
-                    Ok(Vec::new())
-                };
-                let Ok(loaded_segment) = loaded_segment else {
-                    self.history_cache.calculation_error =
-                        Some("無法讀取此區間的 Token 資料；請重新開啟扣額記錄重試。".into());
-                    self.history_cache.key = Some(key.clone());
-                    self.history_cache.work_key = None;
-                    self.completed_intervals_table(ui);
-                    return;
-                };
                 let tokens = self.tokens.events();
-                let segment_owned: Vec<TokenEvent>;
-                let segment_events: Vec<&TokenEvent>;
-                if self.tokens.database.is_some() {
-                    segment_owned = loaded_segment;
-                    segment_events = segment_owned.iter().collect();
-                } else {
-                    let lo = self
-                        .history_cache
-                        .day_token_indices
-                        .partition_point(|&index| tokens[index].timestamp <= segment.start);
-                    let hi = self
-                        .history_cache
-                        .day_token_indices
-                        .partition_point(|&index| tokens[index].timestamp <= segment.end);
-                    segment_events = self.history_cache.day_token_indices[lo..hi]
-                        .iter()
-                        .map(|&index| &tokens[index])
-                        .collect();
-                    segment_owned = Vec::new();
-                }
-                let models = intervals::model_usage(segment_events.iter().copied());
-                let task_counts = interval_task_counts(&segment_events);
-                let cost = if self.tokens.database.is_some() {
-                    accounting::CostIndex::new(&segment_owned).observed(segment.start, segment.end)
-                } else {
-                    self.tokens.cost_index.observed(segment.start, segment.end)
-                };
-                if let Some(path) = cache_path.as_ref().filter(|_| self._lock.is_some()) {
-                    let _ = storage::save_json(
-                        path,
-                        &CachedSegmentUsage {
-                            models: models.clone(),
-                            counts: task_counts,
-                            cost,
-                        },
-                    );
-                }
-                (models, task_counts, cost)
+                let lo = self
+                    .history_cache
+                    .day_token_indices
+                    .partition_point(|&index| tokens[index].timestamp <= segment.start);
+                let hi = self
+                    .history_cache
+                    .day_token_indices
+                    .partition_point(|&index| tokens[index].timestamp <= segment.end);
+                let events: Vec<_> = self.history_cache.day_token_indices[lo..hi]
+                    .iter()
+                    .map(|&index| &tokens[index])
+                    .collect();
+                Ok(CachedSegmentUsage {
+                    models: intervals::model_usage(events.iter().copied()),
+                    counts: interval_task_counts(&events),
+                    cost: self.tokens.cost_index.observed(segment.start, segment.end),
+                })
+            };
+            let Ok(CachedSegmentUsage {
+                models,
+                counts: task_counts,
+                cost,
+            }) = usage
+            else {
+                self.history_cache.calculation_error =
+                    Some("無法讀取此區間的 Token 資料；請重新開啟扣額記錄重試。".into());
+                self.history_cache.key = Some(key.clone());
+                self.history_cache.work_key = None;
+                self.history_cache.usage_receiver = None;
+                break;
             };
             let presentation = segment.event.as_ref().map_or_else(
                 || active_segment_presentation(segment.change.clone(), segment.start, cost),
@@ -3000,7 +3021,14 @@ impl WidgetApp {
             } else {
                 ui.ctx().request_repaint_after(Duration::from_millis(16));
             }
-        } else if self.history_cache.work_key.as_ref() == Some(&key)
+            // Drain already-computed database rows without forcing one frame per row.
+            if self.history_cache.usage_receiver.is_none()
+                || calculation_frame.elapsed() >= Duration::from_millis(8)
+            {
+                break;
+            }
+        }
+        if self.history_cache.work_key.as_ref() == Some(&key)
             && self.history_cache.pending_segments.is_empty()
         {
             self.history_cache.key = Some(key.clone());
@@ -5936,6 +5964,142 @@ mod database_display_tests {
         db_view::{DailyView, DatabaseView},
         tokens::TokenSummary,
     };
+
+    #[test]
+    fn history_worker_preserves_boundaries_response_counts_costs_and_cached_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut records = String::new();
+        let base = now() - 300;
+        for (id, timestamp) in [("a", 100), ("b", 101), ("c", 110), ("d", 111)] {
+            records.push_str(
+                &serde_json::json!({
+                    "timestamp":base + timestamp, "type":"token_usage_record",
+                    "payload":{"thread_id":"test", "response_id":id, "model":"gpt-6-luna",
+                        "usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0}}
+                })
+                .to_string(),
+            );
+            records.push('\n');
+        }
+        std::fs::write(dir.path().join("records.jsonl"), records).unwrap();
+        let mut store = TokenStore::default();
+        store
+            .import_dir(dir.path(), &Pricing::official_standard())
+            .unwrap();
+        let legacy = dir.path().join("tokens.json");
+        store.save(&legacy).unwrap();
+        let path = quota_widget::token_db::TokenDb::open_or_migrate(&legacy, true, &mut |_| {})
+            .unwrap()
+            .unwrap()
+            .path()
+            .to_owned();
+        let segments: Vec<_> = [(110, 120), (100, 110)]
+            .into_iter()
+            .map(|(start, end)| DailyQuotaSegment {
+                start: base + start,
+                end: base + end,
+                event: None,
+                change: String::new(),
+                points: 1.,
+            })
+            .collect();
+        let _reader = quota_widget::token_db::TokenDb::open_readonly(&path).unwrap();
+        let mut previous = Vec::new();
+        for pass in 0..2 {
+            let receiver = start_history_usage(
+                path.clone(),
+                segments.clone(),
+                true,
+                egui::Context::default(),
+            );
+            let mut results = Vec::new();
+            for (segment, expected) in segments.iter().zip([1, 2]) {
+                let usage = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(usage.counts[3], expected);
+                assert_eq!(usage.cost.events, expected);
+                let direct =
+                    accounting::CostIndex::new(store.events()).observed(segment.start, segment.end);
+                assert!((usage.cost.known_usd - direct.known_usd).abs() < 1e-10);
+                assert!(usage.cost.known_usd > 0.);
+                results.push(serde_json::to_string(&usage).unwrap());
+            }
+            if pass == 0 {
+                previous = results;
+            } else {
+                assert_eq!(results, previous);
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("history-cache"))
+                .unwrap()
+                .count(),
+            2
+        );
+        // A cancelled page must not retain a worker blocked on its bounded channel.
+        drop(start_history_usage(
+            path,
+            segments,
+            false,
+            egui::Context::default(),
+        ));
+    }
+
+    // Opt-in, read-only measurement of the actual history-page calculation.
+    #[test]
+    #[ignore = "set QUOTA_HISTORY_BENCH_DB to a local database"]
+    fn measure_real_history_page() {
+        let path = PathBuf::from(std::env::var_os("QUOTA_HISTORY_BENCH_DB").unwrap());
+        let db = quota_widget::token_db::TokenDb::open_readonly(&path).unwrap();
+        let history = quota_widget::history::normalized(&db.history_events().unwrap());
+        let mut app = app();
+        Arc::get_mut(&mut app.tokens)
+            .unwrap()
+            .database
+            .as_mut()
+            .unwrap()
+            .database_path = path;
+        app.history = Arc::new(history);
+        app.history_generation += 1;
+        let mut dates: Vec<_> = app
+            .history
+            .iter()
+            .filter_map(|event| local_day(event.observed_at_unix))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .rev()
+            .take(3)
+            .collect();
+        dates.reverse();
+        let ctx = egui::Context::default();
+        for date in dates {
+            app.date = date;
+            let began = Instant::now();
+            let mut maximum = Duration::ZERO;
+            let mut frames = 0;
+            loop {
+                let frame = Instant::now();
+                let _ = ctx.run(Default::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.history_ui(ui));
+                });
+                maximum = maximum.max(frame.elapsed());
+                frames += 1;
+                assert!(app.history_cache.calculation_error.is_none());
+                if app.history_cache.work_key.is_none() {
+                    break;
+                }
+                assert!(frames < 2000);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            eprintln!(
+                "history {date}: rows={} frames={frames} calculation={:?} max_frame={maximum:?}",
+                app.history_cache.table_rows.len(),
+                began.elapsed()
+            );
+        }
+    }
 
     fn app() -> WidgetApp {
         let mut app = WidgetApp::new(
