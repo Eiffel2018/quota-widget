@@ -30,6 +30,9 @@ pub struct Settings {
     pub compact_layout_version: u32,
     pub font_scale_percent: u32,
     pub reset_reminder_local: String,
+    pub utc_offset_minutes: i32,
+    pub reset_prediction_utc: Option<i64>,
+    pub reset_prediction_set_at: Option<i64>,
     pub reset_sound_enabled: bool,
     pub sessions_path: String,
     pub import_enabled: bool,
@@ -54,11 +57,25 @@ impl Default for Settings {
             compact_layout_version: 1,
             font_scale_percent: 100,
             reset_reminder_local: String::new(),
+            utc_offset_minutes: 480,
+            reset_prediction_utc: None,
+            reset_prediction_set_at: None,
             reset_sound_enabled: true,
             sessions_path: default_sessions().to_string_lossy().into(),
             import_enabled: true,
             pricing: Pricing::official_standard(),
         }
+    }
+}
+impl Settings {
+    pub fn prediction_target(&self) -> Option<i64> {
+        self.reset_prediction_utc
+            .or_else(|| crate::display_time::parse_local(&self.reset_reminder_local, 480))
+    }
+    pub fn clear_prediction(&mut self) {
+        self.reset_reminder_local.clear();
+        self.reset_prediction_utc = None;
+        self.reset_prediction_set_at = None;
     }
 }
 fn default_bucket() -> String {

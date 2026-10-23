@@ -61,7 +61,7 @@ CLI 回傳的額度格式不支援；請在設定檢查來源。	Unsupported CLI
 深色外觀	Dark appearance	深色外观
 保持最上層	Always on top	保持最上层
 關閉小工具	Close widget	关闭小工具
-Codex 額度 v3.34	Codex Quota v3.34	Codex 额度 v3.34
+Codex 額度 v3.35	Codex Quota v3.35	Codex 额度 v3.35
 扣額紀錄	Quota history	扣额记录
 Token明細	Token details	Token明细
 — 等待量測	— Awaiting samples	— 等待量测
@@ -351,3 +351,14 @@ Token 記錄有覆蓋缺口	Gaps in token coverage	Token 记录有覆盖缺口
 起迄時間無法形成區間	Invalid start / end interval	起迄时间无法形成区间
 回補後首個區間，不與一般扣額區間比較	First interval after replenishment; excluded from normal comparisons	回补後首个区间，不与一般扣额区间比较
 多個帳戶的 Token 歸屬無法確認	Token attribution across accounts unconfirmed	多个帐户的 Token 归属无法确认
+Reset預測	Reset prediction	Reset预测
+設定或清除 Reset 預測	Set or clear reset prediction	设置或清除 Reset 预测
+Tibo 已公告了Reset時間嗎?	Has Tibo announced a reset time?	Tibo 已公告了Reset时间吗?
+請輸入時間（YYYY-MM-DD HH:MM）	Enter time (YYYY-MM-DD HH:MM)	请输入时间（YYYY-MM-DD HH:MM）
+顯示時區	Display time zone	显示时区
+時間 {} · Token 成本估算 USD	Time {} · Estimated token cost USD	时间 {} · Token 成本估算 USD
+Token 明細 · {}	Token details · {}	Token 明细 · {}
+變化時間（{}）	Change time ({})	变化时间（{}）
+最近 5 次扣額 · {}	Last 5 quota drops · {}	最近 5 次扣额 · {}
+時間{}	Time {}	时间{}
+顯示時間: {}	Display time: {}	显示时间: {}

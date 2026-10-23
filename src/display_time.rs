@@ -1,16 +1,48 @@
-//! Presentation-only Hong Kong time. Stored timestamps remain UTC Unix seconds.
-//!
-//! Use an explicit fixed offset rather than the host's local timezone or an IANA
-//! timezone database: the widget always displays UTC+08:00, including old dates.
+//! Configurable fixed-offset presentation. Stored timestamps remain UTC Unix seconds.
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, SecondsFormat, Utc};
 use serde_json::Value;
 
 pub const OFFSET_LABEL: &str = "+08:00";
 pub const DISPLAY_ZONE: &str = "Asia/Hong_Kong (UTC+08:00)";
-const OFFSET_SECONDS: i32 = 8 * 60 * 60;
+thread_local! { static OFFSET_MINUTES: std::cell::Cell<i32> = const { std::cell::Cell::new(480) }; }
+
+/// A presentation scope stays on its calling thread. Background exports receive
+/// the saved offset explicitly; storage epochs and database indexes remain UTC.
+pub struct ZoneScope(i32, std::marker::PhantomData<std::rc::Rc<()>>);
+impl Drop for ZoneScope {
+    fn drop(&mut self) {
+        OFFSET_MINUTES.with(|offset| offset.set(self.0));
+    }
+}
+pub fn scope(minutes: i32) -> ZoneScope {
+    let old = OFFSET_MINUTES.with(|offset| offset.replace(minutes.clamp(-720, 840)));
+    ZoneScope(old, std::marker::PhantomData)
+}
+pub fn offset_minutes() -> i32 {
+    OFFSET_MINUTES.with(|offset| offset.get())
+}
+pub fn offset_label() -> String {
+    let minutes = offset_minutes();
+    format!(
+        "{}{:02}:{:02}",
+        if minutes < 0 { "-" } else { "+" },
+        minutes.abs() / 60,
+        minutes.abs() % 60
+    )
+}
+pub fn zone_label() -> String {
+    format!("UTC{}", offset_label())
+}
+pub fn parse_local(value: &str, minutes: i32) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M")
+        .ok()?
+        .and_utc()
+        .timestamp()
+        .checked_sub(i64::from(minutes.clamp(-720, 840)) * 60)
+}
 
 pub fn timezone() -> FixedOffset {
-    FixedOffset::east_opt(OFFSET_SECONDS).expect("UTC+08:00 is a valid fixed offset")
+    FixedOffset::east_opt(offset_minutes() * 60).expect("validated fixed offset")
 }
 
 fn zoned(timestamp: i64) -> Option<DateTime<FixedOffset>> {
@@ -18,7 +50,7 @@ fn zoned(timestamp: i64) -> Option<DateTime<FixedOffset>> {
     // A valid UTC timestamp can still exceed chrono's local-calendar range once
     // the offset is applied. Check before date/format methods can panic.
     utc.naive_utc()
-        .checked_add_signed(Duration::seconds(i64::from(OFFSET_SECONDS)))?;
+        .checked_add_signed(Duration::seconds(i64::from(offset_minutes()) * 60))?;
     Some(utc.with_timezone(&timezone()))
 }
 
@@ -52,7 +84,7 @@ pub fn now_day() -> NaiveDate {
 pub fn day_bounds(day: NaiveDate) -> Option<(i64, i64)> {
     let start = day
         .and_hms_opt(0, 0, 0)?
-        .checked_sub_signed(Duration::seconds(i64::from(OFFSET_SECONDS)))?
+        .checked_sub_signed(Duration::seconds(i64::from(offset_minutes()) * 60))?
         .and_utc()
         .timestamp();
     Some((start, start.checked_add(24 * 60 * 60)?))
@@ -99,8 +131,12 @@ pub fn annotate_timestamps(value: &mut Value) {
                 };
                 let raw = raw.clone();
                 let display = raw.as_i64().and_then(datetime).map(Value::String);
-                object.insert(format!("{key}_utc_unix"), raw);
-                object.insert(format!("{key}_hk"), display.unwrap_or(Value::Null));
+                object.insert(format!("{key}_utc_unix"), raw.clone());
+                object.insert(format!("{key}_local"), display.unwrap_or(Value::Null));
+                // Retain the older explicitly Hong Kong field in its original zone.
+                let _legacy_zone = scope(480);
+                let hk = raw.as_i64().and_then(datetime).map(Value::String);
+                object.insert(format!("{key}_hk"), hk.unwrap_or(Value::Null));
             }
         }
         _ => {}

@@ -245,3 +245,36 @@ fn prediction_reset_and_task_epoch_aliases_preserve_durations() {
         assert!(row.get(format!("{key}_utc_unix")).is_none());
     }
 }
+
+#[test]
+fn configured_offset_is_scoped_and_prediction_is_an_absolute_instant() {
+    let utc8 = display_time::parse_local("2030-04-02 01:00", 480).unwrap();
+    let pst = display_time::parse_local("2030-04-01 09:00", -480).unwrap();
+    assert_eq!(utc8, pst);
+    let mut settings = quota_widget::storage::Settings::default();
+    settings.reset_reminder_local = "2030-04-02 01:00".into();
+    assert_eq!(settings.prediction_target(), Some(utc8));
+    {
+        let _zone = display_time::scope(-480);
+        assert_eq!(display_time::zone_label(), "UTC-08:00");
+        assert_eq!(display_time::time(utc8), "09:00:00");
+        let (start, end) = display_time::day_bounds(date(2030, 4, 1)).unwrap();
+        assert_eq!(end - start, 86400);
+        assert!(start <= utc8 && utc8 < end);
+        assert_eq!(settings.prediction_target(), Some(utc8));
+        std::thread::spawn(|| assert_eq!(display_time::zone_label(), "UTC+08:00"))
+            .join()
+            .unwrap();
+        let mut value = serde_json::json!({"timestamp":utc8});
+        display_time::annotate_timestamps(&mut value);
+        assert_eq!(value["timestamp"], utc8);
+        assert!(value["timestamp_local"]
+            .as_str()
+            .unwrap()
+            .ends_with("-08:00"));
+        assert!(value["timestamp_hk"].as_str().unwrap().ends_with("+08:00"));
+    }
+    assert_eq!(display_time::zone_label(), "UTC+08:00");
+    let _zone = display_time::scope(345);
+    assert_eq!(display_time::zone_label(), "UTC+05:45");
+}

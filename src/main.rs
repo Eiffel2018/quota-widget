@@ -35,7 +35,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|s| s == "--help" || s == "-h") {
-        println!("Quota Widget {}\nNative read-only Codex quota + local token history.\n\nGUI:\n  quota-widget [--demo|--offline] [--no-settings] [--data-dir PATH]\n  --demo         Synthetic data only; never starts CLI or scans real sessions\n  --offline      Never starts CLI; local import remains user-configurable\n  --no-settings  Ephemeral state; no preference/history loading or saving\n  --show-tokens  Open daily token details\n  --show-history Open daily quota history\n\nMachine interface:\n  quota-widget inspect --sessions PATH [--state PATH] [--pricing PATH]\n    Read-only import. JSON schema version 1 on stdout. Does not modify inputs.\n  quota-widget import --sessions PATH --state PATH [--pricing PATH]\n    Incrementally import into SQLite state, guarded by writer lock.\n  quota-widget export --state PATH --output PATH\n    Export complete current accounting to a new compatibility JSON file.\n  quota-widget --version\n\nExit codes: 0 success, 1 invalid arguments or operation failed.\nNo login, inference, purchases, or credential handling.", env!("CARGO_PKG_VERSION"));
+        println!("Quota Widget {}\nNative read-only Codex quota + local token history.\n\nGUI:\n  quota-widget [--demo|--offline] [--no-settings] [--data-dir PATH]\n  --demo         Synthetic data only; never starts CLI or scans real sessions\n  --offline      Never starts CLI; local import remains user-configurable\n  --no-settings  Ephemeral state; no preference/history loading or saving\n  --show-tokens  Open daily token details\n  --show-history Open daily quota history\n  --show-settings Open settings and connection window\n\nMachine interface:\n  quota-widget inspect --sessions PATH [--state PATH] [--pricing PATH]\n    Read-only import. JSON schema version 1 on stdout. Does not modify inputs.\n  quota-widget import --sessions PATH --state PATH [--pricing PATH]\n    Incrementally import into SQLite state, guarded by writer lock.\n  quota-widget export --state PATH --output PATH\n    Export complete current accounting to a new compatibility JSON file.\n  quota-widget --version\n\nExit codes: 0 success, 1 invalid arguments or operation failed.\nNo login, inference, purchases, or credential handling.", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args.iter().any(|s| s == "--version") {
@@ -189,6 +189,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "--no-settings",
         "--show-tokens",
         "--show-history",
+        "--show-settings",
         "--data-dir",
     ];
     let mut i = 0;

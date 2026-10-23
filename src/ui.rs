@@ -31,10 +31,9 @@ use std::{
 
 const COLLAPSED_HEIGHT: f32 = 184.;
 
+#[cfg(test)]
 fn reset_reminder_at(value: &str) -> Option<i64> {
-    chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M")
-        .ok()
-        .map(|v| v.and_utc().timestamp() - 8 * 3600)
+    display_time::parse_local(value, 480)
 }
 
 fn reset_reminder_countdown(target: i64, current: i64) -> String {
@@ -527,6 +526,12 @@ struct WidgetApp {
     history_selection: Option<(String, Option<String>, String)>,
     tokens_open: bool,
     settings_open: bool,
+    settings_presented: bool,
+    prediction_open: bool,
+    prediction_presented: bool,
+    prediction_input: String,
+    prediction_pst: bool,
+    prediction_history_checked: Option<(u64, i64, i64)>,
     date: NaiveDate,
     token_date: NaiveDate,
     token_group: GroupBy,
@@ -1293,6 +1298,7 @@ impl WidgetApp {
         offline: bool,
         args: Vec<String>,
     ) -> Self {
+        let _zone = display_time::scope(settings.utc_offset_minutes);
         Self {
             settings,
             dir,
@@ -1334,7 +1340,13 @@ impl WidgetApp {
             recent_expanded: false,
             history_open: args.iter().any(|s| s == "--show-history"),
             tokens_open: args.iter().any(|s| s == "--show-tokens"),
-            settings_open: false,
+            settings_open: args.iter().any(|s| s == "--show-settings"),
+            settings_presented: false,
+            prediction_open: false,
+            prediction_presented: false,
+            prediction_input: String::new(),
+            prediction_pst: false,
+            prediction_history_checked: None,
             date: display_time::now_day(),
             token_date: display_time::now_day(),
             token_group: GroupBy::Response,
@@ -1774,13 +1786,15 @@ impl WidgetApp {
                             let events = std::mem::take(&mut self.quota.history);
                             if !self.demo
                                 && !account_changed
-                                && self.settings.reset_sound_enabled
                                 && self
                                     .selected()
                                     .is_some_and(|view| live_reset_alert(&events, &view))
-                                && !play_reset_chime()
                             {
-                                self.notice = "額度已重設至 100%；提示音播放失敗。".into();
+                                self.settings.clear_prediction();
+                                self.dirty = true;
+                                if self.settings.reset_sound_enabled && !play_reset_chime() {
+                                    self.notice = "額度已重設至 100%；提示音播放失敗。".into();
+                                }
                             }
                             self.send_work(WorkCommand::MergeHistory {
                                 events,
@@ -2219,7 +2233,7 @@ impl WidgetApp {
             self.tokens.events(),
             Some(&wanted),
         );
-        let mut recent_tooltip = String::from("最近 5 次扣額 · UTC+8\n");
+        let mut recent_tooltip = format!("最近 5 次扣額 · {}\n", display_time::zone_label());
         if recent_events.is_empty() {
             recent_tooltip.push_str("已完成區間：0\n");
         }
@@ -2371,7 +2385,7 @@ impl WidgetApp {
         );
         if let Some(e) = self.tokens.events().get(task.latest_event_index) {
             text.push_str(&format!(
-                "\n{}\nReasoning effort: {}\n香港時間: {}",
+                "\n{}\nReasoning effort: {}\n顯示時間: {}",
                 self.event_pricing_tooltip(e),
                 e.reasoning_effort.as_deref().unwrap_or("未知"),
                 display_time::datetime(e.timestamp).unwrap_or_else(|| "未知".into())
@@ -2557,7 +2571,7 @@ impl WidgetApp {
                 }
                 drag.context_menu(|ui| {
                     if ui.button(tr("設定 / 連接")).clicked() {
-                        self.settings_open = true;
+                        self.open_settings();
                         ui.close();
                     }
                     if ui.button(tr("更新額度")).clicked() {
@@ -2588,7 +2602,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.34".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.35".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(181., 35.)))
@@ -2740,7 +2754,7 @@ impl WidgetApp {
                 let short_rate = tr(short_rate);
                 let rate = tr(rate);
                 let short_credit = tr(short_credit);
-                let reminder = reset_reminder_at(&self.settings.reset_reminder_local);
+                let reminder = self.settings.prediction_target();
                 let summary = [
                     format!("重設 {reset}"),
                     format!("消耗 {short_rate}"),
@@ -2772,52 +2786,70 @@ impl WidgetApp {
                     "重設：{reset}\n估計消耗：{rate}\n點數：{credit_text}{}",
                     reminder
                         .map(|_| format!(
-                            "\n自訂提醒：{} UTC+08",
-                            self.settings.reset_reminder_local
+                            "\n自訂提醒：{}",
+                            reminder
+                                .and_then(display_time::datetime)
+                                .unwrap_or_default()
                         ))
                         .unwrap_or_default()
                 )));
-                let prediction_title = "下次 reset 預測：";
-                let title_width = painter
-                    .layout_no_wrap(tr(prediction_title), FontId::proportional(font_size), fg)
-                    .size()
-                    .x;
-                painter.text(
-                    pt(21., 120.),
-                    Align2::LEFT_TOP,
-                    tr(prediction_title),
-                    FontId::proportional(font_size * (155. * sx / title_width.max(1.)).min(1.)),
-                    fg,
-                );
-                let reminder_now = now();
-                let timer_color = if reminder.is_some_and(|target| reminder_now > target) {
-                    if self.settings.dark {
-                        Color32::from_rgb(255, 120, 110)
-                    } else {
-                        Color32::from_rgb(184, 35, 35)
+                if reminder.is_none() {
+                    if ui
+                        .put(
+                            Rect::from_min_max(pt(21., 128.), pt(166., 161.)),
+                            egui::Button::new(RichText::new(tr("Reset預測")).size(font_size)),
+                        )
+                        .clicked()
+                    {
+                        self.open_prediction();
                     }
                 } else {
-                    fg
-                };
-                painter.text(
-                    pt(21., 141.),
-                    Align2::LEFT_TOP,
-                    tr(reminder
-                        .map(|target| reset_reminder_countdown(target, reminder_now))
-                        .unwrap_or_else(|| "未設定".into())),
-                    FontId::proportional((18. * scale * font_multiplier).max(font_size)),
-                    timer_color,
-                );
-                if ui
-                    .interact(
-                        Rect::from_min_max(pt(21., 117.), pt(176., 171.)),
-                        ui.id().with("reset-prediction"),
-                        Sense::click(),
-                    )
-                    .on_hover_text(tr("自行設定預測時間（UTC+08）；按此修改或清除"))
-                    .clicked()
-                {
-                    self.settings_open = true;
+                    let prediction_title = if reminder.is_some() {
+                        "下次 reset 預測："
+                    } else {
+                        "Reset預測"
+                    };
+                    let title_width = painter
+                        .layout_no_wrap(tr(prediction_title), FontId::proportional(font_size), fg)
+                        .size()
+                        .x;
+                    painter.text(
+                        pt(21., 120.),
+                        Align2::LEFT_TOP,
+                        tr(prediction_title),
+                        FontId::proportional(font_size * (155. * sx / title_width.max(1.)).min(1.)),
+                        fg,
+                    );
+                    let reminder_now = now();
+                    let timer_color = if reminder.is_some_and(|target| reminder_now > target) {
+                        if self.settings.dark {
+                            Color32::from_rgb(255, 120, 110)
+                        } else {
+                            Color32::from_rgb(184, 35, 35)
+                        }
+                    } else {
+                        fg
+                    };
+                    painter.text(
+                        pt(21., 141.),
+                        Align2::LEFT_TOP,
+                        tr(reminder
+                            .map(|target| reset_reminder_countdown(target, reminder_now))
+                            .unwrap_or_else(|| "未設定".into())),
+                        FontId::proportional((18. * scale * font_multiplier).max(font_size)),
+                        timer_color,
+                    );
+                    if ui
+                        .interact(
+                            Rect::from_min_max(pt(21., 117.), pt(176., 171.)),
+                            ui.id().with("reset-prediction"),
+                            Sense::click(),
+                        )
+                        .on_hover_text(tr("設定或清除 Reset 預測"))
+                        .clicked()
+                    {
+                        self.open_prediction();
+                    }
                 }
                 if widget_icon(
                     ui,
@@ -2830,7 +2862,7 @@ impl WidgetApp {
                 )
                 .clicked()
                 {
-                    self.settings_open = true;
+                    self.open_settings();
                 }
                 if widget_icon(
                     ui,
@@ -2920,7 +2952,7 @@ impl WidgetApp {
                                         .on_hover_text(tr(self.import_diagnostic_text()))
                                         .clicked()
                                     {
-                                        self.settings_open = true;
+                                        self.open_settings();
                                     }
                                 }
                             });
@@ -2962,7 +2994,7 @@ impl WidgetApp {
         );
         for (x, label) in [
             (0., "對話"),
-            (84., "時間+8"),
+            (84., "時間"),
             (142., "用度"),
             (204., "本%累計"),
         ] {
@@ -3318,19 +3350,62 @@ impl WidgetApp {
             );
         }
         if self.settings_open {
+            let first = !self.settings_presented;
+            self.settings_presented = true;
+            let mut builder = ViewportBuilder::default()
+                .with_title(tr("Quota Widget · 設定 / 連接"))
+                .with_inner_size([760., 700.])
+                .with_min_inner_size([520., 420.])
+                .with_visible(true)
+                .with_window_level(WindowLevel::AlwaysOnTop);
+            if first {
+                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                    builder = builder.with_position(rect.min);
+                }
+                builder = builder.with_active(true);
+            }
+            ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ctx, _| {
+                if first {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    self.settings_open = false;
+                    self.settings_presented = false;
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| self.settings_ui(ui, ctx));
+                });
+            });
+        } else {
+            self.settings_presented = false;
+        }
+        if self.prediction_open {
+            let first = !self.prediction_presented;
+            self.prediction_presented = true;
+            let mut builder = ViewportBuilder::default()
+                .with_title(tr("Reset預測"))
+                .with_inner_size([430., 230.])
+                .with_visible(true)
+                .with_window_level(WindowLevel::AlwaysOnTop);
+            if first {
+                builder = builder.with_active(true);
+                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                    builder = builder.with_position(rect.min);
+                }
+            }
             ctx.show_viewport_immediate(
-                ViewportId::from_hash_of("settings"),
-                ViewportBuilder::default()
-                    .with_title(tr("Quota Widget · 設定 / 連接"))
-                    .with_inner_size([760., 700.])
-                    .with_min_inner_size([520., 420.]),
+                ViewportId::from_hash_of("reset-prediction-dialog"),
+                builder,
                 |ctx, _| {
-                    if ctx.input(|i| i.viewport().close_requested()) {
-                        self.settings_open = false;
+                    if first {
+                        ctx.send_viewport_cmd(ViewportCommand::Focus);
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        egui::ScrollArea::both().show(ui, |ui| self.settings_ui(ui, ctx));
-                    });
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        self.prediction_open = false;
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| self.prediction_ui(ui));
                 },
             );
         }
@@ -3347,7 +3422,10 @@ impl WidgetApp {
                 tr("DEMO"),
             );
         }
-        ui.label(tr("時間 UTC+08:00 · Token 成本估算 USD"));
+        ui.label(tr(format!(
+            "時間 {} · Token 成本估算 USD",
+            display_time::zone_label()
+        )));
         if self.history_cache.sources_generation != Some(self.history_generation) {
             self.history_cache.sources = self
                 .history
@@ -3878,7 +3956,7 @@ impl WidgetApp {
             ui.allocate_exact_size(Vec2::new(table_width * scale, 26. * scale), Sense::hover());
         for (i, title) in [
             "額度變化",
-            "變化時間（UTC+08）",
+            &format!("變化時間（{}）", display_time::zone_label()),
             "Luna",
             "Sol",
             "Astra",
@@ -3928,7 +4006,8 @@ impl WidgetApp {
                         } else {
                             view.end.clone()
                         };
-                        change_time = change_time.replace(" +08:00", "");
+                        change_time =
+                            change_time.replace(&format!(" {}", display_time::offset_label()), "");
                         let families = [
                             ("luna", "Luna", 1),
                             ("sol", "Sol", 0),
@@ -4098,7 +4177,7 @@ impl WidgetApp {
             self.token_group,
             self.show_excluded_records,
         );
-        ui.heading(tr("Token 明細 · UTC+08:00"));
+        ui.heading(tr(format!("Token 明細 · {}", display_time::zone_label())));
         if self.demo {
             ui.colored_label(
                 if self.settings.dark {
@@ -4123,7 +4202,7 @@ impl WidgetApp {
                 self.export_day(true, true);
             }
             if ui.button(tr("編輯價格")).clicked() {
-                self.settings_open = true;
+                self.open_settings();
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -4246,7 +4325,7 @@ impl WidgetApp {
         ]
         .map(|width| width * scale);
         let headers = [
-            "時間+8",
+            "時間",
             "模型",
             "推理強度",
             "Task / Session",
@@ -4343,6 +4422,89 @@ impl WidgetApp {
         self.request_reprice();
         self.dirty = true;
     }
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        self.settings_presented = false;
+    }
+    fn open_prediction(&mut self) {
+        self.prediction_pst = false;
+        self.prediction_input = self
+            .settings
+            .prediction_target()
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|t| {
+                t.with_timezone(&display_time::timezone())
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        self.prediction_open = true;
+        self.prediction_presented = false;
+    }
+    fn clear_completed_prediction(&mut self) {
+        let Some(target) = self.settings.prediction_target() else {
+            return;
+        };
+        let Some(view) = self.selected() else {
+            return;
+        };
+        let since = self.settings.reset_prediction_set_at.unwrap_or(target);
+        let key = (self.history_generation, target, since);
+        if self.prediction_history_checked == Some(key) {
+            return;
+        }
+        self.prediction_history_checked = Some(key);
+        if self.history.iter().any(|event| {
+            event.observed_at_unix >= since
+                && live_reset_alert(std::slice::from_ref(event), &view)
+                && event
+                    .evidence
+                    .as_ref()
+                    .and_then(|e| e.account_id.as_deref())
+                    == self.quota.account_id()
+        }) {
+            self.settings.clear_prediction();
+            self.dirty = true;
+        }
+    }
+    fn prediction_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(tr("Tibo 已公告了Reset時間嗎?"));
+        ui.label(tr("請輸入時間（YYYY-MM-DD HH:MM）"));
+        ui.text_edit_singleline(&mut self.prediction_input);
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.prediction_pst, true, "PST (UTC-08:00)");
+            ui.radio_value(&mut self.prediction_pst, false, display_time::zone_label());
+        });
+        let offset = if self.prediction_pst {
+            -480
+        } else {
+            self.settings.utc_offset_minutes
+        };
+        let target = display_time::parse_local(&self.prediction_input, offset);
+        if target.is_none() && !self.prediction_input.is_empty() {
+            ui.label(tr("日期或時間格式不正確"));
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(target.is_some(), egui::Button::new(tr("儲存設定")))
+                .clicked()
+            {
+                self.settings.clear_prediction();
+                self.settings.reset_prediction_utc = target;
+                self.settings.reset_prediction_set_at = Some(now());
+                self.dirty = true;
+                self.prediction_open = false;
+            }
+            if ui.button(tr("清除提醒")).clicked() {
+                self.settings.clear_prediction();
+                self.dirty = true;
+                self.prediction_open = false;
+            }
+            if ui.button(tr("取消")).clicked() {
+                self.prediction_open = false;
+            }
+        });
+    }
     fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.label(tr("語言 / Language"));
@@ -4416,24 +4578,38 @@ impl WidgetApp {
             ui.label(tr("Aa 中文預覽"));
         });
         ui.separator();
-        ui.strong(tr("自訂重設提醒（UTC+08）"));
-        ui.label(tr(
-            "輸入 YYYY-MM-DD HH:MM；留空停用。時間由你設定。超時後以紅色 >時:分:秒 顯示超出時間。",
-        ));
-        if ui
-            .text_edit_singleline(&mut self.settings.reset_reminder_local)
-            .changed()
-        {
-            self.dirty = true;
+        ui.horizontal(|ui| {
+            ui.label(tr("顯示時區"));
+            let before = self.settings.utc_offset_minutes;
+            let mut hours = before as f64 / 60.;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut hours)
+                        .range(-12.0..=14.0)
+                        .speed(0.25)
+                        .prefix("UTC ")
+                        .max_decimals(2),
+                )
+                .changed()
+            {
+                self.settings.utc_offset_minutes =
+                    ((hours * 4.).round() as i32 * 15).clamp(-720, 840);
+                self.dates_key = None;
+                self.history_cache = HistoryCache::default();
+                self.token_cache = TokenCache::default();
+                self.main_cache.key = None;
+                self.requested_view = None;
+                let _zone = display_time::scope(self.settings.utc_offset_minutes);
+                self.set_intervals(Arc::clone(&self.intervals));
+                self.dirty = true;
+                ctx.request_repaint();
+            }
+        });
+        if ui.button(tr("Reset預測")).clicked() {
+            self.open_prediction();
         }
-        if !self.settings.reset_reminder_local.trim().is_empty()
-            && reset_reminder_at(&self.settings.reset_reminder_local).is_none()
-        {
-            ui.colored_label(Color32::YELLOW, tr("日期或時間格式不正確"));
-        }
-        if ui.button(tr("清除提醒")).clicked() {
-            self.settings.reset_reminder_local.clear();
-            self.dirty = true;
+        if let Some(target) = self.settings.prediction_target() {
+            ui.label(display_time::datetime(target).unwrap_or_default());
         }
         if ui
             .checkbox(
@@ -4686,6 +4862,7 @@ impl WidgetApp {
         let folder = self.dir.join("exports");
         let pricing = snapshot.pricing.clone();
         let hide_unchanged = self.settings.hide_unchanged;
+        let utc_offset_minutes = self.settings.utc_offset_minutes;
         let bucket = self.settings.bucket.clone();
         let selection = self.history_selection.clone().or_else(|| {
             self.selected()
@@ -4699,6 +4876,7 @@ impl WidgetApp {
         let spawned = std::thread::Builder::new()
             .name("quota-export".into())
             .spawn(move || export_cancel.scope(|| {
+                let _zone = display_time::scope(utc_offset_minutes);
                 if cancellation::check().is_err() { return; }
                 let kind = if audit_excluded {"tokens-excluded"}else if tokens { "tokens" } else { "quota" };
                 // Export the entire selected day from a separate read-only
@@ -4830,7 +5008,7 @@ impl WidgetApp {
                     .as_i64();
                     event["local_time"] = serde_json::json!(timestamp.map(local_time));
                     event["local_datetime"] = serde_json::json!(timestamp.and_then(display_time::datetime));
-                    event["display_timezone"] = serde_json::json!(display_time::OFFSET_LABEL);
+                    event["display_timezone"] = serde_json::json!(display_time::offset_label());
                     event["display_date"] = serde_json::json!(timestamp.and_then(display_time::day).map(|d|d.to_string()));
                     display_time::annotate_timestamps(event);
                     event["excluded_from_default_totals"] = serde_json::json!(audit_excluded);
@@ -4845,9 +5023,9 @@ impl WidgetApp {
                         let mut exported = serde_json::json!({
                                 "schema_version": 1,
                                 "date": day.to_string(),
-                                "timezone": display_time::OFFSET_LABEL,
-                                "display_timezone": display_time::DISPLAY_ZONE,
-                                "timestamp_basis": "UTC Unix seconds; *_hk and local_* are fixed +08:00 displays",
+                                "timezone": display_time::offset_label(),
+                                "display_timezone": display_time::zone_label(),
+                                "timestamp_basis": "UTC Unix seconds; *_hk preserves +08:00; *_local and local_* use display_timezone",
                                 "kind": kind,
                                 "cost_basis": "estimated_model_equivalent_not_subscription_charge",
                                 "view_scope":if audit_excluded {"excluded_auto_review_audit"}else{"included_default"},
@@ -4976,9 +5154,9 @@ impl WidgetApp {
                         save_export(&path, |writer| std::io::Write::write_all(writer, out.as_bytes()))?;
                         if !tokens {
                             let model_path = path.with_file_name(format!("{}-models.csv", path.file_stem().unwrap_or_default().to_string_lossy()));
-                            let mut models_csv=String::from("interval_key,start_utc_unix,end_utc_unix,start_hk,end_hk,display_timezone,percentage_points,interval_known_usd,interval_cost_per_point,comparable,partial,reasons,model,events,input,cached,uncached,output,reasoning,model_known_usd,unknown_cost_events,assumed_model_events\n");
+                            let mut models_csv=String::from("interval_key,start_utc_unix,end_utc_unix,start_local,end_local,display_timezone,percentage_points,interval_known_usd,interval_cost_per_point,comparable,partial,reasons,model,events,input,cached,uncached,output,reasoning,model_known_usd,unknown_cost_events,assumed_model_events\n");
                             for interval in &completed_export { cancellation::check()?; for model in &interval.models {
-                                let values=vec![interval.history_event_key.clone(),interval.start.map(|v|v.to_string()).unwrap_or_default(),interval.end.to_string(),interval.start.and_then(display_time::datetime).unwrap_or_default(),display_time::datetime(interval.end).unwrap_or_default(),display_time::OFFSET_LABEL.into(),interval.percentage_points.to_string(),interval.known_usd.to_string(),interval.cost_per_point.map(|v|v.to_string()).unwrap_or_default(),interval.comparable.to_string(),interval.partial.to_string(),interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join("; "),model.model.clone(),model.events.to_string(),model.input.to_string(),model.cached.to_string(),model.uncached.to_string(),model.output.to_string(),model.reasoning.to_string(),model.known_usd.to_string(),model.unknown_cost_events.to_string(),model.assumed_model_events.to_string()];
+                                let values=vec![interval.history_event_key.clone(),interval.start.map(|v|v.to_string()).unwrap_or_default(),interval.end.to_string(),interval.start.and_then(display_time::datetime).unwrap_or_default(),display_time::datetime(interval.end).unwrap_or_default(),display_time::offset_label().into(),interval.percentage_points.to_string(),interval.known_usd.to_string(),interval.cost_per_point.map(|v|v.to_string()).unwrap_or_default(),interval.comparable.to_string(),interval.partial.to_string(),interval.reasons.iter().map(|r|r.label()).collect::<Vec<_>>().join("; "),model.model.clone(),model.events.to_string(),model.input.to_string(),model.cached.to_string(),model.uncached.to_string(),model.output.to_string(),model.reasoning.to_string(),model.known_usd.to_string(),model.unknown_cost_events.to_string(),model.assumed_model_events.to_string()];
                                 models_csv.push_str(&values.into_iter().map(|mut value|{if value.starts_with(['=','+','-','@','\t','\r']){value.insert(0,'\'');}format!("\"{}\"",value.replace('"',"\"\""))}).collect::<Vec<_>>().join(",")); models_csv.push('\n');
                             }}
                             save_export(&model_path, |writer| std::io::Write::write_all(writer, models_csv.as_bytes()))?;
@@ -5112,6 +5290,8 @@ fn save_export(
 impl eframe::App for WidgetApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         set_language(self.settings.language);
+        let _zone = display_time::scope(self.settings.utc_offset_minutes);
+        self.clear_completed_prediction();
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_ready {
             self.begin_close();
         }
@@ -6820,7 +7000,7 @@ mod database_display_tests {
             "Uncached:",
             "Output:",
             "Reasoning:",
-            "香港時間:",
+            "顯示時間:",
         ] {
             assert!(tip.contains(field), "missing {field}: {tip}");
         }
@@ -7763,6 +7943,93 @@ mod responsive_close_tests {
         assert_eq!(saved.position, app.settings.position);
     }
     #[test]
+    fn reset_clears_prediction_even_with_sound_disabled_and_rebound_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.settings.reset_sound_enabled = false;
+        app.settings.reset_prediction_utc = Some(now() + 1000);
+        app.settings.reset_prediction_set_at = Some(now() - 10);
+        let payload = |used| serde_json::json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":used,"windowDurationMins":10080,"resetsAt":now()+604800}}});
+        app.quota.ingest_json(&payload(1.), now() - 30).unwrap();
+        app.quota.history.clear();
+        app.handle_bridge_event(BridgeEvent::RateLimits(payload(0.)));
+        assert!(app.settings.prediction_target().is_some());
+        app.quota = QuotaModel::new("second-cycle-test");
+        app.quota.ingest_json(&payload(3.), now() - 1).unwrap();
+        app.quota.history.clear();
+        app.handle_bridge_event(BridgeEvent::RateLimits(payload(0.)));
+        assert!(app.settings.prediction_target().is_none());
+        assert!(app.dirty);
+    }
+    #[test]
+    fn saved_prediction_clears_after_restart_from_confirmed_reset_history() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        app.settings.reset_prediction_utc = Some(now() + 500);
+        app.settings.reset_prediction_set_at = Some(now() - 100);
+        app.quota.ingest_json(&serde_json::json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":5,"windowDurationMins":10080,"resetsAt":now()+600000}}}), now()-50).unwrap();
+        app.quota.ingest_json(&serde_json::json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":now()+604800}}}), now()-10).unwrap();
+        app.history = Arc::new(app.quota.history.clone());
+        app.clear_completed_prediction();
+        assert!(app.settings.prediction_target().is_none());
+        app.settings.reset_prediction_utc = Some(now() + 1000);
+        app.settings.reset_prediction_set_at = Some(now());
+        app.clear_completed_prediction();
+        assert!(
+            app.settings.prediction_target().is_some(),
+            "old reset must not delete a new prediction"
+        );
+    }
+    #[test]
+    fn settings_native_viewport_opens_front_and_reopens_with_content() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let output = Rc::clone(&captured);
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let mut input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(760., 700.))),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .insert(viewport.ids.this, Default::default());
+            let rendered = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            let text = rendered
+                .shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        Some(t.galley.job.text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            output.borrow_mut().push((viewport.builder, text));
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app(root.path());
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        app.apply_theme(&ctx);
+        for _ in 0..2 {
+            app.open_settings();
+            let _ = ctx.run(Default::default(), |ctx| app.detail_windows(ctx));
+            assert!(app.settings_open);
+            let rows = captured.borrow();
+            let (builder, text) = rows.last().unwrap();
+            assert_eq!(builder.visible, Some(true));
+            assert_eq!(builder.active, Some(true));
+            assert_eq!(builder.window_level, Some(WindowLevel::AlwaysOnTop));
+            assert!(text.contains("顯示時區"), "{text}");
+            assert!(text.contains("Reset預測"), "{text}");
+            app.settings_open = false;
+        }
+    }
+    #[test]
     fn reminder_uses_user_time_at_utc_plus_eight_and_counts_elapsed_after_zero() {
         let target = reset_reminder_at("2030-04-02 01:00").unwrap();
         assert_eq!(
@@ -7878,11 +8145,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.34", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.34", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.35", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.35", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.34",
+                "Codex Quota v3.35",
                 "Interface font size",
             ),
         ] {
