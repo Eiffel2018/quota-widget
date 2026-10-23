@@ -37,17 +37,47 @@ fn reset_reminder_at(value: &str) -> Option<i64> {
 }
 
 fn reset_reminder_countdown(target: i64, current: i64) -> String {
-    if target <= current {
-        "已到時間".into()
-    } else {
-        let seconds = target - current;
-        format!(
-            "{}:{:02}:{:02}",
-            seconds / 3600,
-            seconds / 60 % 60,
-            seconds % 60
-        )
+    let seconds = target.abs_diff(current);
+    format!(
+        "{}{}:{:02}:{:02}",
+        if current > target { ">" } else { "" },
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+fn live_reset_alert(events: &[HistoryEvent], view: &WindowView) -> bool {
+    events.iter().any(|event| {
+        event.kind == quota_widget::model::HistoryKind::QuotaReset
+            && event.source_key == view.source_key
+            && event.window_key.as_deref() == Some(view.window_key.as_str())
+            && event.reconciliation.is_none()
+            && event.before.parse::<f64>().is_ok_and(|value| value < 100.)
+            && event.after.parse::<f64>() == Ok(100.)
+    })
+}
+
+#[cfg(windows)]
+fn play_reset_chime() -> bool {
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn PlaySoundW(sound: *const u16, module: *mut std::ffi::c_void, flags: u32) -> i32;
     }
+    // Static storage keeps the embedded WAV alive for asynchronous playback.
+    static CHIME: &[u8] = include_bytes!("../assets/reset-chime.wav");
+    unsafe {
+        PlaySoundW(
+            CHIME.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0x0004 | 0x0001 | 0x0002,
+        ) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn play_reset_chime() -> bool {
+    false
 }
 
 fn widget_target_height(width: f32, details: f32, monitor: Option<f32>) -> f32 {
@@ -1737,6 +1767,16 @@ impl WidgetApp {
                         self.quota_error = None;
                         if !self.quota.history.is_empty() {
                             let events = std::mem::take(&mut self.quota.history);
+                            if !self.demo
+                                && !account_changed
+                                && self.settings.reset_sound_enabled
+                                && self
+                                    .selected()
+                                    .is_some_and(|view| live_reset_alert(&events, &view))
+                                && !play_reset_chime()
+                            {
+                                self.notice = "額度已重設至 100%；提示音播放失敗。".into();
+                            }
                             self.send_work(WorkCommand::MergeHistory {
                                 events,
                                 save_path: None,
@@ -2533,7 +2573,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "每週額度 v3.32".into());
+                    .unwrap_or_else(|| "每週額度 v3.33".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(181., 35.)))
@@ -2718,14 +2758,24 @@ impl WidgetApp {
                     FontId::proportional(font_size * (155. * sx / title_width.max(1.)).min(1.)),
                     fg,
                 );
+                let reminder_now = now();
+                let timer_color = if reminder.is_some_and(|target| reminder_now > target) {
+                    if self.settings.dark {
+                        Color32::from_rgb(255, 120, 110)
+                    } else {
+                        Color32::from_rgb(184, 35, 35)
+                    }
+                } else {
+                    fg
+                };
                 painter.text(
                     pt(21., 141.),
                     Align2::LEFT_TOP,
                     reminder
-                        .map(|target| reset_reminder_countdown(target, now()))
+                        .map(|target| reset_reminder_countdown(target, reminder_now))
                         .unwrap_or_else(|| "未設定".into()),
                     FontId::proportional((18. * scale * font_multiplier).max(font_size)),
-                    fg,
+                    timer_color,
                 );
                 if ui
                     .interact(
@@ -4308,7 +4358,9 @@ impl WidgetApp {
         });
         ui.separator();
         ui.strong("自訂重設提醒（UTC+08）");
-        ui.label("輸入 YYYY-MM-DD HH:MM；留空停用。時間由你設定。到時顯示「已到時間」。");
+        ui.label(
+            "輸入 YYYY-MM-DD HH:MM；留空停用。時間由你設定。超時後以紅色 >時:分:秒 顯示超出時間。",
+        );
         if ui
             .text_edit_singleline(&mut self.settings.reset_reminder_local)
             .changed()
@@ -4323,6 +4375,18 @@ impl WidgetApp {
         if ui.button("清除提醒").clicked() {
             self.settings.reset_reminder_local.clear();
             self.dirty = true;
+        }
+        if ui
+            .checkbox(
+                &mut self.settings.reset_sound_enabled,
+                "真正重設至 100% 時播放提示音",
+            )
+            .changed()
+        {
+            self.dirty = true;
+        }
+        if ui.button("試播提示音").clicked() && !play_reset_chime() {
+            self.notice = "提示音播放失敗，請檢查系統音效設定。".into();
         }
         ui.separator();
         ui.strong("官方 Codex CLI（唯讀）");
@@ -7581,6 +7645,33 @@ mod quota_connection_recovery_tests {
 mod responsive_close_tests {
     use super::*;
     #[test]
+    fn reset_alert_ignores_initial_snapshot_rebound_reconnect_and_repeated_full_quota() {
+        let mut quota = QuotaModel::new("alert-test");
+        for (at, used, expected) in [
+            (100, 0., false),
+            (130, 1., false),
+            (160, 0., false),
+            (190, 2., false),
+            (220, 0., true),
+            (250, 0., false),
+        ] {
+            quota.history.clear();
+            quota.ingest_json(&serde_json::json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":used,"windowDurationMins":10080,"resetsAt":100000}}}), at).unwrap();
+            let mut view = quota.views(at).into_iter().next().unwrap();
+            assert_eq!(
+                live_reset_alert(&quota.history, &view),
+                expected,
+                "used {used} at {at}"
+            );
+            view.source_key = "different-source".into();
+            assert!(!live_reset_alert(&quota.history, &view));
+        }
+        quota.reset_continuity();
+        quota.history.clear();
+        quota.ingest_json(&serde_json::json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":100000}}}), 280).unwrap();
+        assert!(!live_reset_alert(&quota.history, &quota.views(280)[0]));
+    }
+    #[test]
     fn detail_window_positions_remain_independent_and_persist() {
         let mut app = super::widget_revision_tests::demo_app();
         let ctx = egui::Context::default();
@@ -7613,7 +7704,7 @@ mod responsive_close_tests {
         assert_eq!(saved.position, app.settings.position);
     }
     #[test]
-    fn reminder_uses_user_time_at_utc_plus_eight_and_stops_at_zero() {
+    fn reminder_uses_user_time_at_utc_plus_eight_and_counts_elapsed_after_zero() {
         let target = reset_reminder_at("2030-04-02 01:00").unwrap();
         assert_eq!(
             chrono::DateTime::from_timestamp(target, 0)
@@ -7623,8 +7714,9 @@ mod responsive_close_tests {
         );
         assert_eq!(reset_reminder_countdown(target, target - 3660), "1:01:00");
         assert_eq!(reset_reminder_countdown(target, target - 1), "0:00:01");
-        assert_eq!(reset_reminder_countdown(target, target), "已到時間");
-        assert_eq!(reset_reminder_countdown(target, target + 90), "已到時間");
+        assert_eq!(reset_reminder_countdown(target, target), "0:00:00");
+        assert_eq!(reset_reminder_countdown(target, target + 90), ">0:01:30");
+        assert_eq!(reset_reminder_countdown(target, target + 3661), ">1:01:01");
         assert!(reset_reminder_at("").is_none());
         assert!(reset_reminder_at("2030-02-30 01:00").is_none());
         assert!(Settings::default().reset_reminder_local.is_empty());
