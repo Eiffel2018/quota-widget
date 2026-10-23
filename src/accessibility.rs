@@ -9,7 +9,7 @@ pub const REFERENCE_MINIMUM_FONT: f32 = 18.0;
 pub const MINIMUM_CONFIGURABLE_FONT: f32 = 12.0;
 pub const MIN_FONT_SCALE_PERCENT: u32 = 70;
 pub const MAX_FONT_SCALE_PERCENT: u32 = 150;
-pub const MINIMUM_ROOT_WIDTH: f32 = 430.0;
+pub const MINIMUM_ROOT_WIDTH: f32 = 280.0;
 pub const MAXIMUM_ROOT_WIDTH: f32 = 1000.0;
 pub const MAXIMUM_MAIN_SCALE: f32 = 2.5;
 
@@ -22,7 +22,7 @@ pub fn minimum_font(root_width: f32) -> f32 {
     } else {
         root_width.clamp(MINIMUM_ROOT_WIDTH, MAXIMUM_ROOT_WIDTH)
     };
-    REFERENCE_MINIMUM_FONT.max(13.0 * (width / 310.0).min(MAXIMUM_MAIN_SCALE))
+    13.0_f32.max(13.0 * (width / 310.0).min(MAXIMUM_MAIN_SCALE))
 }
 
 /// Apply the user's percentage preference to the responsive font baseline.
@@ -137,7 +137,7 @@ pub fn configure_style(style: &mut egui::Style, dark: bool, font_size: f32) {
     spacing.slider_rail_height = 8.0 * scale;
     spacing.combo_width = 180.0 * scale;
     spacing.text_edit_width = 280.0 * scale;
-    spacing.tooltip_width = ((MINIMUM_ROOT_WIDTH - 40.0) * scale).min(680.0);
+    spacing.tooltip_width = (20.0 * font_size).min(680.0);
     spacing.menu_width = (400.0 * scale).min(800.0);
     spacing.combo_height = 320.0 * scale;
     spacing.scroll.bar_width = 14.0 * scale;
@@ -219,13 +219,13 @@ mod tests {
     #[test]
     fn minimum_font_matches_quota_rate_and_caps_with_main_widget() {
         for width in [0.0_f32, 310.0, 430.0, 600.0, 775.0, 1000.0, 2000.0] {
-            let rate_size = 13.0 * (width.clamp(430.0, 1000.0) / 310.0).min(2.5);
-            assert_eq!(minimum_font(width), 18.0_f32.max(rate_size));
+            let rate_size = 13.0 * (width.clamp(280.0, 1000.0) / 310.0).min(2.5);
+            assert_eq!(minimum_font(width), 13.0_f32.max(rate_size));
         }
         assert_eq!(minimum_font(430.0), 13.0 * (430.0 / 310.0));
         assert_eq!(minimum_font(1000.0), 32.5);
-        assert_eq!(minimum_font(f32::NAN), minimum_font(430.0));
-        assert_eq!(minimum_font(f32::NEG_INFINITY), minimum_font(430.0));
+        assert_eq!(minimum_font(f32::NAN), minimum_font(280.0));
+        assert_eq!(minimum_font(f32::NEG_INFINITY), minimum_font(280.0));
         assert_eq!(minimum_font(f32::INFINITY), 32.5);
     }
 

@@ -28,18 +28,110 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn accessible_visible_rows(
-    count: usize,
-    threshold: usize,
-    scale: f32,
-    monitor_height: Option<f32>,
-) -> usize {
-    let requested = usage_views::visible_task_rows(count, threshold);
-    let available = monitor_height
-        .filter(|height| height.is_finite() && *height > 0.)
-        .map(|height| (((height - 60.) / scale - 324.) / 22.).floor().max(1.) as usize)
-        .unwrap_or(requested);
-    requested.min(available)
+const COLLAPSED_HEIGHT: f32 = 184.;
+
+fn widget_target_height(width: f32, details: f32, monitor: Option<f32>) -> f32 {
+    let desired = COLLAPSED_HEIGHT * width / 310. + details;
+    let maximum = monitor
+        .filter(|h| h.is_finite() && *h > 0.)
+        .map(|h| (h - 60.).max(COLLAPSED_HEIGHT * width / 310.))
+        .unwrap_or(2000.);
+    desired.min(maximum)
+}
+
+fn prepare_widget_settings(settings: &mut Settings) {
+    if settings.compact_layout_version == 0 {
+        settings.size[0] *= 2. / 3.;
+        settings.compact_layout_version = 1;
+    }
+    settings.size[0] = settings.size[0].clamp(280., 1000.);
+    settings.size[1] = COLLAPSED_HEIGHT * settings.size[0] / 310.;
+}
+
+#[derive(Clone, Copy)]
+enum WidgetIcon {
+    History,
+    Tokens,
+    Tasks,
+    Recent,
+    Settings,
+    Close,
+}
+
+fn widget_icon(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    icon: WidgetIcon,
+    expanded: Option<bool>,
+    help: &str,
+    foreground: Color32,
+    fill: Color32,
+) -> egui::Response {
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().interact_size = Vec2::ZERO;
+            ui.spacing_mut().button_padding = Vec2::ZERO;
+            ui.put(rect, egui::Button::new("").fill(fill).min_size(rect.size()))
+        })
+        .inner
+        .on_hover_text(help);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, help));
+    let side = rect.height() * 0.55;
+    let center = if expanded.is_some() {
+        Pos2::new(rect.left() + rect.height() * 0.65, rect.center().y)
+    } else {
+        rect.center()
+    };
+    let r = Rect::from_center_size(center, Vec2::splat(side));
+    let painter = ui.painter();
+    let stroke = Stroke::new(1.4_f32, foreground);
+    let line = |a: Pos2, b: Pos2| {
+        painter.line_segment([a, b], stroke);
+    };
+    match icon {
+        WidgetIcon::History => {
+            painter.rect_stroke(r, 1., stroke, egui::StrokeKind::Inside);
+            for y in [0.28, 0.5, 0.72] {
+                line(
+                    Pos2::new(r.left() + side * 0.2, r.top() + side * y),
+                    Pos2::new(r.right() - side * 0.2, r.top() + side * y),
+                );
+            }
+        }
+        WidgetIcon::Tokens => {
+            for (x, h) in [(0.15, 0.4), (0.5, 0.7), (0.85, 1.)] {
+                line(
+                    Pos2::new(r.left() + side * x, r.bottom()),
+                    Pos2::new(r.left() + side * x, r.bottom() - side * h),
+                );
+            }
+        }
+        WidgetIcon::Tasks | WidgetIcon::Settings => {
+            for y in [0.15, 0.5, 0.85] {
+                line(
+                    Pos2::new(r.left(), r.top() + side * y),
+                    Pos2::new(r.right(), r.top() + side * y),
+                );
+            }
+        }
+        WidgetIcon::Recent => {
+            painter.circle_stroke(r.center(), side * 0.5, stroke);
+            line(r.center(), r.center() - Vec2::new(0., side * 0.3));
+            line(r.center(), r.center() + Vec2::new(side * 0.25, 0.));
+        }
+        WidgetIcon::Close => {
+            line(r.left_top(), r.right_bottom());
+            line(r.right_top(), r.left_bottom());
+        }
+    }
+    if let Some(open) = expanded {
+        let c = Pos2::new(rect.right() - rect.height() * 0.5, rect.center().y);
+        let d = rect.height() * 0.15;
+        let sign = if open { -1. } else { 1. };
+        line(c + Vec2::new(-d, -d * sign), c + Vec2::new(0., d * sign));
+        line(c + Vec2::new(0., d * sign), c + Vec2::new(d, -d * sign));
+    }
+    response
 }
 
 #[derive(PartialEq)]
@@ -112,7 +204,7 @@ impl LayoutConvergence {
             self.next_retry = None;
             self.converged = false;
             self.quiet_since = Some(t);
-            plan.minimum = Some(Vec2::new(430., height));
+            plan.minimum = Some(Vec2::new(280., COLLAPSED_HEIGHT * actual.x / 310.));
         }
         if self
             .observed_size
@@ -136,10 +228,8 @@ impl LayoutConvergence {
             return plan;
         }
         if self.converged {
-            // A new external height-only resize may keep the exact same key.
-            self.converged = false;
-            self.attempts = 0;
-            self.next_retry = None;
+            // Once settled, respect a manual height resize; overflowing details scroll.
+            return plan;
         }
         if self.attempts >= Self::MAX_ATTEMPTS {
             return plan;
@@ -376,6 +466,8 @@ struct WidgetApp {
     quota_retry_at: Option<Instant>,
     status: String,
     quota_error: Option<String>,
+    tasks_expanded: bool,
+    recent_expanded: bool,
     history_open: bool,
     history_selection: Option<(String, Option<String>, String)>,
     tokens_open: bool,
@@ -1061,14 +1153,11 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
         .as_ref()
         .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
     let mut settings = settings_read.unwrap_or_default();
-    settings.size[0] = settings.size[0].clamp(430., 1000.);
-    settings.task_visible_rows = settings.task_visible_rows.clamp(1, 50);
-    settings.size[1] = usage_views::widget_height(0, settings.task_visible_rows as usize)
-        * settings.size[0]
-        / 310.;
+    let compact_layout_migrated = settings.compact_layout_version == 0;
+    prepare_widget_settings(&mut settings);
     let mut viewport = ViewportBuilder::default()
         .with_inner_size(settings.size)
-        .with_min_inner_size([430., 400.])
+        .with_min_inner_size([280., COLLAPSED_HEIGHT * 280. / 310.])
         .with_max_inner_size([1000., 2000.])
         .with_decorations(false)
         .with_transparent(true)
@@ -1121,6 +1210,7 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
             }
             cc.egui_ctx.set_fonts(fonts);
             let mut app = WidgetApp::new(settings, dir, persistent, demo, offline, args);
+            app.dirty = compact_layout_migrated;
             app._lock = lock;
             app.database_mode = app.read_state && !demo;
             if app._lock.is_none() {
@@ -1185,6 +1275,8 @@ impl WidgetApp {
             status: "OFFLINE".into(),
             quota_error: None,
             history_selection: None,
+            tasks_expanded: false,
+            recent_expanded: false,
             history_open: args.iter().any(|s| s == "--show-history"),
             tokens_open: args.iter().any(|s| s == "--show-tokens"),
             settings_open: false,
@@ -2259,10 +2351,30 @@ impl WidgetApp {
         }
         text
     }
+    fn recent_detail_text(&self) -> String {
+        let age = if let Some(event) = &self.main_cache.boundary {
+            format!(
+                "{} {} 分鐘",
+                if reset_event(event) {
+                    "距本次重設"
+                } else {
+                    "距上次扣額"
+                },
+                (now() - event.observed_at_unix).max(0) / 60
+            )
+        } else {
+            format!("自啟動 {} 分鐘", (now() - self.demo_start).max(0) / 60)
+        };
+        let details = self.main_cache.recent_tooltip.replacen(
+            "最近 5 次扣額",
+            &format!("最近 {} 次扣額", self.main_cache.recent_events.len()),
+            1,
+        );
+        format!("{age}\n\n{details}")
+    }
     fn widget(&mut self, ctx: &egui::Context) {
         self.refresh_main_cache();
-        let dark = self.settings.dark;
-        let palette = accessibility::palette(dark);
+        let palette = accessibility::palette(self.settings.dark);
         let (bg, fg, muted, line, accent) = (
             palette.background,
             palette.text,
@@ -2271,49 +2383,22 @@ impl WidgetApp {
             palette.text,
         );
         let root_width = ctx.screen_rect().width();
-        let font_multiplier = self.settings.font_scale_percent as f32 / 100.0;
+        let font_multiplier = self.settings.font_scale_percent as f32 / 100.;
         let font_size =
             accessibility::scaled_minimum_font(root_width, self.settings.font_scale_percent);
         if (ctx.style().text_styles[&egui::TextStyle::Body].size - font_size).abs() > 0.1 {
             let mut style = (*ctx.style()).clone();
-            accessibility::configure_style(&mut style, dark, font_size);
+            accessibility::configure_style(&mut style, self.settings.dark, font_size);
             ctx.set_style(style);
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
-                let w = rect.width();
-                let sx = w / 310.;
+                let sx = rect.width() / 310.;
                 let sy = sx;
-                let monitor_height=ctx.input(|input|input.viewport().monitor_size.map(|size|size.y));
-                let visible=accessible_visible_rows(self.main_cache.tree.len(),self.settings.task_visible_rows as usize,sx,monitor_height);
-                let layout=(visible,self.settings.task_visible_rows,w.round() as u32);
-                let suspended=ctx.input(|input| {
-                    let viewport=input.viewport();
-                    viewport.minimized.unwrap_or(false) || viewport.maximized.unwrap_or(false) || viewport.fullscreen.unwrap_or(false)
-                });
-                if !suspended {
-                    let height=(324.+22.*visible as f32)*sx;
-                    let plan=self.layout.plan(layout,rect.size(),height,ctx.input(|input|input.pointer.any_down()),Instant::now());
-                    if let Some(minimum)=plan.minimum {
-                        let maximum_height=monitor_height.map(|h|(h-60.).max(480.)).unwrap_or(2000.);
-                        let maximum_width=(maximum_height*310./346.).clamp(430.,1000.);
-                        ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(maximum_width,maximum_height)));
-                        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(minimum.x,minimum.y.min(maximum_height))));
-                    }
-                    if let Some(size)=plan.size {ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));}
-                    if let Some(delay)=plan.repaint_after {ctx.request_repaint_after(delay);}
-                }
-                let scale = sx.min(sy).clamp(0.85, 2.5);
+                let scale = sx.clamp(0.85, 2.5);
                 let painter = ui.painter().clone();
-                painter.rect(
-                    rect.shrink(1.),
-                    22.,
-                    bg,
-                    Stroke::new(1_f32, line),
-                    egui::StrokeKind::Inside,
-                );
                 let pt = |x: f32, y: f32| Pos2::new(rect.left() + x * sx, rect.top() + y * sy);
                 let txt = |x, y, text: String, size: f32, color| {
                     painter.text(
@@ -2324,16 +2409,87 @@ impl WidgetApp {
                         color,
                     );
                 };
+                painter.rect(
+                    rect.shrink(1.),
+                    22.,
+                    bg,
+                    Stroke::new(1_f32, line),
+                    egui::StrokeKind::Inside,
+                );
+                let monitor_height = ctx.input(|i| i.viewport().monitor_size.map(|size| size.y));
+                let mut details = 0.;
+                let recent_text = if self.recent_expanded {
+                    self.recent_detail_text()
+                } else {
+                    String::new()
+                };
+                if self.tasks_expanded {
+                    details += (24. * sy).max(font_size * 1.4)
+                        + (22. * sy).max(font_size * 1.4)
+                            * self.main_cache.tree.len().max(1) as f32
+                        + 52. * sy;
+                }
+                if self.recent_expanded {
+                    details += painter
+                        .layout(
+                            recent_text.clone(),
+                            FontId::proportional(font_size),
+                            fg,
+                            268. * sx,
+                        )
+                        .size()
+                        .y
+                        + 16. * sy;
+                }
+                if self.tasks_expanded || self.recent_expanded {
+                    details += 42. * sy;
+                }
+                let height = widget_target_height(rect.width(), details, monitor_height);
+                let suspended = ctx.input(|i| {
+                    i.viewport().minimized.unwrap_or(false)
+                        || i.viewport().maximized.unwrap_or(false)
+                        || i.viewport().fullscreen.unwrap_or(false)
+                });
+                if !suspended {
+                    let key = (
+                        usize::from(self.tasks_expanded) | usize::from(self.recent_expanded) << 1,
+                        height.round() as u32,
+                        rect.width().round() as u32,
+                    );
+                    let plan = self.layout.plan(
+                        key,
+                        rect.size(),
+                        height,
+                        ctx.input(|i| i.pointer.any_down()),
+                        Instant::now(),
+                    );
+                    if let Some(minimum) = plan.minimum {
+                        ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(
+                            1000.,
+                            monitor_height
+                                .map(|h| (h - 60.).max(minimum.y))
+                                .unwrap_or(2000.),
+                        )));
+                        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(minimum));
+                    }
+                    if let Some(size) = plan.size {
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                    }
+                    if let Some(delay) = plan.repaint_after {
+                        ctx.request_repaint_after(delay);
+                    }
+                }
                 let drag = ui.interact(
-                    Rect::from_min_max(pt(4.,40.),pt(306.,196.)),
+                    Rect::from_min_max(pt(4., 38.), pt(306., 119.)),
                     ui.id().with("drag"),
                     Sense::click_and_drag(),
                 );
-                let title_drag=ui.interact(Rect::from_min_max(pt(4.,4.),pt(155.,39.)),ui.id().with("title-drag"),Sense::click_and_drag());
-                // Wait for a real drag. Beginning native window dragging on
-                // pointer-down steals clicks from the diagnostic status strip.
-                if drag.drag_started() || title_drag.drag_started()
-                {
+                let title_drag = ui.interact(
+                    Rect::from_min_max(pt(4., 4.), pt(208., 37.)),
+                    ui.id().with("title-drag"),
+                    Sense::click_and_drag(),
+                );
+                if drag.drag_started() || title_drag.drag_started() {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
                 drag.context_menu(|ui| {
@@ -2364,79 +2520,62 @@ impl WidgetApp {
                 let view = self.selected();
                 let title = view
                     .as_ref()
-                    .map(|v| {
-                        if v.window_duration_mins == Some(10080) {
-                            "每週額度 v3.29".to_owned()
-                        } else {
-                            v.window_label.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        "每週額度 v3.29".to_owned()
-                    });
-                painter.circle_filled(
-                    pt(22., 24.),
-                    3.2 * scale,
-                    if self.status == "LIVE" || self.demo {
-                        accent
-                    } else {
-                        muted
-                    },
-                );
-                let title_size = font_size;
-                painter.with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(140., 36.))).text(
-                    pt(34., 14.),
-                    Align2::LEFT_TOP,
-                    title,
-                    FontId::proportional(title_size),
+                    .filter(|v| v.window_duration_mins != Some(10080))
+                    .map(|v| v.window_label.clone())
+                    .unwrap_or_else(|| "每週額度 v3.30".into());
+                painter.circle_filled(pt(21., 22.), 3. * scale, accent);
+                painter
+                    .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(209., 35.)))
+                    .text(
+                        pt(33., 14.),
+                        Align2::LEFT_TOP,
+                        title,
+                        FontId::proportional(font_size),
+                        fg,
+                    );
+                if widget_icon(
+                    ui,
+                    Rect::from_min_max(pt(214., 10.), pt(238., 34.)),
+                    WidgetIcon::History,
+                    None,
+                    "扣額紀錄",
                     fg,
-                );
-                if ui
-                    .put(
-                        Rect::from_min_max(pt(145., 12.), pt(208., 37.)),
-                        egui::Button::new(RichText::new("扣額紀錄").size(font_size).color(fg)).fill(line),
-                    )
-                    .clicked()
+                    line,
+                )
+                .clicked()
                 {
                     self.history_open = true;
                 }
-                if ui
-                    .put(
-                        Rect::from_min_max(pt(211., 12.), pt(275., 37.)),
-                        egui::Button::new(RichText::new("Token明細").size(font_size).color(fg)).fill(line),
-                    )
-                    .clicked()
+                if widget_icon(
+                    ui,
+                    Rect::from_min_max(pt(242., 10.), pt(266., 34.)),
+                    WidgetIcon::Tokens,
+                    None,
+                    "Token明細",
+                    fg,
+                    line,
+                )
+                .clicked()
                 {
                     self.tokens_open = true;
                 }
-                if ui
-                    .put(
-                        Rect::from_min_max(pt(279., 12.), pt(302., 37.)),
-                        egui::Button::new(
-                            RichText::new("×").size(font_size + 2.).color(fg),
-                        )
-                        .fill(line),
-                    )
-                    .on_hover_text("關閉小工具")
-                    .clicked()
+                if widget_icon(
+                    ui,
+                    Rect::from_min_max(pt(270., 10.), pt(294., 34.)),
+                    WidgetIcon::Close,
+                    None,
+                    "關閉小工具",
+                    fg,
+                    line,
+                )
+                .clicked()
                 {
                     self.begin_close();
                     ctx.request_repaint();
                 }
-                if let Some(progress) = self.compact_status_text() {
-                    let progress_rect = Rect::from_min_max(pt(21., 39.), pt(289., 57.));
-                    painter.with_clip_rect(progress_rect).text(
-                        progress_rect.min, Align2::LEFT_TOP, progress,
-                        FontId::proportional(font_size), muted,
-                    );
-                    if ui.interact(progress_rect, ui.id().with("import-progress"), Sense::click())
-                        .on_hover_text(format!("{}\n\n{}", self.quota_diagnostic_text(), self.import_diagnostic_text())).clicked()
-                    {
-                        self.settings_open = true;
-                    }
-                }
-                let remain = view.as_ref().and_then(|v| v.remaining_percent);
-                let percent = remain
+                let percent = view
+                    .as_ref()
+                    .and_then(|v| v.remaining_percent)
                     .map(|r| {
                         if r.fract().abs() < 1e-7 {
                             format!("{r:.0}")
@@ -2445,21 +2584,31 @@ impl WidgetApp {
                         }
                     })
                     .unwrap_or_else(|| "—".into());
-                txt(20., 57., percent.clone(), 76., fg);
+                painter.text(
+                    pt(20., 38.),
+                    Align2::LEFT_TOP,
+                    percent.clone(),
+                    FontId::proportional(60. * scale * font_multiplier.min(1.)),
+                    fg,
+                );
                 let percent_width = painter
                     .layout_no_wrap(
-                        percent.clone(),
-                        FontId::proportional(76. * scale * font_multiplier),
+                        percent,
+                        FontId::proportional(60. * scale * font_multiplier.min(1.)),
                         fg,
                     )
                     .size()
                     .x;
-                let percent_x = 20. + percent_width / sx + 5.;
-                txt(percent_x, 89., "%".into(), 33., fg);
-                txt(248., 108., "剩餘".into(), 13., muted);
-                let bar = Rect::from_min_max(pt(21., 145.), pt(289., 149.));
+                painter.text(
+                    pt(25. + percent_width / sx, 66.),
+                    Align2::LEFT_TOP,
+                    "%",
+                    FontId::proportional(28. * scale * font_multiplier.min(1.)),
+                    fg,
+                );
+                let bar = Rect::from_min_max(pt(21., 109.), pt(289., 113.));
                 painter.rect_filled(bar, 3., line);
-                if let Some(p) = remain {
+                if let Some(p) = view.as_ref().and_then(|v| v.remaining_percent) {
                     painter.rect_filled(
                         Rect::from_min_size(
                             bar.min,
@@ -2469,51 +2618,10 @@ impl WidgetApp {
                         accent,
                     );
                 }
-                txt(21., 160., "估計消耗".into(), 13., muted);
-                let rate = view
-                    .as_ref()
-                    .and_then(|v| v.rate_per_hour)
-                    .map(|r| format!("{r:.2} 百分點 / 小時"))
-                    .unwrap_or_else(|| "— 等待量測".into());
-                txt(93., 160., rate, 13., fg);
-                txt(21., 184., "點數".into(), 13., muted);
-                let credits = self.quota.credits(now());
-                let credit = if let Some(v) = &view {
-                    credits.into_iter().find(|c| c.source_key == v.source_key)
-                } else {
-                    credits.into_iter().next()
-                };
+                txt(21., 125., "重設".into(), 13., muted);
                 txt(
-                    93.,
-                    184.,
-                    credit
-                        .as_ref()
-                        .map(|c| {
-                            if c.unlimited {
-                                "不限".into()
-                            } else {
-                                c.balance.clone().unwrap_or_else(|| "—".into())
-                            }
-                        })
-                        .unwrap_or_else(|| "—".into()),
-                    13.,
-                    fg,
-                );
-                txt(
-                    207.,
-                    184.,
-                    credit
-                        .as_ref()
-                        .and_then(|c| c.rate_per_minute)
-                        .map(|r| format!("{r:.2} / 分"))
-                        .unwrap_or_else(|| "— / 分".into()),
-                    12.,
-                    muted,
-                );
-                txt(21., 208., "重設".into(), 13., muted);
-                txt(
-                    93.,
-                    208.,
+                    78.,
+                    125.,
                     view.as_ref()
                         .and_then(|v| v.reset_at)
                         .map(|t| duration(t - now()))
@@ -2521,80 +2629,140 @@ impl WidgetApp {
                     13.,
                     fg,
                 );
-                painter.line_segment([pt(21., 235.), pt(289., 235.)], Stroke::new(1_f32, line));
-                for (x,label) in [(21.,"對話"),(105.,"時間+8"),(163.,"用度"),(225.,"本%累計")] {txt(x,245.,label.into(),13.,fg);}
-                ui.interact(Rect::from_min_max(pt(21.,244.),pt(289.,261.)),ui.id().with("task-column-help"),Sense::hover()).on_hover_text("用度：最新 Response\n本%累計：自身估算 USD\n*：部分");
-                let table_bottom=263.+22.*visible as f32;
-                ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pt(21.,263.),pt(289.,table_bottom))),|ui| {
-                    ui.spacing_mut().item_spacing=Vec2::ZERO;
-                    egui::ScrollArea::vertical().id_salt("task-interval-rows").max_height(22.*visible as f32*sy).min_scrolled_height(0.).show_rows(ui,22.*sy,self.main_cache.tree.len().max(1),|ui,range| {
-                        if self.main_cache.tree.is_empty() {
-                            let response=ui.add(egui::Label::new(RichText::new(self.empty_task_status()).size(font_size).color(muted)).sense(Sense::click()));
-                            if response.on_hover_text(self.import_diagnostic_text()).clicked() {self.settings_open=true;}
-                            return;
+                let rate = view
+                    .as_ref()
+                    .and_then(|v| v.rate_per_hour)
+                    .map(|r| format!("{r:.2} 百分點 / 小時"))
+                    .unwrap_or_else(|| "— 等待量測".into());
+                let credits = self.quota.credits(now());
+                let credit = credits
+                    .iter()
+                    .find(|c| view.as_ref().is_none_or(|v| c.source_key == v.source_key));
+                let credit_text = credit
+                    .map(|c| {
+                        if c.unlimited {
+                            "不限".into()
+                        } else {
+                            c.balance.clone().unwrap_or_else(|| "—".into())
                         }
-                        for i in range {
-                            let row=&self.main_cache.tree[i];
-                            let (r,response)=ui.allocate_exact_size(Vec2::new(268.*sx,22.*sy),Sense::hover());
-                            match row {
-                                usage_views::TaskTreeRow::SelfTask {task_id,task_index,depth,relationship}=>{
-                                    let task=task_index.and_then(|i|self.main_cache.tasks.get(i));
-                                    let mut tooltip=task.map(|t|self.task_tooltip(t)).unwrap_or_else(||format!("{}\nTask ID: {}\n狀態：無近期用量\nInput: 未知\nCached: 未知\nUncached: 未知\nOutput: 未知\nReasoning: 未知\nTurn Input: 未知\nTurn Output: 未知",self.tokens.task_name(task_id).unwrap_or("名稱未記錄"),task_id));
-                                    let relation=match relationship {usage_views::TaskRelationship::Unlinked=>"上層：未知".into(),usage_views::TaskRelationship::Child{parent_id}=>format!("上層: {parent_id}"),usage_views::TaskRelationship::Orphan{parent_id}=>format!("上層（部分）: {}",parent_id.as_deref().unwrap_or("未知")),usage_views::TaskRelationship::Cycle{parent_id}=>format!("上層（循環）: {parent_id}")};
-                                    tooltip.push_str(&format!("\n{relation}"));
-                                    response.on_hover_ui(|ui|{readable_tooltip(ui,&tooltip,font_size);});
-                                    let indent=(*depth as f32*8.).min(32.);
-                                    let name=self.tokens.task_name(task_id).map(str::to_owned).unwrap_or_else(||task_id.chars().take(7).collect());
-                                    let rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((81.-indent)*sx,22.*sy));
-                                    let label=if *depth>0 {format!("└ {name}")}else{name};
-                                    let font=FontId::proportional(font_size);
-                                    let mut short=label.clone();
-                                    while ui.painter().layout_no_wrap(short.clone(),font.clone(),fg).size().x>rect.width()-2.*sx && short.chars().count()>2 {if short.ends_with('…'){short.pop();}short.pop();short.push('…');}
-                                    ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).text(rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,short,font,fg);
-                                    if ui.interact(rect,ui.id().with(("task-name",task_id)),Sense::click()).on_hover_ui(|ui|{readable_tooltip(ui,&tooltip,font_size);}).clicked(){ctx.copy_text(task_id.clone());}
-                                    let values=if let Some(task)=task {[(84.,local_time(task.latest_timestamp)),(142.,money(task.latest_cost_usd)),(204.,format!("{}{}",money(task.interval_cost_usd),if task.partial {"*"}else{""}))]}else{[(84.,"—".into()),(142.,"—".into()),(204.,if self.main_cache.loading {"$—*".into()}else{"$0.0000*".into()})]};
-                                    for (x,text) in values {
-                                        let cell=Rect::from_min_size(r.min+Vec2::new(x*sx,0.),Vec2::new(if x==84. {56.} else {62.} * sx,22.*sy));
-                                        ui.painter().with_clip_rect(cell.intersect(ui.clip_rect())).text(cell.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,&text,FontId::proportional(font_size),fg);
-                                        ui.interact(cell,ui.id().with(("task-cell",task_id,x as i32)),Sense::hover()).on_hover_ui(|ui|readable_tooltip(ui,&format!("{}\n{}",text,tooltip),font_size));
-                                    }
-                                }
-                                usage_views::TaskTreeRow::ChildrenSummary {parent_id,depth,descendant_count,direct_child_count,known_cost_usd,partial,expanded}=>{
-                                    let indent=(*depth as f32*8.).min(32.);
-                                    let label=format!("[{}] 子代理 {}",if *expanded {"−"}else{"+"},descendant_count);
-                                    let help=format!("顯示子代理：{descendant_count}\n直接分支：{direct_child_count}\n範圍：近2h／本%\n本%累計：{}{}",money(Some(*known_cost_usd)),if *partial {" *"} else {""});
-                                    response.on_hover_text(&help);
-                                    let button_rect=Rect::from_min_size(r.min+Vec2::new(indent*sx,0.),Vec2::new((200.-indent)*sx,22.*sy));
-                                    ui.painter().text(button_rect.min+Vec2::new(0.,2.*sy),Align2::LEFT_TOP,label,FontId::proportional(font_size),accent);
-                                    if ui.interact(button_rect,ui.id().with(("children-toggle",parent_id)),Sense::click()).on_hover_text(&help).clicked(){if *expanded {self.expanded_tasks.remove(parent_id);}else{self.expanded_tasks.insert(parent_id.clone());}self.tree_generation+=1;}
-                                    ui.painter().text(r.min+Vec2::new(204.*sx,2.*sy),Align2::LEFT_TOP,format!("{}{}",money((!self.main_cache.loading).then_some(*known_cost_usd)),if *partial {"*"}else{""}),FontId::proportional(font_size),accent);
-                                }
-                            }
-                        }
-                    });
-                });
-                let footer=if self.main_cache.loading {"更新中\n累計 $— *".into()} else if let Some(e)=&self.main_cache.boundary {
-                    format!("{} {} 分鐘\n累計 {}{}",if reset_event(e){"距本次重設"}else{"距上次扣額"},(now()-e.observed_at_unix).max(0)/60,money(Some(self.main_cache.cost.known_usd)),if self.main_cache.cost.partial {" *"}else{""})
-                } else {format!("自啟動 {} 分鐘\n累計 {} *",(now()-self.demo_start).max(0)/60,money(Some(self.main_cache.cost.known_usd)))};
-                let footer_response=ui.put(Rect::from_min_max(pt(21.,table_bottom+8.),pt(289.,table_bottom+52.)),egui::Label::new(RichText::new(footer).size(font_size).color(fg)).sense(Sense::click()).wrap());
-                let open_intervals=footer_response.clicked();
-                footer_response.on_hover_ui(|ui|{readable_tooltip(ui,&self.main_cache.recent_tooltip,font_size);});
-                if open_intervals {
-                    self.history_open=true; self.history_intervals=true; self.history_selection=None;
-                    if let Some(event)=self.main_cache.recent_events.first() {if let Some(day)=local_day(event.observed_at_unix) {self.date=day;}}
-                }
-                if ui
-                    .put(
-                        Rect::from_min_max(pt(272., 204.), pt(294., 226.)),
-                        egui::Button::new("≡").frame(false),
-                    )
-                    .clicked()
+                    })
+                    .unwrap_or_else(|| "—".into());
+                ui.interact(
+                    Rect::from_min_max(pt(21., 121.), pt(265., 146.)),
+                    ui.id().with("quota-details"),
+                    Sense::hover(),
+                )
+                .on_hover_text(format!("估計消耗：{rate}\n點數：{credit_text}"));
+                if widget_icon(
+                    ui,
+                    Rect::from_min_max(pt(272., 122.), pt(294., 144.)),
+                    WidgetIcon::Settings,
+                    None,
+                    "設定 / 連接",
+                    fg,
+                    line,
+                )
+                .clicked()
                 {
                     self.settings_open = true;
                 }
-                // Native borderless resize handle. Never changes focus or activates the window.
+                if widget_icon(
+                    ui,
+                    Rect::from_min_max(pt(80., 151.), pt(135., 175.)),
+                    WidgetIcon::Tasks,
+                    Some(self.tasks_expanded),
+                    "展開 / 收起對話列表",
+                    fg,
+                    line,
+                )
+                .clicked()
+                {
+                    self.tasks_expanded = !self.tasks_expanded;
+                    ctx.request_repaint();
+                }
+                if widget_icon(
+                    ui,
+                    Rect::from_min_max(pt(175., 151.), pt(230., 175.)),
+                    WidgetIcon::Recent,
+                    Some(self.recent_expanded),
+                    "展開 / 收起最近扣額",
+                    fg,
+                    line,
+                )
+                .clicked()
+                {
+                    self.recent_expanded = !self.recent_expanded;
+                    ctx.request_repaint();
+                }
+                if self.tasks_expanded || self.recent_expanded {
+                    let content = Rect::from_min_max(
+                        pt(21., 184.),
+                        Pos2::new(pt(289., 184.).x, rect.bottom() - 12. * sy),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("widget-details")
+                            .max_height(content.height().max(0.))
+                            .min_scrolled_height(0.)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.tasks_expanded {
+                                    self.widget_task_rows(
+                                        ui, ctx, sx, sy, font_size, fg, muted, accent,
+                                    );
+                                    let footer = if self.main_cache.loading {
+                                        "更新中".into()
+                                    } else {
+                                        format!(
+                                            "本%累計 {}{}",
+                                            money(Some(self.main_cache.cost.known_usd)),
+                                            if self.main_cache.cost.partial {
+                                                " *"
+                                            } else {
+                                                ""
+                                            }
+                                        )
+                                    };
+                                    ui.add_space(6. * sy);
+                                    ui.label(RichText::new(footer).size(font_size).color(fg));
+                                }
+                                if self.recent_expanded {
+                                    if self.tasks_expanded {
+                                        ui.separator();
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&recent_text).size(font_size).color(fg),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                if let Some(progress) = self.compact_status_text() {
+                                    ui.separator();
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(progress)
+                                                    .size(font_size)
+                                                    .color(muted),
+                                            )
+                                            .wrap()
+                                            .sense(Sense::click()),
+                                        )
+                                        .on_hover_text(self.import_diagnostic_text())
+                                        .clicked()
+                                    {
+                                        self.settings_open = true;
+                                    }
+                                }
+                            });
+                    });
+                }
                 let resize = ui.interact(
-                    Rect::from_min_max(Pos2::new(rect.right()-16.*sx,rect.bottom()-16.*sy),rect.max),
+                    Rect::from_min_max(
+                        Pos2::new(rect.right() - 16. * sx, rect.bottom() - 16. * sy),
+                        rect.max,
+                    ),
                     ui.id().with("resize"),
                     Sense::drag(),
                 );
@@ -2606,6 +2774,234 @@ impl WidgetApp {
                     ));
                 }
             });
+    }
+    fn widget_task_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        sx: f32,
+        sy: f32,
+        font_size: f32,
+        fg: Color32,
+        muted: Color32,
+        accent: Color32,
+    ) {
+        let row_height = (22. * sy).max(font_size * 1.4);
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        let (header, _) = ui.allocate_exact_size(
+            Vec2::new(268. * sx, (24. * sy).max(font_size * 1.4)),
+            Sense::hover(),
+        );
+        for (x, label) in [
+            (0., "對話"),
+            (84., "時間+8"),
+            (142., "用度"),
+            (204., "本%累計"),
+        ] {
+            ui.painter().text(
+                header.min + Vec2::new(x * sx, 0.),
+                Align2::LEFT_TOP,
+                label,
+                FontId::proportional(font_size),
+                fg,
+            );
+        }
+        ui.interact(header, ui.id().with("task-column-help"), Sense::hover())
+            .on_hover_text("用度：最新 Response\n本%累計：自身估算 USD\n*：部分");
+        if self.main_cache.tree.is_empty() {
+            ui.label(
+                RichText::new(self.empty_task_status())
+                    .size(font_size)
+                    .color(muted),
+            );
+        }
+        for i in 0..self.main_cache.tree.len() {
+            let row = &self.main_cache.tree[i];
+            let (r, response) =
+                ui.allocate_exact_size(Vec2::new(268. * sx, row_height), Sense::hover());
+            match row {
+                usage_views::TaskTreeRow::SelfTask {
+                    task_id,
+                    task_index,
+                    depth,
+                    relationship,
+                } => {
+                    let task = task_index.and_then(|i| self.main_cache.tasks.get(i));
+                    let mut tooltip=task.map(|t|self.task_tooltip(t)).unwrap_or_else(||format!("{}\nTask ID: {}\n狀態：無近期用量\nInput: 未知\nCached: 未知\nUncached: 未知\nOutput: 未知\nReasoning: 未知\nTurn Input: 未知\nTurn Output: 未知",self.tokens.task_name(task_id).unwrap_or("名稱未記錄"),task_id));
+                    let relation = match relationship {
+                        usage_views::TaskRelationship::Unlinked => "上層：未知".into(),
+                        usage_views::TaskRelationship::Child { parent_id } => {
+                            format!("上層: {parent_id}")
+                        }
+                        usage_views::TaskRelationship::Orphan { parent_id } => {
+                            format!("上層（部分）: {}", parent_id.as_deref().unwrap_or("未知"))
+                        }
+                        usage_views::TaskRelationship::Cycle { parent_id } => {
+                            format!("上層（循環）: {parent_id}")
+                        }
+                    };
+                    tooltip.push_str(&format!("\n{relation}"));
+                    response.on_hover_ui(|ui| {
+                        readable_tooltip(ui, &tooltip, font_size);
+                    });
+                    let indent = (*depth as f32 * 8.).min(32.);
+                    let name = self
+                        .tokens
+                        .task_name(task_id)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| task_id.chars().take(7).collect());
+                    let rect = Rect::from_min_size(
+                        r.min + Vec2::new(indent * sx, 0.),
+                        Vec2::new((81. - indent) * sx, row_height),
+                    );
+                    let label = if *depth > 0 {
+                        format!("└ {name}")
+                    } else {
+                        name
+                    };
+                    let font = FontId::proportional(font_size);
+                    let mut short = label.clone();
+                    while ui
+                        .painter()
+                        .layout_no_wrap(short.clone(), font.clone(), fg)
+                        .size()
+                        .x
+                        > rect.width() - 2. * sx
+                        && short.chars().count() > 2
+                    {
+                        if short.ends_with('…') {
+                            short.pop();
+                        }
+                        short.pop();
+                        short.push('…');
+                    }
+                    ui.painter()
+                        .with_clip_rect(rect.intersect(ui.clip_rect()))
+                        .text(
+                            rect.min + Vec2::new(0., 2. * sy),
+                            Align2::LEFT_TOP,
+                            short,
+                            font,
+                            fg,
+                        );
+                    if ui
+                        .interact(rect, ui.id().with(("task-name", task_id)), Sense::click())
+                        .on_hover_ui(|ui| {
+                            readable_tooltip(ui, &tooltip, font_size);
+                        })
+                        .clicked()
+                    {
+                        ctx.copy_text(task_id.clone());
+                    }
+                    let values = if let Some(task) = task {
+                        [
+                            (84., local_time(task.latest_timestamp)),
+                            (142., money(task.latest_cost_usd)),
+                            (
+                                204.,
+                                format!(
+                                    "{}{}",
+                                    money(task.interval_cost_usd),
+                                    if task.partial { "*" } else { "" }
+                                ),
+                            ),
+                        ]
+                    } else {
+                        [
+                            (84., "—".into()),
+                            (142., "—".into()),
+                            (
+                                204.,
+                                if self.main_cache.loading {
+                                    "$—*".into()
+                                } else {
+                                    "$0.0000*".into()
+                                },
+                            ),
+                        ]
+                    };
+                    for (x, text) in values {
+                        let cell = Rect::from_min_size(
+                            r.min + Vec2::new(x * sx, 0.),
+                            Vec2::new(if x == 84. { 56. } else { 62. } * sx, row_height),
+                        );
+                        ui.painter()
+                            .with_clip_rect(cell.intersect(ui.clip_rect()))
+                            .text(
+                                cell.min + Vec2::new(0., 2. * sy),
+                                Align2::LEFT_TOP,
+                                &text,
+                                FontId::proportional(font_size),
+                                fg,
+                            );
+                        ui.interact(
+                            cell,
+                            ui.id().with(("task-cell", task_id, x as i32)),
+                            Sense::hover(),
+                        )
+                        .on_hover_ui(|ui| {
+                            readable_tooltip(ui, &format!("{}\n{}", text, tooltip), font_size)
+                        });
+                    }
+                }
+                usage_views::TaskTreeRow::ChildrenSummary {
+                    parent_id,
+                    depth,
+                    descendant_count,
+                    direct_child_count,
+                    known_cost_usd,
+                    partial,
+                    expanded,
+                } => {
+                    let indent = (*depth as f32 * 8.).min(32.);
+                    let label = format!(
+                        "[{}] 子代理 {}",
+                        if *expanded { "−" } else { "+" },
+                        descendant_count
+                    );
+                    let help=format!("顯示子代理：{descendant_count}\n直接分支：{direct_child_count}\n範圍：近2h／本%\n本%累計：{}{}",money(Some(*known_cost_usd)),if *partial {" *"} else {""});
+                    response.on_hover_text(&help);
+                    let button_rect = Rect::from_min_size(
+                        r.min + Vec2::new(indent * sx, 0.),
+                        Vec2::new((200. - indent) * sx, row_height),
+                    );
+                    ui.painter().text(
+                        button_rect.min + Vec2::new(0., 2. * sy),
+                        Align2::LEFT_TOP,
+                        label,
+                        FontId::proportional(font_size),
+                        accent,
+                    );
+                    if ui
+                        .interact(
+                            button_rect,
+                            ui.id().with(("children-toggle", parent_id)),
+                            Sense::click(),
+                        )
+                        .on_hover_text(&help)
+                        .clicked()
+                    {
+                        if *expanded {
+                            self.expanded_tasks.remove(parent_id);
+                        } else {
+                            self.expanded_tasks.insert(parent_id.clone());
+                        }
+                        self.tree_generation += 1;
+                    }
+                    ui.painter().text(
+                        r.min + Vec2::new(204. * sx, 2. * sy),
+                        Align2::LEFT_TOP,
+                        format!(
+                            "{}{}",
+                            money((!self.main_cache.loading).then_some(*known_cost_usd)),
+                            if *partial { "*" } else { "" }
+                        ),
+                        FontId::proportional(font_size),
+                        accent,
+                    );
+                }
+            }
+        }
     }
     fn topmost(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd_to(
@@ -3768,15 +4164,6 @@ impl WidgetApp {
                 .changed()
             {
                 self.topmost(ctx);
-                self.dirty = true;
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Task 可見行數");
-            if ui
-                .add(egui::DragValue::new(&mut self.settings.task_visible_rows).range(1..=50))
-                .changed()
-            {
                 self.dirty = true;
             }
         });
@@ -5148,9 +5535,10 @@ mod widget_revision_tests {
     #[test]
     fn visible_children_summary_click_expands_and_collapses() {
         let mut app = demo_app();
+        app.tasks_expanded = true;
         let ctx = egui::Context::default();
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 511.));
-        let pos = Pos2::new(60. * 430. / 310., 296. * 430. / 310.);
+        let pos = Pos2::new(60. * 430. / 310., 241. * 430. / 310.);
         let frame = |app: &mut WidgetApp, events: Vec<egui::Event>| {
             let input = egui::RawInput {
                 screen_rect: Some(rect),
@@ -5234,7 +5622,7 @@ mod widget_revision_tests {
         }
     }
     #[test]
-    fn saved_theme_pins_first_frame_and_button_text_against_system_theme() {
+    fn saved_theme_pins_first_frame_and_icon_strokes_against_system_theme() {
         let temp = tempfile::tempdir().unwrap();
         for dark in [true, false, true] {
             let settings = Settings {
@@ -5278,21 +5666,10 @@ mod widget_revision_tests {
             } else {
                 Color32::from_rgb(29, 61, 45)
             };
-            let mut found = 0;
-            for shape in output.shapes {
-                if let egui::Shape::Text(text) = shape.shape {
-                    if ["扣額紀錄", "Token明細"].contains(&text.galley.job.text.as_str()) {
-                        found += 1;
-                        assert!(text
-                            .galley
-                            .job
-                            .sections
-                            .iter()
-                            .all(|section| section.format.color == expected));
-                    }
-                }
-            }
-            assert_eq!(found, 2);
+            let icon_strokes=output.shapes.iter().filter(|shape| {
+                matches!(&shape.shape,egui::Shape::LineSegment{stroke,..} if stroke.color==expected)
+            }).count();
+            assert!(icon_strokes >= 10, "icons remain visible in either theme");
         }
     }
     #[test]
@@ -6730,7 +7107,10 @@ mod database_display_tests {
             false,
             t + Duration::from_secs(1),
         );
-        assert_eq!(first.minimum, Some(Vec2::new(430., 510.)));
+        assert_eq!(
+            first.minimum,
+            Some(Vec2::new(280., COLLAPSED_HEIGHT * 430. / 310.))
+        );
         assert!(
             first.size.is_none(),
             "apply the new minimum before resizing"
@@ -6907,7 +7287,7 @@ mod database_display_tests {
             false,
             t + Duration::from_secs(104),
         );
-        assert_eq!(
+        assert!(
             layout
                 .plan(
                     new,
@@ -6916,8 +7296,9 @@ mod database_display_tests {
                     false,
                     t + Duration::from_secs(105)
                 )
-                .size,
-            Some(Vec2::new(450., 530.))
+                .size
+                .is_none(),
+            "manual height is preserved after initial convergence"
         );
     }
 }
@@ -7161,17 +7542,19 @@ mod accessible_ui_tests {
     use super::*;
 
     #[test]
-    fn visible_rows_follow_threshold_and_shrink_to_fit_monitor() {
-        assert_eq!(accessible_visible_rows(9, 10, 430. / 310., Some(1080.)), 9);
-        assert_eq!(
-            accessible_visible_rows(11, 10, 430. / 310., Some(1080.)),
-            10
-        );
-        assert_eq!(accessible_visible_rows(20, 6, 430. / 310., Some(1080.)), 6);
-        let fit = accessible_visible_rows(20, 10, 2., Some(768.));
-        assert!(fit < 10);
-        assert!((324. + 22. * fit as f32) * 2. <= 768. - 60.);
-        assert_eq!(accessible_visible_rows(0, 10, 1., None), 1);
+    fn expanded_content_uses_window_height_instead_of_row_threshold() {
+        assert_eq!(widget_target_height(310., 0., Some(1080.)), 184.);
+        assert_eq!(widget_target_height(310., 300., Some(1080.)), 484.);
+        assert_eq!(widget_target_height(310., 2000., Some(768.)), 708.);
+        let mut settings = Settings {
+            size: [450., 1000.],
+            compact_layout_version: 0,
+            ..Default::default()
+        };
+        prepare_widget_settings(&mut settings);
+        assert_eq!(settings.size, [300., 184. * 300. / 310.]);
+        prepare_widget_settings(&mut settings);
+        assert_eq!(settings.size[0], 300., "narrowing is a one-time migration");
     }
 
     #[test]
@@ -7179,6 +7562,7 @@ mod accessible_ui_tests {
         for dark in [false, true] {
             for width in [430., 540., 700.] {
                 let mut app = super::widget_revision_tests::demo_app();
+                app.tasks_expanded = true;
                 app.settings.dark = dark;
                 app.settings.size[0] = width;
                 let ctx = egui::Context::default();
@@ -7212,44 +7596,150 @@ mod accessible_ui_tests {
     }
 
     #[test]
-    fn footer_hover_renders_actual_tooltip_at_readable_size() {
+    fn details_scroll_only_when_the_window_cannot_fit_all_rows() {
         let mut app = super::widget_revision_tests::demo_app();
-        app.settings.size[0] = 430.;
+        app.tasks_expanded = true;
+        app.settings.task_visible_rows = 1; // An obsolete preference must not truncate the list.
+        app.refresh_main_cache();
+        app.main_cache.tree = (0..30)
+            .map(|n| usage_views::TaskTreeRow::SelfTask {
+                task_id: format!("row-{n:02}"),
+                task_index: None,
+                depth: 0,
+                relationship: usage_views::TaskRelationship::Unlinked,
+            })
+            .collect();
         let ctx = egui::Context::default();
-        app.apply_theme(&ctx);
-        let mut found = false;
-        for time in [0., 0.1, 1., 2., 3.] {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 510.))),
-                time: Some(time),
-                events: if time == 0. {
-                    vec![egui::Event::PointerMoved(Pos2::new(215., 470.))]
-                } else {
-                    Vec::new()
+        let frame = |app: &mut WidgetApp, height, events, time| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(310., height))),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
                 },
-                ..Default::default()
-            };
-            let output = ctx.run(input, |ctx| app.widget(ctx));
-            for clipped in output.shapes {
-                if let egui::Shape::Text(text) = clipped.shape {
-                    if text.galley.job.text.contains("最近 5 次扣額") {
-                        found = true;
-                        assert!(text
-                            .galley
-                            .job
-                            .sections
-                            .iter()
-                            .all(|s| s.format.font_id.size >= 18.));
+                |ctx| app.widget(ctx),
+            )
+        };
+        let visible = |output: egui::FullOutput| {
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(t) = shape.shape {
+                        let bounds = t.galley.rect.translate(t.pos.to_vec2());
+                        if t.galley.job.text.starts_with("row-")
+                            && bounds.intersects(shape.clip_rect)
+                        {
+                            return Some(t.galley.job.text.clone());
+                        }
                     }
-                }
-            }
+                    None
+                })
+                .collect::<Vec<_>>()
+        };
+        let full = visible(frame(&mut app, 1200., vec![], 0.));
+        assert_eq!(full.len(), 30, "the old one-row preference is ignored");
+        let small = visible(frame(&mut app, 400., vec![], 0.1));
+        assert!(small.len() < 30 && small.contains(&"row-00".into()));
+        let mut end = Vec::new();
+        for time in [0.2, 0.4, 0.8] {
+            end = visible(frame(
+                &mut app,
+                400.,
+                vec![
+                    egui::Event::PointerMoved(Pos2::new(150., 300.)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0., -1000.),
+                        modifiers: Default::default(),
+                    },
+                ],
+                time,
+            ));
         }
-        assert!(found);
+        assert!(
+            end.contains(&"row-29".into()),
+            "the last row remains reachable by scrolling: {end:?}"
+        );
+    }
+
+    #[test]
+    fn compact_expanders_are_independent_and_progress_stays_in_details() {
+        let mut app = super::widget_revision_tests::demo_app();
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(310., 900.));
+        let frame = |app: &mut WidgetApp, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.widget(ctx),
+            )
+        };
+        let text = |output: egui::FullOutput| {
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(t) = shape.shape {
+                        Some(t.galley.job.text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let collapsed = text(frame(&mut app, vec![]));
+        assert!(!app.tasks_expanded && !app.recent_expanded);
+        for hidden in ["對話", "最近 5 次扣額", "正在讀取", "扣額紀錄", "Token明細"]
+        {
+            assert!(!collapsed.contains(hidden), "{hidden}");
+        }
+        let click = |app: &mut WidgetApp, pos| {
+            frame(app, vec![egui::Event::PointerMoved(pos)]);
+            frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                }],
+            );
+            frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            )
+        };
+        let tasks = text(click(&mut app, Pos2::new(107., 163.)));
+        assert!(app.tasks_expanded && !app.recent_expanded);
+        assert!(tasks.contains("對話"));
+        click(&mut app, Pos2::new(202., 163.));
+        let both = text(frame(&mut app, vec![]));
+        assert!(app.tasks_expanded && app.recent_expanded);
+        let recent_heading = format!("最近 {} 次扣額", app.main_cache.recent_events.len());
+        assert!(both.contains(&recent_heading), "{both}");
+        click(&mut app, Pos2::new(107., 163.));
+        assert!(!app.tasks_expanded && app.recent_expanded);
+        click(&mut app, Pos2::new(226., 22.));
+        assert!(app.history_open);
+        click(&mut app, Pos2::new(254., 22.));
+        assert!(app.tokens_open);
     }
 
     #[test]
     fn narrow_task_tooltip_wraps_inside_native_viewport() {
         let mut app = super::widget_revision_tests::demo_app();
+        app.tasks_expanded = true;
         app.settings.size[0] = 430.;
         let ctx = egui::Context::default();
         app.apply_theme(&ctx);
@@ -7260,7 +7750,7 @@ mod accessible_ui_tests {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430., 510.))),
                     time: Some(time),
                     events: if time == 0. {
-                        vec![egui::Event::PointerMoved(Pos2::new(60., 378.))]
+                        vec![egui::Event::PointerMoved(Pos2::new(60., 300.))]
                     } else {
                         Vec::new()
                     },
