@@ -102,7 +102,11 @@ fn prepare_widget_settings(settings: &mut Settings) {
         settings.size[0] *= 0.92;
         settings.compact_layout_version = 3;
     }
-    settings.size[0] = settings.size[0].clamp(250., 1000.);
+    if settings.compact_layout_version < 4 {
+        settings.size[0] *= 0.94;
+        settings.compact_layout_version = 4;
+    }
+    settings.size[0] = settings.size[0].clamp(230., 1000.);
     settings.size[1] = COLLAPSED_HEIGHT * settings.size[0] / 310.;
 }
 
@@ -288,7 +292,7 @@ impl LayoutConvergence {
             self.next_retry = None;
             self.converged = false;
             self.quiet_since = Some(t);
-            plan.minimum = Some(Vec2::new(250., COLLAPSED_HEIGHT * actual.x / 310.));
+            plan.minimum = Some(Vec2::new(230., COLLAPSED_HEIGHT * actual.x / 310.));
         }
         if self
             .observed_size
@@ -556,6 +560,7 @@ struct WidgetApp {
     dates_key: Option<(u64, u64, NaiveDate, u32)>,
     dates_cache: BTreeSet<NaiveDate>,
     layout: LayoutConvergence,
+    detail_measurement: Option<(bool, bool, u32, f32)>,
     bridge: Option<Bridge>,
     quota_retry_at: Option<Instant>,
     status: String,
@@ -1004,6 +1009,11 @@ fn model_usage_tooltip(
 fn now() -> i64 {
     Utc::now().timestamp()
 }
+fn cents(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{:.2}¢", v * 100.))
+        .unwrap_or_else(|| "—".into())
+}
 fn local_time(t: i64) -> String {
     display_time::time(t)
 }
@@ -1258,7 +1268,7 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
     prepare_widget_settings(&mut settings);
     let mut viewport = ViewportBuilder::default()
         .with_inner_size(settings.size)
-        .with_min_inner_size([250., COLLAPSED_HEIGHT * 250. / 310.])
+        .with_min_inner_size([230., COLLAPSED_HEIGHT * 230. / 310.])
         .with_max_inner_size([1000., 2000.])
         .with_decorations(false)
         .with_transparent(true)
@@ -1372,6 +1382,7 @@ impl WidgetApp {
             dates_key: None,
             dates_cache: BTreeSet::new(),
             layout: LayoutConvergence::default(),
+            detail_measurement: None,
             bridge: None,
             quota_retry_at: None,
             status: "OFFLINE".into(),
@@ -2562,55 +2573,79 @@ impl WidgetApp {
         }
     }
     fn recent_usage_table(&self, ui: &mut egui::Ui) {
-        ui.label(tr(format!(
-            "最近 {} 次扣額",
-            self.recent_usage.segments.len()
-        )));
-        egui::Grid::new("recent-quota-summary")
-            .striped(true)
-            .num_columns(3)
-            .min_col_width(0.)
-            .show(ui, |ui| {
-                for header in ["額度變化", "結算時間", "Total"] {
-                    ui.strong(tr(header));
-                }
-                ui.end_row();
-                for (segment, cost) in self
-                    .recent_usage
-                    .segments
-                    .iter()
-                    .zip(&self.recent_usage.costs)
-                {
-                    let event = segment.event.as_ref().expect("completed recent segment");
-                    ui.label(format!("{}% → {}%", event.before, event.after));
-                    let date = chrono::DateTime::from_timestamp(segment.end, 0)
-                        .map(|d| d.with_timezone(&display_time::timezone()));
-                    ui.label(
+        let width = ui.available_width();
+        let font_size = ui.text_style_height(&egui::TextStyle::Body);
+        let row_height = font_size * 1.5;
+        let color = ui.visuals().text_color();
+        for index in 0..=self.recent_usage.segments.len() {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, row_height), Sense::hover());
+            if index % 2 == 1 {
+                ui.painter()
+                    .rect_filled(rect, 2., ui.visuals().faint_bg_color);
+            }
+            let (values, tooltip) = if index == 0 {
+                (
+                    [tr("額度變化"), tr("結算時間"), "Total".into()],
+                    String::new(),
+                )
+            } else {
+                let segment = &self.recent_usage.segments[index - 1];
+                let event = segment.event.as_ref().expect("completed recent segment");
+                let date = chrono::DateTime::from_timestamp(segment.end, 0)
+                    .map(|d| d.with_timezone(&display_time::timezone()));
+                let cost = self.recent_usage.costs[index - 1]
+                    .map(|c| format!("${:.2}", c.known_usd))
+                    .unwrap_or_else(|| {
+                        tr(if self.recent_usage.error.is_some() {
+                            "讀取失敗"
+                        } else {
+                            "計算中"
+                        })
+                    });
+                (
+                    [
+                        format!("{}% → {}%", event.before, event.after),
                         date.map(|d| d.format("%H:%M").to_string())
                             .unwrap_or_default(),
-                    )
-                    .on_hover_text(
-                        date.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-                            .unwrap_or_default(),
-                    );
-                    if let Some(cost) = cost {
-                        ui.label(format!("${:.2}", cost.known_usd))
-                            .on_hover_text(tr(format!(
-                                "記錄：{} 筆 · 未定價：{} 筆{}",
-                                cost.events,
-                                cost.unknown_events,
-                                if cost.partial { " · 部分資料" } else { "" }
-                            )));
+                        cost,
+                    ],
+                    date.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_default(),
+                )
+            };
+            for (column, value) in values.iter().enumerate() {
+                let fractions = [0., 0.43, 0.74, 1.];
+                let cell = Rect::from_min_max(
+                    Pos2::new(rect.left() + width * fractions[column], rect.top()),
+                    Pos2::new(rect.left() + width * fractions[column + 1], rect.bottom()),
+                );
+                let measured = ui
+                    .painter()
+                    .layout_no_wrap(value.clone(), FontId::proportional(font_size), color)
+                    .size()
+                    .x;
+                let fitted = font_size * ((cell.width() - 4.) / measured.max(1.)).min(1.);
+                ui.painter().text(
+                    if column == 2 {
+                        cell.right_top() - Vec2::new(2., -2.)
                     } else {
-                        ui.label(if self.recent_usage.error.is_some() {
-                            tr("讀取失敗")
-                        } else {
-                            tr("計算中")
-                        });
-                    }
-                    ui.end_row();
+                        cell.left_top() + Vec2::splat(2.)
+                    },
+                    if column == 2 {
+                        Align2::RIGHT_TOP
+                    } else {
+                        Align2::LEFT_TOP
+                    },
+                    value,
+                    FontId::proportional(fitted),
+                    color,
+                );
+                if column == 1 && !tooltip.is_empty() {
+                    ui.interact(cell, ui.id().with(("recent-time", index)), Sense::hover())
+                        .on_hover_text(&tooltip);
                 }
-            });
+            }
+        }
     }
     fn widget(&mut self, ctx: &egui::Context) {
         self.refresh_main_cache();
@@ -2656,14 +2691,22 @@ impl WidgetApp {
                     details += (24. * sy).max(font_size * 1.4)
                         + (22. * sy).max(font_size * 1.4)
                             * self.main_cache.tree.len().max(1) as f32
-                        + 52. * sy;
+                        + 28. * sy;
                 }
                 if self.recent_expanded {
-                    details += (self.recent_usage.segments.len() as f32 + 2.)
+                    details += (self.recent_usage.segments.len() as f32 + 1.)
                         * (font_size * 1.5).max(24. * sy);
                 }
                 if self.tasks_expanded || self.recent_expanded {
-                    details += 42. * sy;
+                    details += 12. * sy;
+                }
+                if let Some((tasks, recent, width, measured)) = self.detail_measurement {
+                    if tasks == self.tasks_expanded
+                        && recent == self.recent_expanded
+                        && width == rect.width().to_bits()
+                    {
+                        details = measured;
+                    }
                 }
                 let height = widget_target_height(rect.width(), details, monitor_height);
                 let suspended = ctx.input(|i| {
@@ -2746,7 +2789,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.39".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.40".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -2851,7 +2894,7 @@ impl WidgetApp {
                         fg,
                     );
                 }
-                let bar = Rect::from_min_max(pt(145., 97.), pt(289., 100.));
+                let bar = Rect::from_min_max(pt(145., 103.), pt(289., 106.));
                 painter.rect_filled(bar, 3., line);
                 if let Some(p) = view.as_ref().and_then(|v| v.remaining_percent) {
                     painter.rect_filled(
@@ -2909,7 +2952,7 @@ impl WidgetApp {
                 ];
                 for (index, text) in summary.into_iter().enumerate() {
                     let text = tr(text);
-                    let y = 40. + index as f32 * 17.;
+                    let y = 46. + index as f32 * 17.;
                     let available = 144. * sx;
                     let measured = painter
                         .layout_no_wrap(tr(text.clone()), FontId::proportional(font_size), fg)
@@ -2925,7 +2968,7 @@ impl WidgetApp {
                     );
                 }
                 ui.interact(
-                    Rect::from_min_max(pt(145., 40.), pt(289., 104.)),
+                    Rect::from_min_max(pt(145., 46.), pt(289., 110.)),
                     ui.id().with("quota-details"),
                     Sense::hover(),
                 )
@@ -3051,7 +3094,7 @@ impl WidgetApp {
                         Pos2::new(pt(289., 158.).x, rect.bottom() - 12. * sy),
                     );
                     ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
-                        egui::ScrollArea::vertical()
+                        let output = egui::ScrollArea::vertical()
                             .id_salt("widget-details")
                             .max_height(content.height().max(0.))
                             .min_scrolled_height(0.)
@@ -3102,6 +3145,17 @@ impl WidgetApp {
                                     }
                                 }
                             });
+                        let measured = output.content_size.y + 12. * sy;
+                        let next = (
+                            self.tasks_expanded,
+                            self.recent_expanded,
+                            rect.width().to_bits(),
+                            measured,
+                        );
+                        if self.detail_measurement != Some(next) {
+                            self.detail_measurement = Some(next);
+                            ctx.request_repaint();
+                        }
                     });
                 }
                 let resize = ui.interact(
@@ -3138,12 +3192,7 @@ impl WidgetApp {
             Vec2::new(268. * sx, (24. * sy).max(font_size * 1.4)),
             Sense::hover(),
         );
-        for (x, label) in [
-            (0., "對話"),
-            (84., "時間"),
-            (142., "用度"),
-            (204., "本%累計"),
-        ] {
+        for (x, label) in [(0., "對話"), (84., "時間"), (140., "用度")] {
             ui.painter().text(
                 header.min + Vec2::new(x * sx, 0.),
                 Align2::LEFT_TOP,
@@ -3241,13 +3290,22 @@ impl WidgetApp {
                     }
                     let values = if let Some(task) = task {
                         [
-                            (84., local_time(task.latest_timestamp)),
-                            (142., money(task.latest_cost_usd)),
                             (
-                                204.,
+                                84.,
+                                chrono::DateTime::from_timestamp(task.latest_timestamp, 0)
+                                    .map(|t| {
+                                        t.with_timezone(&display_time::timezone())
+                                            .format("%H:%M")
+                                            .to_string()
+                                    })
+                                    .unwrap_or_default(),
+                            ),
+                            (
+                                140.,
                                 format!(
-                                    "{}{}",
-                                    money(task.interval_cost_usd),
+                                    "{} / {}{}",
+                                    cents(task.latest_cost_usd),
+                                    cents(task.interval_cost_usd),
                                     if task.partial { "*" } else { "" }
                                 ),
                             ),
@@ -3255,13 +3313,12 @@ impl WidgetApp {
                     } else {
                         [
                             (84., "—".into()),
-                            (142., "—".into()),
                             (
-                                204.,
+                                140.,
                                 if self.main_cache.loading {
-                                    "$—*".into()
+                                    "— / —".into()
                                 } else {
-                                    "$0.0000*".into()
+                                    "— / 0.00¢*".into()
                                 },
                             ),
                         ]
@@ -3269,7 +3326,7 @@ impl WidgetApp {
                     for (x, text) in values {
                         let cell = Rect::from_min_size(
                             r.min + Vec2::new(x * sx, 0.),
-                            Vec2::new(if x == 84. { 56. } else { 62. } * sx, row_height),
+                            Vec2::new(if x == 84. { 53. } else { 128. } * sx, row_height),
                         );
                         ui.painter()
                             .with_clip_rect(cell.intersect(ui.clip_rect()))
@@ -3277,7 +3334,20 @@ impl WidgetApp {
                                 cell.min + Vec2::new(0., 2. * sy),
                                 Align2::LEFT_TOP,
                                 tr(&text),
-                                FontId::proportional(font_size),
+                                FontId::proportional(
+                                    font_size
+                                        * ((cell.width() - 2.)
+                                            / ui.painter()
+                                                .layout_no_wrap(
+                                                    tr(&text),
+                                                    FontId::proportional(font_size),
+                                                    fg,
+                                                )
+                                                .size()
+                                                .x
+                                                .max(1.))
+                                        .min(1.),
+                                ),
                                 fg,
                             );
                         ui.interact(
@@ -3309,7 +3379,7 @@ impl WidgetApp {
                     response.on_hover_text(tr(&help));
                     let button_rect = Rect::from_min_size(
                         r.min + Vec2::new(indent * sx, 0.),
-                        Vec2::new((200. - indent) * sx, row_height),
+                        Vec2::new((137. - indent) * sx, row_height),
                     );
                     ui.painter().text(
                         button_rect.min + Vec2::new(0., 2. * sy),
@@ -3335,11 +3405,11 @@ impl WidgetApp {
                         self.tree_generation += 1;
                     }
                     ui.painter().text(
-                        r.min + Vec2::new(204. * sx, 2. * sy),
+                        r.min + Vec2::new(140. * sx, 2. * sy),
                         Align2::LEFT_TOP,
                         tr(format!(
                             "{}{}",
-                            money((!self.main_cache.loading).then_some(*known_cost_usd)),
+                            cents((!self.main_cache.loading).then_some(*known_cost_usd)),
                             if *partial { "*" } else { "" }
                         )),
                         FontId::proportional(font_size),
@@ -7803,7 +7873,7 @@ mod database_display_tests {
         );
         assert_eq!(
             first.minimum,
-            Some(Vec2::new(250., COLLAPSED_HEIGHT * 430. / 310.))
+            Some(Vec2::new(230., COLLAPSED_HEIGHT * 430. / 310.))
         );
         assert!(
             first.size.is_none(),
@@ -8466,11 +8536,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.39", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.39", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.40", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.40", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.39",
+                "Codex Quota v3.40",
                 "Interface font size",
             ),
         ] {
@@ -8517,6 +8587,41 @@ mod accessible_ui_tests {
     }
 
     #[test]
+    fn compact_costs_use_cents_and_task_rows_merge_usage_columns() {
+        assert_eq!(cents(Some(0.0141)), "1.41¢");
+        assert_eq!(cents(Some(0.7859)), "78.59¢");
+        assert_eq!(cents(Some(0.)), "0.00¢");
+        let mut app = super::widget_revision_tests::demo_app();
+        app.tasks_expanded = true;
+        let ctx = egui::Context::default();
+        app.apply_theme(&ctx);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(310., 900.))),
+                ..Default::default()
+            },
+            |ctx| app.widget(ctx),
+        );
+        let values: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| {
+                if let egui::Shape::Text(t) = &s.shape {
+                    Some(t.galley.job.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(values.contains(&"用度"));
+        assert!(!values.contains(&"本%累計"));
+        assert!(values
+            .iter()
+            .any(|v| v.contains("¢ / ") && v.ends_with('¢')
+                || v.contains("¢ / ") && v.ends_with("¢*")));
+        assert!(app.detail_measurement.is_some());
+    }
+    #[test]
     fn expanded_content_uses_window_height_instead_of_row_threshold() {
         assert_eq!(widget_target_height(310., 0., Some(1080.)), 158.);
         assert_eq!(widget_target_height(310., 300., Some(1080.)), 458.);
@@ -8527,11 +8632,14 @@ mod accessible_ui_tests {
             ..Default::default()
         };
         prepare_widget_settings(&mut settings);
-        assert_eq!(settings.size, [282. * 0.92, 158. * (282. * 0.92) / 310.]);
+        assert_eq!(
+            settings.size,
+            [282. * 0.92 * 0.94, 158. * (282. * 0.92 * 0.94) / 310.]
+        );
         prepare_widget_settings(&mut settings);
         assert_eq!(
             settings.size[0],
-            282. * 0.92,
+            282. * 0.92 * 0.94,
             "narrowing is a one-time migration"
         );
     }
@@ -8712,8 +8820,11 @@ mod accessible_ui_tests {
         click(&mut app, Pos2::new(265., 129.));
         let both = text(frame(&mut app, vec![]));
         assert!(app.tasks_expanded && app.recent_expanded);
-        let recent_heading = format!("最近 {} 次扣額", app.main_cache.recent_events.len());
-        assert!(both.contains(&recent_heading), "{both}");
+        assert!(
+            both.contains("額度變化") && both.contains("Total"),
+            "{both}"
+        );
+        assert!(!both.contains("最近 5 次扣額"), "{both}");
         click(&mut app, Pos2::new(207., 129.));
         assert!(!app.tasks_expanded && app.recent_expanded);
         click(&mut app, Pos2::new(137., 129.));
