@@ -2789,7 +2789,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.40".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.41".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -8536,11 +8536,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.40", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.40", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.41", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.41", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.40",
+                "Codex Quota v3.41",
                 "Interface font size",
             ),
         ] {

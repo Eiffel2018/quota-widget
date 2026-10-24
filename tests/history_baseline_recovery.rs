@@ -16,7 +16,8 @@ fn observation(t: i64, remaining: i64, reset: Option<i64>) -> ImportedQuotaObser
         source_id: Some("synthetic-source".into()),
         payload: json!({"limit_id":"codex","primary":{
             "used_percent":100-remaining,"window_minutes":10080,"resets_at":reset
-        }}),
+        }})
+        .into(),
     }
 }
 

@@ -372,7 +372,7 @@ fn normalized_stale_replay_yields_only_actual_decrement_intervals() {
     let snapshots: Vec<_> = [(100, "A", 4.), (110, "A", 3.), (120, "A", 2.), (121, "B", 3.), (124, "A", 2.), (126, "B", 3.), (128, "A", 2.), (140, "A", 1.)]
         .into_iter().map(|(timestamp, origin, remaining)| ImportedQuotaObservation {
             timestamp, timestamp_ms: Some(timestamp * 1000), origin_session: Some(origin.into()), source_id: Some(format!("synthetic-{origin}")),
-            payload: json!({"limit_id":"codex","primary":{"used_percent":100. - remaining,"window_minutes":10080,"resets_at":10000}}),
+            payload: json!({"limit_id":"codex","primary":{"used_percent":100. - remaining,"window_minutes":10080,"resets_at":10000}}).into(),
         }).collect();
     let history = normalized(&replay(&snapshots));
     let events = [

@@ -191,7 +191,7 @@ mod tests {
         .unwrap();
         initialize(&conn).unwrap();
         let reset = 1_800_000_000;
-        let observations:Vec<_>=[(reset-1,2),(reset,0),(reset+30,0),(reset+60,1)].into_iter().map(|(timestamp,used)|ImportedQuotaObservation{timestamp,payload:json!({"limit_id":"codex","secondary":{"used_percent":used,"window_minutes":10080,"resets_at":reset+604800}}),origin_session:None,source_id:None,timestamp_ms:Some(timestamp*1000)}).collect();
+        let observations:Vec<_>=[(reset-1,2),(reset,0),(reset+30,0),(reset+60,1)].into_iter().map(|(timestamp,used)|ImportedQuotaObservation{timestamp,payload:json!({"limit_id":"codex","secondary":{"used_percent":used,"window_minutes":10080,"resets_at":reset+604800}}).into(),origin_session:None,source_id:None,timestamp_ms:Some(timestamp*1000)}).collect();
         let tx = conn.unchecked_transaction().unwrap();
         sync_chunk(&tx, 0, b"one", &observations).unwrap();
         tx.commit().unwrap();

@@ -172,7 +172,7 @@ fn quota_payload(remaining: f64, reset_at: i64) -> serde_json::Value {
 fn observation(time: i64, remaining: f64, origin: &str, reset_at: i64) -> ImportedQuotaObservation {
     ImportedQuotaObservation {
         timestamp: time,
-        payload: quota_payload(remaining, reset_at),
+        payload: quota_payload(remaining, reset_at).into(),
         origin_session: Some(origin.into()),
         source_id: Some(format!("synthetic-source-{origin}")),
         timestamp_ms: Some(time * 1000),

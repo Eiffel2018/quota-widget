@@ -212,6 +212,26 @@ fn hash(bytes: &[u8]) -> io::Result<Vec<u8>> {
     cancellation::check()?;
     Ok(digest.finalize().to_vec())
 }
+// Preserve the exact transaction receipt digest without allocating a full JSON copy.
+fn serialized_hash<T: Serialize + ?Sized>(value: &T) -> io::Result<Vec<u8>> {
+    cancellation::check()?;
+    struct HashWriter(Sha256);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            cancellation::check().map_err(|e| io::Error::other(e.to_string()))?;
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = std::io::BufWriter::with_capacity(IO_CHUNK, HashWriter(Sha256::new()));
+    serde_json::to_writer(&mut writer, value).map_err(error)?;
+    writer.flush().map_err(error)?;
+    cancellation::check()?;
+    Ok(writer.into_inner().map_err(error)?.0.finalize().to_vec())
+}
 fn compress(bytes: &[u8]) -> io::Result<Vec<u8>> {
     cancellation::check()?;
     let mut out = ZlibEncoder::new(Vec::new(), Compression::new(6));
@@ -864,8 +884,7 @@ impl TokenDb {
         export: &DirtyExport,
         expected_revision: u64,
     ) -> io::Result<CommitStats> {
-        let payload = encode(export)?;
-        let digest = hash(&payload)?;
+        let digest = serialized_hash(export)?;
         let operation_id = format!(
             "{expected_revision}:{}:{}",
             export.header.revision,
@@ -879,7 +898,7 @@ impl TokenDb {
         expected_revision: u64,
         operation_id: &str,
     ) -> io::Result<CommitStats> {
-        let digest = hash(&encode(export)?)?;
+        let digest = serialized_hash(export)?;
         self.commit_inner(export, expected_revision, operation_id, digest)
     }
     fn commit_inner(
@@ -1843,6 +1862,14 @@ fn immutable_uri(path: &Path) -> io::Result<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    #[test]
+    fn streamed_receipt_hash_matches_existing_serialization() {
+        let value = serde_json::json!({"quota":[{"primary":{"used_percent":1.25}}],"unicode":"額度", "nested":[null,true,123,"\n"]});
+        assert_eq!(
+            serialized_hash(&value).unwrap(),
+            hash(&encode(&value).unwrap()).unwrap()
+        );
+    }
     fn fixture_store(dir: &Path) -> TokenStore {
         fs::write(
             dir.join("source.jsonl"),

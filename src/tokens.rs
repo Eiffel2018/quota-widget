@@ -459,12 +459,62 @@ impl TokenEvent {
     }
 }
 
+/// Immutable quota JSON is shared; edits use copy-on-write and preserve raw evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaPayload(std::sync::Arc<Value>);
+thread_local! {
+    static QUOTA_PAYLOADS: std::cell::RefCell<HashMap<String, std::sync::Weak<Value>>> = std::cell::RefCell::new(HashMap::new());
+}
+impl From<Value> for QuotaPayload {
+    fn from(value: Value) -> Self {
+        let key = value.to_string();
+        QUOTA_PAYLOADS.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(shared) = pool.get(&key).and_then(std::sync::Weak::upgrade) {
+                return Self(shared);
+            }
+            if pool.len() % 4096 == 0 {
+                pool.retain(|_, value| value.strong_count() > 0);
+            }
+            let shared = std::sync::Arc::new(value);
+            pool.insert(key, std::sync::Arc::downgrade(&shared));
+            Self(shared)
+        })
+    }
+}
+impl std::ops::Deref for QuotaPayload {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for QuotaPayload {
+    fn deref_mut(&mut self) -> &mut Value {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+impl std::fmt::Display for QuotaPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl Serialize for QuotaPayload {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for QuotaPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::from)
+    }
+}
+
 /// An actually recorded quota snapshot, not a quota inferred from token totals.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImportedQuotaObservation {
     pub timestamp: i64,
     /// The actual `rate_limits` object, without a synthetic wrapper or modifications.
-    pub payload: Value,
+    pub payload: QuotaPayload,
     /// Logical thread that logged the snapshot, not a claim of account ownership.
     #[serde(default)]
     pub origin_session: Option<String>,
@@ -3131,7 +3181,7 @@ impl TokenStore {
                 if let Some(timestamp_ms) = timestamp_ms {
                     let observation = ImportedQuotaObservation {
                         timestamp: timestamp_ms.div_euclid(1000),
-                        payload: rate_limits.clone(),
+                        payload: rate_limits.clone().into(),
                         origin_session: (cursor.session.is_some() || explicit_thread.is_some())
                             .then(|| session.clone()),
                         source_id: Some(format!("{:016x}", stable_hash(source.as_bytes()))),
@@ -4773,6 +4823,22 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn quota_payloads_share_duplicates_without_changing_json_or_mutation() {
+        let original = serde_json::json!({"primary":{"used_percent":12,"resets_at":1234}});
+        let a: QuotaPayload = original.clone().into();
+        let bytes = serde_json::to_vec(&a).unwrap();
+        let mut copies: Vec<QuotaPayload> = (0..10_000)
+            .map(|_| serde_json::from_slice(&bytes).unwrap())
+            .collect();
+        assert!(copies.iter().all(|p| std::sync::Arc::ptr_eq(&a.0, &p.0)));
+        assert_eq!(serde_json::to_value(&a).unwrap(), original);
+        copies[0]["primary"]["used_percent"] = serde_json::json!(50);
+        assert_eq!(a["primary"]["used_percent"], 12);
+        assert_eq!(copies[1]["primary"]["used_percent"], 12);
+        assert_eq!(copies[0]["primary"]["used_percent"], 50);
+    }
 
     #[test]
     fn cycle_compaction_export_keeps_only_current_usage_and_one_baseline() {

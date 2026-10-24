@@ -16,7 +16,7 @@ fn observation(t: i64, r: f64, reset: i64) -> ImportedQuotaObservation {
         timestamp_ms: Some(t * 1000),
         origin_session: Some("synthetic-observer".into()),
         source_id: Some("synthetic-source".into()),
-        payload: payload(r, reset),
+        payload: payload(r, reset).into(),
     }
 }
 fn checked(observations: &[ImportedQuotaObservation]) -> Vec<quota_widget::model::HistoryEvent> {

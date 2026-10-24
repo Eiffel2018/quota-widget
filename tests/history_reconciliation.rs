@@ -14,7 +14,8 @@ fn observation(ms: i64, origin: &str, remaining: f64, reset: i64) -> ImportedQuo
         source_id: Some(format!("synthetic-source-{origin}")),
         payload: json!({"limit_id":"codex","primary":{
             "used_percent":100.0 - remaining,"window_minutes":10080,"resets_at":reset
-        }}),
+        }})
+        .into(),
     }
 }
 fn confirmed(rows: &[HistoryEvent]) -> Vec<&HistoryEvent> {

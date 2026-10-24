@@ -713,7 +713,8 @@ fn historical_replay_retains_real_observations_older_than_thirty_days() {
         timestamp_ms: None,
         payload: json!({"limit_id":"codex","primary":{
             "used_percent":used,"window_minutes":10080,"resets_at":base + 100 * 86400
-        }}),
+        }})
+        .into(),
     };
     let history = quota_widget::history::replay(&[
         observation(base, 10),
