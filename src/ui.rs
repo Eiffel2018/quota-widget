@@ -348,6 +348,7 @@ impl LayoutConvergence {
 }
 #[derive(Default)]
 struct TokenCache {
+    conversations: Vec<usage_views::ConversationGroup>,
     key: Option<(u64, NaiveDate, GroupBy, bool, usize)>,
     loading: bool,
     group_count: usize,
@@ -580,6 +581,8 @@ struct WidgetApp {
     prediction_history_checked: Option<(u64, i64, i64)>,
     date: NaiveDate,
     token_date: NaiveDate,
+    token_tree: bool,
+    expanded_token_conversations: BTreeSet<String>,
     token_group: GroupBy,
     token_page: usize,
     show_excluded_records: bool,
@@ -1402,6 +1405,8 @@ impl WidgetApp {
             prediction_history_checked: None,
             date: display_time::now_day(),
             token_date: display_time::now_day(),
+            token_tree: true,
+            expanded_token_conversations: BTreeSet::new(),
             token_group: GroupBy::Response,
             token_page: 0,
             show_excluded_records: false,
@@ -2789,7 +2794,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.42".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.43".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -4347,6 +4352,7 @@ impl WidgetApp {
                 let summary = &view.daily.summary;
                 self.token_cache = TokenCache {
                     key: Some(key),
+                    conversations: usage_views::conversation_groups(&view.daily.rows),
                     rows: view.daily.rows.clone(),
                     group_count: view.daily.group_count,
                     count: summary.event_count,
@@ -4387,6 +4393,7 @@ impl WidgetApp {
             ),
             ..Default::default()
         };
+        cache.conversations = usage_views::conversation_groups(&cache.rows);
         cache.group_count = cache.rows.len();
         for event in events {
             cache.input = cache.input.saturating_add(event.input);
@@ -4445,6 +4452,9 @@ impl WidgetApp {
                 tr("Task／Thread（當日）"),
             );
         });
+        if self.token_group != GroupBy::Task {
+            ui.checkbox(&mut self.token_tree, tr("按對話展開／收起"));
+        }
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(
                 &mut self.show_excluded_records,
@@ -4565,21 +4575,47 @@ impl WidgetApp {
             "推理",
             "估算 USD",
         ];
+        let tree = self.token_tree && self.token_group != GroupBy::Task;
+        if tree && cache.group_count > cache.rows.len() {
+            ui.small(tr("對話小計只包含本頁事件；其他事件請翻頁查看。"));
+        }
+        let mut visible = Vec::new();
+        if tree {
+            for group in cache.conversations.iter().rev() {
+                visible.push((&group.summary, true, false));
+                if self
+                    .expanded_token_conversations
+                    .contains(&group.summary.session)
+                {
+                    for &index in &group.children {
+                        visible.push((&cache.rows[index], false, true));
+                    }
+                }
+            }
+        } else {
+            visible.extend(cache.rows.iter().rev().map(|row| (row, false, false)));
+        }
         let total_width: f32 = widths.iter().sum();
         egui::ScrollArea::horizontal().show(ui,|ui| {
             ui.set_min_width(total_width);
             let (header,_) = ui.allocate_exact_size(Vec2::new(total_width,row_height),Sense::hover());
             let mut x=header.left();
             for (label,width) in headers.iter().zip(widths){ui.painter().text(Pos2::new(x+3.,header.top()+3.),Align2::LEFT_TOP,tr(label),FontId::proportional(font_size),ui.visuals().strong_text_color());x+=width;}
-            egui::ScrollArea::vertical().id_salt("token-rows").show_rows(ui,row_height,cache.rows.len(),|ui,range| {
+            egui::ScrollArea::vertical().id_salt("token-rows").show_rows(ui,row_height,visible.len(),|ui,range| {
                 for i in range {
-                    let e=&cache.rows[cache.rows.len()-1-i];
+                    let (e, parent, child) = visible[i];
                     let number=|n:u64,flag:&str|if e.partial_flags.iter().any(|f|f==flag){"未知".to_owned()}else{n.to_string()};
                     let uncached=if e.partial_flags.iter().any(|f|f=="input_count_unavailable"||f=="cached_count_unavailable"){"未知".into()}else{e.uncached.to_string()};
-                    let identity=match self.token_group {GroupBy::Response=>e.response_id.as_deref().unwrap_or("舊版／未知"),GroupBy::Turn=>e.turn_id.as_deref().unwrap_or("未知 Turn"),GroupBy::Task=>"當日事件合計"};
-                    let values=[local_time(e.last_timestamp),format!("{}{}",e.models.join(" / "),if e.model_assumed {"（假設）"}else{""}),effort_label(e),self.tokens.task_name(&e.session).filter(|name| !name.trim().is_empty()).map(str::to_owned).unwrap_or_else(|| e.session.chars().take(12).collect()),identity.chars().take(12).collect(),e.event_count.to_string(),number(e.input,"input_count_unavailable"),number(e.cached,"cached_count_unavailable"),uncached,number(e.output,"output_count_unavailable"),number(e.reasoning,"reasoning_count_unavailable"),format!("{}{}",money(e.display_cost_usd()),if e.display_cost_is_partial(){" *"}else{""})];
+                    let identity=if parent {"對話小計"} else {match self.token_group {GroupBy::Response=>e.response_id.as_deref().unwrap_or("舊版／未知"),GroupBy::Turn=>e.turn_id.as_deref().unwrap_or("未知 Turn"),GroupBy::Task=>"當日事件合計"}};
+                    let name=self.tokens.task_name(&e.session).filter(|name| !name.trim().is_empty()).map(str::to_owned).unwrap_or_else(|| e.session.chars().take(12).collect());
+                    let name=if parent {format!("{} {}", if self.expanded_token_conversations.contains(&e.session) {"▼"} else {"▶"}, name)} else if child {format!("    ↳ {}", name)} else {name};
+                    let values=[local_time(e.last_timestamp),format!("{}{}",e.models.join(" / "),if e.model_assumed {"（假設）"}else{""}),effort_label(e),name,identity.chars().take(12).collect(),e.event_count.to_string(),number(e.input,"input_count_unavailable"),number(e.cached,"cached_count_unavailable"),uncached,number(e.output,"output_count_unavailable"),number(e.reasoning,"reasoning_count_unavailable"),format!("{}{}",money(e.display_cost_usd()),if e.display_cost_is_partial(){" *"}else{""})];
                     let tooltip=format!("Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 筆費用未知\n{}",effort_label(e),self.tokens.task_name(&e.session).unwrap_or("名稱未記錄"),e.session,e.turn_id.as_deref().unwrap_or("未知"),e.response_id.as_deref().unwrap_or("未知"),display_time::datetime(e.first_timestamp).unwrap_or_else(||"未知".into()),display_time::datetime(e.last_timestamp).unwrap_or_else(||"未知".into()),e.models.join(" / "),money(e.display_cost_usd()),e.unknown_cost_events,if e.partial_flags.is_empty() {"狀態：完整"} else {"狀態：部分"});
-                    let (rect,response)=ui.allocate_exact_size(Vec2::new(total_width,row_height),Sense::hover());response.on_hover_text(tr(tooltip));
+                    let (rect,response)=ui.allocate_exact_size(Vec2::new(total_width,row_height),if parent {Sense::click()} else {Sense::hover()});
+                    if parent && response.clicked() {
+                        if !self.expanded_token_conversations.remove(&e.session) {self.expanded_token_conversations.insert(e.session.clone());}
+                    }
+                    response.on_hover_text(tr(tooltip));
                     if i%2==1 {ui.painter().rect_filled(rect,0.,ui.visuals().faint_bg_color);}
                     let mut x=rect.left();
                     for (value,width) in values.iter().zip(widths) {let cell=Rect::from_min_size(Pos2::new(x,rect.top()),Vec2::new(width,row_height));ui.painter().with_clip_rect(cell.intersect(ui.clip_rect())).text(Pos2::new(x+3.,rect.top()+3.),Align2::LEFT_TOP,tr(value),FontId::proportional(font_size),ui.visuals().text_color());x+=width;}
@@ -6236,6 +6272,72 @@ mod widget_revision_tests {
             .tasks
             .iter()
             .all(|t| t.interval_cost_usd == Some(0.) && t.partial));
+    }
+    #[test]
+    fn token_conversation_row_click_expands_and_collapses_without_changing_totals() {
+        let mut app = demo_app();
+        app.refresh_token_cache();
+        let session = app
+            .token_cache
+            .conversations
+            .last()
+            .unwrap()
+            .summary
+            .session
+            .clone();
+        let count = app.token_cache.count;
+        let cost = app.token_cache.cost;
+        let ctx = egui::Context::default();
+        let frame = |app: &mut WidgetApp, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1800., 1500.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.token_ui(ui));
+                },
+            )
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text.starts_with("▶ ") => {
+                    Some(text.pos + Vec2::new(4., 4.))
+                }
+                _ => None,
+            })
+            .expect("collapsed conversation is painted");
+        for expanded in [true, false] {
+            frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    }],
+                );
+            }
+            assert_eq!(
+                app.expanded_token_conversations.contains(&session),
+                expanded
+            );
+            let output = frame(&mut app, vec![]);
+            assert_eq!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text.starts_with("    ↳ "))),
+                expanded
+            );
+            assert_eq!(app.token_cache.count, count);
+            assert_eq!(app.token_cache.cost, cost);
+        }
     }
     #[test]
     fn visible_children_summary_click_expands_and_collapses() {
@@ -8536,11 +8638,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.42", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.42", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.43", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.43", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.42",
+                "Codex Quota v3.43",
                 "Interface font size",
             ),
         ] {

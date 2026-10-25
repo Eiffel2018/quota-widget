@@ -50,6 +50,74 @@ impl UsageGroup {
         self.cost_usd.is_none() || !self.partial_flags.is_empty()
     }
 }
+/// Presentation-only conversation totals over the already loaded page.
+#[derive(Debug, Clone)]
+pub struct ConversationGroup {
+    pub summary: UsageGroup,
+    pub children: Vec<usize>,
+}
+pub fn conversation_groups(rows: &[UsageGroup]) -> Vec<ConversationGroup> {
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        groups.entry(&row.session).or_default().push(index);
+    }
+    let mut result: Vec<_> = groups
+        .into_values()
+        .map(|mut children| {
+            children.sort_by_key(|&index| std::cmp::Reverse(rows[index].last_timestamp));
+            let mut summary = rows[children[0]].clone();
+            summary.turn_id = None;
+            summary.response_id = None;
+            for &index in &children[1..] {
+                let row = &rows[index];
+                summary.first_timestamp = summary.first_timestamp.min(row.first_timestamp);
+                summary.last_timestamp = summary.last_timestamp.max(row.last_timestamp);
+                summary.event_count = summary.event_count.saturating_add(row.event_count);
+                summary.response_count = summary.response_count.saturating_add(row.response_count);
+                summary.unknown_effort_events = summary
+                    .unknown_effort_events
+                    .saturating_add(row.unknown_effort_events);
+                summary.unknown_cost_events = summary
+                    .unknown_cost_events
+                    .saturating_add(row.unknown_cost_events);
+                summary.input = summary.input.saturating_add(row.input);
+                summary.cached = summary.cached.saturating_add(row.cached);
+                summary.uncached = summary.uncached.saturating_add(row.uncached);
+                summary.output = summary.output.saturating_add(row.output);
+                summary.reasoning = summary.reasoning.saturating_add(row.reasoning);
+                summary.known_cost_subtotal_usd += row.known_cost_subtotal_usd;
+                summary.model_assumed |= row.model_assumed;
+                summary.models.extend(row.models.iter().cloned());
+                summary
+                    .source_kinds
+                    .extend(row.source_kinds.iter().cloned());
+                summary
+                    .reasoning_efforts
+                    .extend(row.reasoning_efforts.iter().cloned());
+                summary
+                    .partial_flags
+                    .extend(row.partial_flags.iter().cloned());
+            }
+            summary.cost_usd =
+                (summary.unknown_cost_events == 0).then_some(summary.known_cost_subtotal_usd);
+            for values in [
+                &mut summary.models,
+                &mut summary.source_kinds,
+                &mut summary.reasoning_efforts,
+                &mut summary.partial_flags,
+            ] {
+                values.sort();
+                values.dedup();
+            }
+            ConversationGroup { summary, children }
+        })
+        .collect();
+    result.sort_by(|a, b| {
+        (a.summary.last_timestamp, &a.summary.session)
+            .cmp(&(b.summary.last_timestamp, &b.summary.session))
+    });
+    result
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskRow {
     pub task_id: String,
@@ -614,6 +682,36 @@ mod tests {
             coverage_start_timestamp_ms: None,
             partial_flags: vec![],
         }
+    }
+    #[test]
+    fn conversation_tree_partitions_sessions_and_preserves_totals() {
+        let mut missing = e("c", 30, "first", Some("turn"));
+        missing.cost_usd = None;
+        let events = [
+            e("a", 10, "first", Some("turn")),
+            e("b", 20, "second", None),
+            missing,
+        ];
+        let rows = group(&events.iter().collect::<Vec<_>>(), GroupBy::Response);
+        let tree = conversation_groups(&rows);
+        assert_eq!(tree.len(), 2);
+        let first = tree.last().unwrap();
+        assert_eq!(first.summary.session, "first");
+        assert_eq!(first.children.len(), 2);
+        assert_eq!(rows[first.children[0]].last_timestamp, 30);
+        assert_eq!(first.summary.event_count, 2);
+        assert_eq!(first.summary.input, 600_000);
+        assert_eq!(first.summary.unknown_cost_events, 1);
+        assert_eq!(first.summary.cost_usd, None);
+        assert_eq!(first.summary.display_cost_usd(), Some(0.4415));
+        let mut indices: Vec<_> = tree
+            .iter()
+            .flat_map(|g| g.children.iter().copied())
+            .collect();
+        indices.sort();
+        assert_eq!(indices, (0..rows.len()).collect::<Vec<_>>());
+        assert_eq!(tree.iter().map(|g| g.summary.event_count).sum::<usize>(), 3);
+        assert!(conversation_groups(&[]).is_empty());
     }
     #[test]
     fn tasks_keep_distinct_latest_events_and_only_current_interval_cost() {
