@@ -31,6 +31,7 @@ pub struct Settings {
     #[serde(default)]
     pub compact_layout_version: u32,
     pub font_scale_percent: u32,
+    pub ui_scale_percent: u32,
     pub reset_reminder_local: String,
     pub utc_offset_minutes: i32,
     pub reset_prediction_utc: Option<i64>,
@@ -60,6 +61,7 @@ impl Default for Settings {
             task_visible_rows: 10,
             compact_layout_version: 4,
             font_scale_percent: 100,
+            ui_scale_percent: 100,
             reset_reminder_local: String::new(),
             utc_offset_minutes: 480,
             reset_prediction_utc: None,

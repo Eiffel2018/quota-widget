@@ -89,7 +89,78 @@ fn widget_target_height(width: f32, details: f32, monitor: Option<f32>) -> f32 {
     desired.min(maximum)
 }
 
+fn popup_position(anchor: Pos2, size: Vec2, work: Rect) -> Pos2 {
+    Pos2::new(
+        anchor
+            .x
+            .clamp(work.left(), (work.right() - size.x).max(work.left())),
+        anchor
+            .y
+            .clamp(work.top(), (work.bottom() - size.y).max(work.top())),
+    )
+}
+
+fn popup_work_area(ctx: &egui::Context, anchor: Pos2) -> Rect {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct NativeRect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        #[repr(C)]
+        struct Info {
+            size: u32,
+            monitor: NativeRect,
+            work: NativeRect,
+            flags: u32,
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn MonitorFromPoint(point: Point, flags: u32) -> *mut std::ffi::c_void;
+            fn GetMonitorInfoW(monitor: *mut std::ffi::c_void, info: *mut Info) -> i32;
+        }
+        let ppp = ctx.pixels_per_point();
+        let mut info = Info {
+            size: std::mem::size_of::<Info>() as u32,
+            monitor: NativeRect::default(),
+            work: NativeRect::default(),
+            flags: 0,
+        };
+        unsafe {
+            let monitor = MonitorFromPoint(
+                Point {
+                    x: (anchor.x * ppp).round() as i32,
+                    y: (anchor.y * ppp).round() as i32,
+                },
+                2,
+            );
+            if GetMonitorInfoW(monitor, &mut info) != 0 {
+                return Rect::from_min_max(
+                    Pos2::new(info.work.left as f32 / ppp, info.work.top as f32 / ppp),
+                    Pos2::new(info.work.right as f32 / ppp, info.work.bottom as f32 / ppp),
+                );
+            }
+        }
+    }
+    let _ = anchor;
+    Rect::from_min_size(
+        Pos2::ZERO,
+        ctx.input(|i| i.viewport().monitor_size)
+            .unwrap_or(Vec2::new(1920., 1080.)),
+    )
+}
+
 fn prepare_widget_settings(settings: &mut Settings) {
+    settings.ui_scale_percent = settings.ui_scale_percent.clamp(75, 250);
     if settings.compact_layout_version == 0 {
         settings.size[0] *= 2. / 3.;
         settings.compact_layout_version = 1;
@@ -568,6 +639,9 @@ struct WidgetApp {
     dates_cache: BTreeSet<NaiveDate>,
     layout: LayoutConvergence,
     detail_measurement: Option<(bool, bool, u32, f32)>,
+    menu_position: Option<Pos2>,
+    menu_presented: bool,
+    scale_resize_pending: bool,
     bridge: Option<Bridge>,
     quota_retry_at: Option<Instant>,
     status: String,
@@ -1276,10 +1350,13 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
     let compact_layout_migrated = settings.compact_layout_version == 0;
     prepare_widget_settings(&mut settings);
     let mut viewport = ViewportBuilder::default()
-        .with_inner_size(settings.size)
+        .with_inner_size(Vec2::from(settings.size) * (settings.ui_scale_percent as f32 / 100.))
         .with_maximized(false)
         .with_maximize_button(false)
-        .with_min_inner_size([230., COLLAPSED_HEIGHT * 230. / 310.])
+        .with_min_inner_size(
+            Vec2::new(230., COLLAPSED_HEIGHT * 230. / 310.)
+                * (settings.ui_scale_percent as f32 / 100.),
+        )
         .with_max_inner_size([1000., 2000.])
         .with_decorations(false)
         .with_transparent(true)
@@ -1290,7 +1367,8 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
             WindowLevel::Normal
         });
     if let Some(p) = settings.position {
-        viewport = viewport.with_position(p);
+        viewport =
+            viewport.with_position(Pos2::from(p) * (settings.ui_scale_percent as f32 / 100.));
     }
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);
@@ -1332,6 +1410,8 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
                 list.insert(insert, "quota-original-cjk".into());
             }
             cc.egui_ctx.set_fonts(fonts);
+            cc.egui_ctx
+                .set_zoom_factor(settings.ui_scale_percent as f32 / 100.);
             let mut app = WidgetApp::new(settings, dir, persistent, demo, offline, args);
             app.dirty = compact_layout_migrated;
             app._lock = lock;
@@ -1353,6 +1433,123 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
     )
 }
 impl WidgetApp {
+    fn context_menu_window(&mut self, ctx: &egui::Context) {
+        let Some(anchor) = self.menu_position else {
+            self.menu_presented = false;
+            return;
+        };
+        let work = popup_work_area(ctx, anchor);
+        let size = Vec2::new(220., 230.).min(work.size());
+        let first = !self.menu_presented;
+        self.menu_presented = true;
+        let viewport = ViewportBuilder::default()
+            .with_title("Quota Widget · 選單")
+            .with_inner_size(size)
+            .with_position(popup_position(anchor, size, work))
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_active(true)
+            .with_window_level(WindowLevel::AlwaysOnTop);
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of("widget-context-menu"),
+            viewport,
+            |ctx, _| {
+                if first {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                if ctx.input(|i| {
+                    i.viewport().close_requested()
+                        || i.key_pressed(egui::Key::Escape)
+                        || (!first && i.viewport().focused == Some(false))
+                }) {
+                    self.menu_position = None;
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        if ui.button(tr("還原小視窗")).clicked() {
+                            self.settings.size = Settings::default().size;
+                            self.dirty = true;
+                            ctx.send_viewport_cmd_to(
+                                ViewportId::ROOT,
+                                ViewportCommand::Maximized(false),
+                            );
+                            ctx.send_viewport_cmd_to(
+                                ViewportId::ROOT,
+                                ViewportCommand::InnerSize(Vec2::from(self.settings.size)),
+                            );
+                            self.menu_position = None;
+                        }
+                        if ui.button(tr("設定 / 連接")).clicked() {
+                            self.open_settings();
+                            self.menu_position = None;
+                        }
+                        if ui.button(tr("更新額度")).clicked() {
+                            self.refresh_quota();
+                            self.menu_position = None;
+                        }
+                        if ui
+                            .checkbox(&mut self.settings.dark, tr("深色外觀"))
+                            .changed()
+                        {
+                            self.apply_theme(ctx);
+                            self.dirty = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.settings.on_top, tr("保持最上層"))
+                            .changed()
+                        {
+                            self.topmost(ctx);
+                            self.dirty = true;
+                        }
+                        if ui.button(tr("關閉小工具")).clicked() {
+                            self.begin_close();
+                            self.menu_position = None;
+                            ctx.request_repaint_of(ViewportId::ROOT);
+                        }
+                    });
+                });
+            },
+        );
+    }
+    fn apply_interface_scale(&mut self, ctx: &egui::Context) -> bool {
+        self.settings.ui_scale_percent = self.settings.ui_scale_percent.clamp(75, 250);
+        let wanted = self.settings.ui_scale_percent as f32 / 100.;
+        if (ctx.zoom_factor() - wanted).abs() > 0.001 {
+            let ratio = ctx.zoom_factor() / wanted;
+            for position in [
+                &mut self.settings.position,
+                &mut self.settings.history_position,
+                &mut self.settings.tokens_position,
+                &mut self.settings.settings_position,
+                &mut self.settings.prediction_position,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                position[0] *= ratio;
+                position[1] *= ratio;
+            }
+            ctx.set_zoom_factor(wanted);
+            self.menu_position = None;
+            self.scale_resize_pending = true;
+            self.dirty = true;
+            return true;
+        }
+        if self.scale_resize_pending {
+            ctx.send_viewport_cmd_to(
+                ViewportId::ROOT,
+                ViewportCommand::InnerSize(Vec2::from(self.settings.size)),
+            );
+            self.scale_resize_pending = false;
+            self.layout = LayoutConvergence::default();
+            self.detail_measurement = None;
+            return true;
+        }
+        false
+    }
     fn new(
         settings: Settings,
         dir: PathBuf,
@@ -1395,6 +1592,9 @@ impl WidgetApp {
             dates_cache: BTreeSet::new(),
             layout: LayoutConvergence::default(),
             detail_measurement: None,
+            menu_position: None,
+            menu_presented: false,
+            scale_resize_pending: false,
             bridge: None,
             quota_retry_at: None,
             status: "OFFLINE".into(),
@@ -2776,49 +2976,23 @@ impl WidgetApp {
                 if drag.drag_started() || title_drag.drag_started() {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
-                drag.context_menu(|ui| {
-                    if ui.button("還原小視窗").clicked() {
-                        self.settings.size = Settings::default().size;
-                        self.dirty = true;
-                        ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
-                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::from(
-                            self.settings.size,
-                        )));
-                        ui.close();
-                    }
-                    if ui.button(tr("設定 / 連接")).clicked() {
-                        self.toggle_settings();
-                        ui.close();
-                    }
-                    if ui.button(tr("更新額度")).clicked() {
-                        self.refresh_quota();
-                        ui.close();
-                    }
-                    if ui
-                        .checkbox(&mut self.settings.dark, tr("深色外觀"))
-                        .changed()
-                    {
-                        self.apply_theme(ctx);
-                        self.dirty = true;
-                    }
-                    if ui
-                        .checkbox(&mut self.settings.on_top, tr("保持最上層"))
-                        .changed()
-                    {
-                        self.topmost(ctx);
-                        self.dirty = true;
-                    }
-                    if ui.button(tr("關閉小工具")).clicked() {
-                        self.begin_close();
-                        ctx.request_repaint();
-                    }
-                });
+                if ctx.input(|i| i.pointer.secondary_clicked()) {
+                    let anchor = ctx.input(|i| {
+                        i.viewport()
+                            .outer_rect
+                            .map(|rect| rect.min)
+                            .unwrap_or_default()
+                            + i.pointer.interact_pos().unwrap_or_default().to_vec2()
+                    });
+                    self.menu_position = Some(anchor);
+                    self.menu_presented = false;
+                }
                 let view = self.selected();
                 let title = view
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.43".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.45".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -3548,6 +3722,7 @@ impl WidgetApp {
         }
     }
     fn detail_windows(&mut self, ctx: &egui::Context) {
+        self.context_menu_window(ctx);
         if self.history_open {
             let mut viewport = ViewportBuilder::default()
                 .with_title(tr("Quota Widget · 扣額紀錄"))
@@ -4883,6 +5058,26 @@ impl WidgetApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            ui.label(tr("整體縮放"));
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.settings.ui_scale_percent, 75..=250)
+                        .step_by(5.)
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                self.dirty = true;
+                ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            if ui.button("100%").clicked() {
+                self.settings.ui_scale_percent = 100;
+                self.dirty = true;
+                ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            ui.label(tr("視窗、文字及按鈕一併縮放"));
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.label(tr("介面字體大小"));
             if ui
                 .add(
@@ -5619,6 +5814,10 @@ impl eframe::App for WidgetApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         set_language(self.settings.language);
         let _zone = display_time::scope(self.settings.utc_offset_minutes);
+        if self.apply_interface_scale(ctx) {
+            ctx.request_repaint();
+            return;
+        }
         self.clear_completed_prediction();
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_ready {
             self.begin_close();
@@ -8678,11 +8877,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.43", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.43", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.45", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.45", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.43",
+                "Codex Quota v3.45",
                 "Interface font size",
             ),
         ] {
@@ -9120,5 +9319,121 @@ mod recovered_history_display_tests {
             .iter()
             .all(|row| row.presentation.status == "區間沒有 Token 記錄"));
         assert_eq!(app.history_cache.interval_indices.len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod interface_scale_tests {
+    use super::*;
+    #[test]
+    fn scale_defaults_roundtrips_and_preserves_base_geometry() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.ui_scale_percent, 100);
+        let mut app = super::widget_revision_tests::demo_app();
+        let size = app.settings.size;
+        app.settings.position = Some([600., 400.]);
+        app.settings.ui_scale_percent = 200;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            app.apply_interface_scale(ctx);
+        });
+        let output = ctx.run(Default::default(), |ctx| {
+            app.apply_interface_scale(ctx);
+        });
+        assert_eq!(ctx.zoom_factor(), 2.);
+        assert_eq!(app.settings.size, size);
+        assert_eq!(app.settings.position, Some([300., 200.]));
+        assert!(output.viewport_output[&ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c,ViewportCommand::InnerSize(s) if *s==Vec2::from(size))));
+        let saved: Settings =
+            serde_json::from_str(&serde_json::to_string(&app.settings).unwrap()).unwrap();
+        assert_eq!(saved.ui_scale_percent, 200);
+        app.settings.ui_scale_percent = 100;
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                app.apply_interface_scale(ctx);
+            });
+        }
+        assert_eq!(app.settings.size, size);
+        assert_eq!(app.settings.position, Some([600., 400.]));
+    }
+    #[test]
+    fn menu_fits_work_area_including_negative_origin_monitor() {
+        for work in [
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(1280., 680.)),
+            Rect::from_min_size(Pos2::new(-1920., -200.), Vec2::new(1920., 1040.)),
+        ] {
+            let size = Vec2::new(220., 230.);
+            for anchor in [work.min, work.max, work.center()] {
+                let position = popup_position(anchor, size, work);
+                assert!(work.contains_rect(Rect::from_min_size(position, size)));
+            }
+        }
+    }
+    #[test]
+    fn menu_uses_own_viewport_with_all_actions_outside_small_root() {
+        use std::{cell::RefCell, rc::Rc};
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let saved = Rc::clone(&captured);
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let mut input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(220., 230.))),
+                ..Default::default()
+            };
+            input.viewports.insert(
+                viewport.ids.this,
+                egui::ViewportInfo {
+                    focused: Some(true),
+                    ..Default::default()
+                },
+            );
+            let result = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            let text = result
+                .shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        Some(t.galley.job.text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            saved
+                .borrow_mut()
+                .push((viewport.ids.this, viewport.builder, text));
+        });
+        let mut app = super::widget_revision_tests::demo_app();
+        app.menu_position = Some(Pos2::new(250., 150.));
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        app.apply_theme(&ctx);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(244., 124.))),
+                ..Default::default()
+            },
+            |ctx| app.context_menu_window(ctx),
+        );
+        let rows = captured.borrow();
+        let (id, builder, text) = rows.last().unwrap();
+        assert_ne!(*id, ViewportId::ROOT);
+        assert_eq!(builder.inner_size, Some(Vec2::new(220., 230.)));
+        for action in [
+            "還原小視窗",
+            "設定 / 連接",
+            "更新額度",
+            "深色外觀",
+            "保持最上層",
+            "關閉小工具",
+        ] {
+            assert!(text.contains(action), "{text}");
+        }
+        assert_eq!(builder.taskbar, Some(false));
+        assert_eq!(builder.window_level, Some(WindowLevel::AlwaysOnTop));
     }
 }
