@@ -2789,7 +2789,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.41".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.42".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -4548,14 +4548,14 @@ impl WidgetApp {
         let scale = font_size / 12.;
         let row_height = 24. * scale;
         let widths = [
-            72., 150., 80., 115., 120., 45., 90., 90., 90., 80., 80., 110.,
+            72., 135., 70., 160., 100., 45., 90., 90., 90., 80., 80., 110.,
         ]
         .map(|width| width * scale);
         let headers = [
             "時間",
             "模型",
             "推理強度",
-            "Task / Session",
+            "對話",
             "Turn / Response",
             "筆數",
             "輸入",
@@ -4577,7 +4577,7 @@ impl WidgetApp {
                     let number=|n:u64,flag:&str|if e.partial_flags.iter().any(|f|f==flag){"未知".to_owned()}else{n.to_string()};
                     let uncached=if e.partial_flags.iter().any(|f|f=="input_count_unavailable"||f=="cached_count_unavailable"){"未知".into()}else{e.uncached.to_string()};
                     let identity=match self.token_group {GroupBy::Response=>e.response_id.as_deref().unwrap_or("舊版／未知"),GroupBy::Turn=>e.turn_id.as_deref().unwrap_or("未知 Turn"),GroupBy::Task=>"當日事件合計"};
-                    let values=[local_time(e.last_timestamp),format!("{}{}",e.models.join(" / "),if e.model_assumed {"（假設）"}else{""}),effort_label(e),e.session.chars().take(12).collect::<String>(),identity.chars().take(12).collect(),e.event_count.to_string(),number(e.input,"input_count_unavailable"),number(e.cached,"cached_count_unavailable"),uncached,number(e.output,"output_count_unavailable"),number(e.reasoning,"reasoning_count_unavailable"),format!("{}{}",money(e.display_cost_usd()),if e.display_cost_is_partial(){" *"}else{""})];
+                    let values=[local_time(e.last_timestamp),format!("{}{}",e.models.join(" / "),if e.model_assumed {"（假設）"}else{""}),effort_label(e),self.tokens.task_name(&e.session).filter(|name| !name.trim().is_empty()).map(str::to_owned).unwrap_or_else(|| e.session.chars().take(12).collect()),identity.chars().take(12).collect(),e.event_count.to_string(),number(e.input,"input_count_unavailable"),number(e.cached,"cached_count_unavailable"),uncached,number(e.output,"output_count_unavailable"),number(e.reasoning,"reasoning_count_unavailable"),format!("{}{}",money(e.display_cost_usd()),if e.display_cost_is_partial(){" *"}else{""})];
                     let tooltip=format!("Reasoning effort: {}\n{}\nTask: {}\nTurn: {}\nResponse: {}\n{} 至 {}\n模型: {}\n已可估部分 {}；{} 筆費用未知\n{}",effort_label(e),self.tokens.task_name(&e.session).unwrap_or("名稱未記錄"),e.session,e.turn_id.as_deref().unwrap_or("未知"),e.response_id.as_deref().unwrap_or("未知"),display_time::datetime(e.first_timestamp).unwrap_or_else(||"未知".into()),display_time::datetime(e.last_timestamp).unwrap_or_else(||"未知".into()),e.models.join(" / "),money(e.display_cost_usd()),e.unknown_cost_events,if e.partial_flags.is_empty() {"狀態：完整"} else {"狀態：部分"});
                     let (rect,response)=ui.allocate_exact_size(Vec2::new(total_width,row_height),Sense::hover());response.on_hover_text(tr(tooltip));
                     if i%2==1 {ui.painter().rect_filled(rect,0.,ui.visuals().faint_bg_color);}
@@ -8536,11 +8536,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.41", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.41", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.42", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.42", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.41",
+                "Codex Quota v3.42",
                 "Interface font size",
             ),
         ] {
