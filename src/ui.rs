@@ -106,6 +106,12 @@ fn prepare_widget_settings(settings: &mut Settings) {
         settings.size[0] *= 0.94;
         settings.compact_layout_version = 4;
     }
+    if settings.compact_layout_version < 5 {
+        if settings.size[0] > 600. {
+            settings.size[0] = Settings::default().size[0];
+        }
+        settings.compact_layout_version = 5;
+    }
     settings.size[0] = settings.size[0].clamp(230., 1000.);
     settings.size[1] = COLLAPSED_HEIGHT * settings.size[0] / 310.;
 }
@@ -1271,6 +1277,8 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
     prepare_widget_settings(&mut settings);
     let mut viewport = ViewportBuilder::default()
         .with_inner_size(settings.size)
+        .with_maximized(false)
+        .with_maximize_button(false)
         .with_min_inner_size([230., COLLAPSED_HEIGHT * 230. / 310.])
         .with_max_inner_size([1000., 2000.])
         .with_decorations(false)
@@ -1289,6 +1297,7 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport,
+        persist_window: false,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -2758,10 +2767,25 @@ impl WidgetApp {
                     ui.id().with("title-drag"),
                     Sense::click_and_drag(),
                 );
+                if title_drag.double_clicked() {
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::from(
+                        self.settings.size,
+                    )));
+                }
                 if drag.drag_started() || title_drag.drag_started() {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
                 drag.context_menu(|ui| {
+                    if ui.button("還原小視窗").clicked() {
+                        self.settings.size = Settings::default().size;
+                        self.dirty = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::from(
+                            self.settings.size,
+                        )));
+                        ui.close();
+                    }
                     if ui.button(tr("設定 / 連接")).clicked() {
                         self.toggle_settings();
                         ui.close();
@@ -5635,14 +5659,30 @@ impl eframe::App for WidgetApp {
         }
         self.last_focus = focus;
         self.last_minimized = minimized;
-        if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+        // A compact frameless widget must not get stuck in Windows snap/maximize.
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::from(self.settings.size)));
+        }
+        let normal_window = ctx.input(|i| {
+            !i.viewport().maximized.unwrap_or(false)
+                && !i.viewport().minimized.unwrap_or(false)
+                && !i.viewport().fullscreen.unwrap_or(false)
+        });
+        if let Some(rect) = ctx
+            .input(|i| i.viewport().outer_rect)
+            .filter(|_| normal_window)
+        {
             let p = [rect.min.x, rect.min.y];
             if self.settings.position != Some(p) {
                 self.settings.position = Some(p);
                 self.dirty = true;
             }
         }
-        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+        if let Some(rect) = ctx
+            .input(|i| i.viewport().inner_rect)
+            .filter(|_| normal_window)
+        {
             let s = [rect.width(), rect.height()];
             if self.settings.size != s {
                 self.settings.size = s;
@@ -8744,6 +8784,20 @@ mod accessible_ui_tests {
             282. * 0.92 * 0.94,
             "narrowing is a one-time migration"
         );
+    }
+
+    #[test]
+    fn oversized_saved_widget_recovers_once() {
+        let mut settings = Settings {
+            size: [1000., 510.],
+            compact_layout_version: 4,
+            ..Default::default()
+        };
+        prepare_widget_settings(&mut settings);
+        assert_eq!(settings.size[0], Settings::default().size[0]);
+        settings.size[0] = 430.;
+        prepare_widget_settings(&mut settings);
+        assert_eq!(settings.size[0], 430.);
     }
 
     #[test]
