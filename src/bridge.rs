@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Notifications trigger an earlier read; polling covers changes made in other clients.
+// Merge local notifications immediately; polling remains an independent fallback.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const LOOP_INTERVAL: Duration = Duration::from_millis(40);
@@ -41,7 +41,7 @@ pub enum BridgeEvent {
     Connecting,
     /// The protocol handshake succeeded; quota availability is still unknown.
     Connected,
-    /// Complete `account/rateLimits/read` result, not a sparse notification.
+    /// Complete snapshot, including validated sparse updates merged into the last read.
     RateLimits(Value),
     Error(BridgeError),
     Stopped,
@@ -576,7 +576,7 @@ fn initialize() -> Value {
 }
 
 fn quota_request(id: u64) -> Value {
-    json!({"id": id, "method": "account/rateLimits/read"})
+    json!({"id": id, "method": "account/rateLimits/read", "params": {"excludeResetCreditDetails": true}})
 }
 
 fn is_quota_result(value: &Value) -> bool {
@@ -585,6 +585,67 @@ fn is_quota_result(value: &Value) -> bool {
             || value
                 .get("rateLimitsByLimitId")
                 .is_some_and(Value::is_object))
+}
+
+// Only known windows in the current account snapshot can be updated without a read.
+// A replenishment without reset metadata needs an authoritative fallback.
+fn merge_notification(snapshot: &Value, params: &Value) -> Option<Value> {
+    let delta = params.get("rateLimits")?.as_object()?;
+    let mut merged = snapshot.clone();
+    let base = merged.get_mut("rateLimits")?.as_object_mut()?;
+    if delta
+        .get("limitId")
+        .filter(|v| !v.is_null())
+        .is_some_and(|id| base.get("limitId") != Some(id))
+    {
+        return None;
+    }
+    let mut changed = false;
+    for key in ["primary", "secondary"] {
+        let Some(window) = delta.get(key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let used = window.get("usedPercent")?.as_f64()?;
+        if !used.is_finite() || !(0.0..=100.0).contains(&used) {
+            return None;
+        }
+        let old = base.get_mut(key)?.as_object_mut()?;
+        if !old.get("windowDurationMins").is_some_and(Value::is_number)
+            || !old.get("resetsAt").is_some_and(Value::is_number)
+        {
+            return None;
+        }
+        if old
+            .get("usedPercent")
+            .and_then(Value::as_f64)
+            .is_some_and(|v| used < v)
+            && !window.get("resetsAt").is_some_and(Value::is_number)
+        {
+            return None;
+        }
+        for field in ["usedPercent", "windowDurationMins", "resetsAt"] {
+            if let Some(value) = window.get(field).filter(|v| !v.is_null()) {
+                old.insert(field.into(), value.clone());
+            }
+        }
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    // Keep the bucket map consistent with the default snapshot.
+    let rate = merged["rateLimits"].clone();
+    if let Some(map) = merged
+        .get_mut("rateLimitsByLimitId")
+        .and_then(Value::as_object_mut)
+    {
+        let id = rate.get("limitId").and_then(Value::as_str)?;
+        if !map.contains_key(id) {
+            return None;
+        }
+        map.insert(id.into(), rate);
+    }
+    Some(merged)
 }
 
 #[derive(Clone, Copy)]
@@ -645,6 +706,7 @@ fn run(
     let mut epoch = 0u64;
     let mut next_id = 2u64;
     let mut refresh_pending = true;
+    let mut snapshot: Option<Value> = None;
     let mut last_sent = Instant::now();
     let mut next_poll = last_sent + timing.poll;
     loop {
@@ -700,9 +762,25 @@ fn run(
                     match method {
                         "account/updated" => {
                             epoch = epoch.wrapping_add(1);
+                            snapshot = None;
                             refresh_pending = true;
                         }
-                        "account/rateLimits/updated" => refresh_pending = true,
+                        "account/rateLimits/updated" => {
+                            // Do not race a full read already in flight.
+                            let merged = if pending.is_none() {
+                                snapshot
+                                    .as_ref()
+                                    .and_then(|s| merge_notification(s, &message["params"]))
+                            } else {
+                                None
+                            };
+                            if let Some(value) = merged {
+                                snapshot = Some(value.clone());
+                                let _ = events.send(BridgeEvent::RateLimits(value));
+                            } else {
+                                refresh_pending = true;
+                            }
+                        }
                         _ => {}
                     }
                     continue;
@@ -735,6 +813,7 @@ fn run(
                         .unwrap_or_else(Instant::now);
                 } else if request.epoch == epoch {
                     if is_quota_result(result) {
+                        snapshot = Some(result.clone());
                         let _ = events.send(BridgeEvent::RateLimits(result.clone()));
                     } else {
                         let _ = events.send(BridgeEvent::Error(BridgeError::Unavailable));
@@ -768,9 +847,42 @@ mod tests {
         let request = quota_request(7);
         assert_eq!(
             request,
-            json!({"id": 7, "method": "account/rateLimits/read"})
+            json!({"id": 7, "method": "account/rateLimits/read", "params": {"excludeResetCreditDetails": true}})
         );
-        assert!(request.get("params").is_none());
+        assert_eq!(request["params"]["excludeResetCreditDetails"], true);
+    }
+
+    #[test]
+    fn sparse_merge_preserves_missing_windows_and_rejects_unidentified_resets() {
+        let full = json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":20,"windowDurationMins":300,"resetsAt":1000},"secondary":{"usedPercent":10,"windowDurationMins":10080,"resetsAt":9000}},"rateLimitsByLimitId":{"codex":{}}});
+        let delta =
+            json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":21},"secondary":null}});
+        let merged = merge_notification(&full, &delta).unwrap();
+        assert_eq!(merged["rateLimits"]["primary"]["usedPercent"], 21);
+        assert_eq!(
+            merged["rateLimits"]["secondary"],
+            full["rateLimits"]["secondary"]
+        );
+        assert_eq!(merged["rateLimitsByLimitId"]["codex"], merged["rateLimits"]);
+        assert!(
+            merge_notification(&full, &json!({"rateLimits":{"primary":{"usedPercent":0}}}))
+                .is_none()
+        );
+        assert!(merge_notification(
+            &full,
+            &json!({"rateLimits":{"limitId":"other","primary":{"usedPercent":21}}})
+        )
+        .is_none());
+        assert!(merge_notification(
+            &full,
+            &json!({"rateLimits":{"primary":{"usedPercent":101}}})
+        )
+        .is_none());
+        assert!(merge_notification(
+            &full,
+            &json!({"rateLimits":{"primary":{"usedPercent":0,"resetsAt":2000}}})
+        )
+        .is_some());
     }
 
     #[test]
@@ -1185,10 +1297,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sparse_notifications_trigger_full_reads_and_are_never_observations() {
+    fn sparse_notifications_merge_without_an_extra_read() {
         let mock = Mock::spawn("sparse", Duration::from_secs(2), Duration::from_secs(30));
         assert_eq!(mock.next_quota()["rateLimits"]["primary"]["usedPercent"], 1);
-        assert_eq!(mock.next_quota()["rateLimits"]["primary"]["usedPercent"], 2);
+        assert_eq!(
+            mock.next_quota()["rateLimits"]["primary"]["usedPercent"],
+            99
+        );
     }
 
     #[cfg(unix)]
