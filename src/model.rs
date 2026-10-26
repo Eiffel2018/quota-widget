@@ -14,6 +14,12 @@ pub const CONTINUITY_GAP_SECONDS: i64 = 90;
 pub const MAX_DROP_SAMPLES: usize = 120;
 const PERCENT_EPSILON: f64 = 0.000001;
 
+// Reject an old pre-reset endpoint until the new cycle reaches its neighbourhood.
+pub(crate) fn stale_pre_reset_echo(current: f64, incoming: f64, before_reset: f64) -> bool {
+    current > before_reset + 2.0 + PERCENT_EPSILON
+        && (incoming - before_reset).abs() <= PERCENT_EPSILON
+}
+
 pub(crate) fn quota_deadline_rollover(before: Option<i64>, after: Option<i64>, at: i64) -> bool {
     before.zip(after).is_some_and(|(before, after)| {
         before <= at && after > at && after.saturating_sub(before) > 90
@@ -217,6 +223,7 @@ struct WindowState {
     window_key: String,
     window_label: String,
     used_percent: Option<f64>,
+    pre_reset_used: Option<f64>,
     duration: Option<i64>,
     reset_at: Option<i64>,
     // Retain rollover evidence if an unchanged poll publishes the next deadline
@@ -256,6 +263,7 @@ pub struct QuotaModel {
     windows: BTreeMap<(String, String), WindowState>,
     credit_states: BTreeMap<String, CreditState>,
     account_id: Option<String>,
+    reset_guards: BTreeMap<(String, String), (f64, f64)>,
 }
 
 impl Default for QuotaModel {
@@ -280,6 +288,10 @@ impl QuotaModel {
     /// even if subsequent quota payloads omit the optional account ID.
     pub fn account_changed(&mut self) {
         self.account_id = None;
+        self.reset_guards.clear();
+        for state in self.windows.values_mut() {
+            state.pre_reset_used = None;
+        }
         self.reset_continuity();
     }
 
@@ -292,6 +304,40 @@ impl QuotaModel {
             windows: BTreeMap::new(),
             credit_states: BTreeMap::new(),
             account_id: None,
+            reset_guards: BTreeMap::new(),
+        }
+    }
+
+    /// History seeds only the stale-snapshot rejection guard, never a live rate.
+    pub fn remember_reset_guards(&mut self, history: &[HistoryEvent]) {
+        self.reset_guards.clear();
+        for e in history {
+            if self
+                .account_id
+                .as_ref()
+                .zip(e.evidence.as_ref().and_then(|p| p.account_id.as_ref()))
+                .is_some_and(|(a, b)| a != b)
+            {
+                continue;
+            }
+            let (Some(window), Ok(before), Ok(after)) = (
+                &e.window_key,
+                e.before.parse::<f64>(),
+                e.after.parse::<f64>(),
+            ) else {
+                continue;
+            };
+            let key = (e.source_key.clone(), window.clone());
+            if e.kind == HistoryKind::QuotaReset
+                && after >= 100. - PERCENT_EPSILON
+                && before <= 98. + PERCENT_EPSILON
+            {
+                self.reset_guards.insert(key, (100. - before, 100. - after));
+            } else if e.kind == HistoryKind::QuotaDecrease {
+                if let Some(guard) = self.reset_guards.get_mut(&key) {
+                    guard.1 = 100. - after;
+                }
+            }
         }
     }
 
@@ -348,6 +394,7 @@ impl QuotaModel {
         if let Some(account) = observation.account_id {
             if self.account_id.as_ref().is_some_and(|old| old != &account) {
                 self.windows.clear();
+                self.reset_guards.clear();
                 self.credit_states.clear();
                 report.warnings.push("account_changed_new_baseline".into());
             }
@@ -364,6 +411,26 @@ impl QuotaModel {
                 seen_windows.insert(key.clone());
                 report.windows_updated += 1;
                 let old = self.windows.remove(&key);
+                let history_guard = self.reset_guards.get(&key).copied();
+                let pre = old
+                    .as_ref()
+                    .and_then(|s| s.pre_reset_used)
+                    .or(history_guard.map(|g| g.0));
+                let current = old
+                    .as_ref()
+                    .and_then(|s| s.used_percent)
+                    .or(history_guard.map(|g| g.1));
+                if pre.zip(current).zip(incoming.used_percent).is_some_and(
+                    |((pre, current), incoming)| {
+                        stale_pre_reset_echo(100. - current, 100. - incoming, 100. - pre)
+                    },
+                ) {
+                    if let Some(old) = old {
+                        self.windows.insert(key.clone(), old);
+                    }
+                    report.warnings.push("ignored_pre_reset_snapshot".into());
+                    continue;
+                }
                 // Absent duration metadata must not forget an established
                 // identity and allow an incompatible window to bridge it later.
                 let duration = incoming
@@ -376,6 +443,7 @@ impl QuotaModel {
                     window_key: incoming.key.clone(),
                     window_label: label,
                     used_percent: incoming.used_percent,
+                    pre_reset_used: pre,
                     duration,
                     reset_at: incoming.reset_at,
                     reset_evidence_at: old
@@ -472,6 +540,9 @@ impl QuotaModel {
                         if let Some((before_used, after_used)) = both {
                             let change = after_used - before_used;
                             if change < -PERCENT_EPSILON {
+                                if after_used.abs() <= PERCENT_EPSILON && before_used >= 2.0 {
+                                    state.pre_reset_used = Some(before_used);
+                                }
                                 state.reset_evidence_at = state.reset_at;
                                 state.epoch = state.epoch.saturating_add(1);
                                 state.drops.clear();
@@ -541,6 +612,10 @@ impl QuotaModel {
                                         HistoryKind::QuotaReset
                                     };
                                     if kind == HistoryKind::QuotaReset {
+                                        if after_used.abs() <= PERCENT_EPSILON && before_used >= 2.0
+                                        {
+                                            state.pre_reset_used = Some(before_used);
+                                        }
                                         state.reset_evidence_at = state.reset_at;
                                     }
                                     self.history.push(quota_event(
@@ -1202,6 +1277,38 @@ mod tests {
     }
     fn ingest(model: &mut QuotaModel, at: i64, used: f64) {
         model.ingest_json(&payload(used, 10000), at).unwrap();
+    }
+
+    #[test]
+    fn reset_rejects_cached_old_endpoint_but_accepts_skips_and_later_real_usage() {
+        assert!(!stale_pre_reset_echo(100., 98., 98.));
+        let mut m = QuotaModel::new("test");
+        for (t, used, reset) in [
+            (100, 47., 1000),
+            (110, 0., 9000),
+            (120, 47., 1000),
+            (130, 1., 9000),
+            (140, 47., 1000),
+            (150, 3., 9000),
+        ] {
+            m.ingest_json(&payload(used, reset), t).unwrap();
+            if used == 47. && t > 100 {
+                assert!(view(&m, t).remaining_percent.unwrap() >= 99.);
+            }
+        }
+        assert_eq!(view(&m, 150).remaining_percent, Some(97.));
+        let mut restarted = QuotaModel::new("restart");
+        restarted.remember_reset_guards(&m.history);
+        restarted.ingest_json(&payload(3., 9000), 150).unwrap();
+        restarted.ingest_json(&payload(47., 1000), 155).unwrap();
+        assert_eq!(view(&restarted, 155).remaining_percent, Some(97.));
+        assert!(!m
+            .history
+            .iter()
+            .any(|e| e.kind == HistoryKind::QuotaDecrease && e.after == "53"));
+        m.ingest_json(&payload(46., 9000), 160).unwrap();
+        m.ingest_json(&payload(47., 9000), 170).unwrap();
+        assert_eq!(view(&m, 170).remaining_percent, Some(53.));
     }
 
     #[test]

@@ -151,6 +151,7 @@ pub fn replay(observations: &[ImportedQuotaObservation]) -> Vec<HistoryEvent> {
     let mut previous: BTreeMap<ObservationScope, PriorObservation<'_>> = BTreeMap::new();
     let mut observer_previous: BTreeMap<(ObservationScope, (bool, String)), PriorObservation<'_>> =
         BTreeMap::new();
+    let mut reset_endpoints = BTreeMap::new();
     let mut result = Vec::new();
     // Credits retain the live model's exact decimal arithmetic.
     let mut credit_model = QuotaModel::new("imported-local-observations-v2");
@@ -194,6 +195,15 @@ pub fn replay(observations: &[ImportedQuotaObservation]) -> Vec<HistoryEvent> {
                     || old.window.duration == snapshot.duration;
                 let before = old.window.remaining.parse::<f64>().unwrap();
                 let after = snapshot.remaining.parse::<f64>().unwrap();
+                if reset_endpoints
+                    .get(&key)
+                    .is_some_and(|pre| crate::model::stale_pre_reset_echo(before, after, *pre))
+                {
+                    continue;
+                }
+                if compatible && after >= 100. - EPSILON && before <= 98. + EPSILON {
+                    reset_endpoints.insert(key.clone(), before);
+                }
                 if compatible && (after - before).abs() > EPSILON {
                     let kind = if after > before {
                         HistoryKind::QuotaReset
@@ -430,7 +440,26 @@ pub fn normalized(raw: &[HistoryEvent]) -> Vec<HistoryEvent> {
     let mut zero_reset_epochs: BTreeMap<(Window, String, u64), u64> = BTreeMap::new();
     // Credits do not share a quota reset cycle. Preserve exact string precision.
     let mut credit_endpoints: BTreeMap<Window, String> = BTreeMap::new();
+    let mut reset_endpoints: BTreeMap<Window, f64> = BTreeMap::new();
     for original in ordered {
+        if let (Ok(before), Ok(after)) = (
+            original.before.parse::<f64>(),
+            original.after.parse::<f64>(),
+        ) {
+            if original.kind == HistoryKind::QuotaDecrease
+                && reset_endpoints
+                    .get(&window(original))
+                    .is_some_and(|pre| crate::model::stale_pre_reset_echo(before, after, *pre))
+            {
+                continue;
+            }
+            if original.kind == HistoryKind::QuotaReset
+                && after >= 100. - EPSILON
+                && before <= 98. + EPSILON
+            {
+                reset_endpoints.insert(window(original), before);
+            }
+        }
         let mut event = original.clone();
         if let Some(slot) = legacy_slot(original) {
             let Some(kind) = legacy_direction(original, slot) else {
@@ -836,6 +865,30 @@ mod tests {
             reconciliation: None,
         }
     }
+    #[test]
+    fn pre_reset_echo_is_not_a_visible_accounting_boundary() {
+        let raw = vec![
+            e(10, HistoryKind::QuotaDecrease, "54", "53"),
+            e(20, HistoryKind::QuotaReset, "53", "100"),
+            e(30, HistoryKind::QuotaDecrease, "100", "53"),
+            e(40, HistoryKind::QuotaDecrease, "100", "99"),
+        ];
+        let mut raw = raw;
+        raw.insert(3, e(31, HistoryKind::QuotaReset, "53", "100"));
+        raw.insert(4, e(32, HistoryKind::QuotaDecrease, "100", "53"));
+        raw.insert(5, e(33, HistoryKind::QuotaReset, "53", "100"));
+        let rows = normalized(&raw);
+        assert_eq!(
+            rows.iter()
+                .filter(|e| e.kind == HistoryKind::QuotaReset)
+                .count(),
+            1
+        );
+        assert!(!rows.iter().any(|e| e.before == "100" && e.after == "53"));
+        assert!(rows.iter().any(|e| e.before == "100" && e.after == "99"));
+        assert_eq!(raw.len(), 7);
+    }
+
     #[test]
     fn duplicate_reset_can_merge_but_repeated_true_reset_is_retained() {
         let reset = e(10, HistoryKind::QuotaReset, "98", "100");

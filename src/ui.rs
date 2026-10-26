@@ -2033,6 +2033,7 @@ impl WidgetApp {
             }
             BridgeEvent::Connected => self.status = "CONNECTED · 等待額度".into(),
             BridgeEvent::RateLimits(v) => {
+                self.quota.remember_reset_guards(&self.history);
                 let previous_account = self.quota.account_id().map(str::to_owned);
                 match self.quota.ingest_json(&v, now()) {
                     Ok(_) => {
@@ -2992,7 +2993,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.45".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.46".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -8877,11 +8878,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.45", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.45", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.46", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.46", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.45",
+                "Codex Quota v3.46",
                 "Interface font size",
             ),
         ] {
