@@ -1224,6 +1224,15 @@ fn persist_thread(
         .map_err(error)?
         .map(|row| checked_row(row).map(|e| (e.id.clone(), e)))
         .collect::<io::Result<_>>()?;
+    let mut old_rows: BTreeMap<String, (i64, i64, i64)> = tx
+        .prepare("SELECT id,event_key,ordinal,model_sid FROM events WHERE thread_key=?")
+        .map_err(error)?
+        .query_map([key], |row| {
+            Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+        })
+        .map_err(error)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(error)?;
     for table in ["event_partitions", "day_counts", "model_counts"] {
         cancellation::check()?;
         tx.execute(&format!("DELETE FROM {table} WHERE thread_key=?"), [key])
@@ -1233,12 +1242,12 @@ fn persist_thread(
     let mut partitions: BTreeMap<(bool, bool), PartitionValue> = BTreeMap::new();
     let mut days: BTreeMap<(i64, bool, bool), i64> = BTreeMap::new();
     let mut models: BTreeMap<(i64, bool, bool), i64> = BTreeMap::new();
-    tx.execute("DELETE FROM events WHERE thread_key=?", [key])
-        .map_err(error)?;
     for (ordinal, event) in shard.events.iter().enumerate() {
         cancellation::check()?;
         let old = old_events.remove(&event.id);
-        if old.as_ref() != Some(event) {
+        let old_row = old_rows.remove(&event.id);
+        let changed = old.as_ref() != Some(event);
+        if changed {
             stats.event_changes.push((old, Some(event.clone())));
         }
         if event.session != shard.thread_id {
@@ -1247,19 +1256,50 @@ fn persist_thread(
         if event.cost_usd.is_some_and(|cost| !cost.is_finite()) {
             return Err(error("Non-finite cached cost"));
         }
-        let model = intern(tx, &event.model)?;
-        let effort = optional_intern(tx, event.reasoning_effort.as_deref())?;
-        let kind = optional_intern(tx, event.source_kind.as_deref())?;
-        let flags_json = String::from_utf8(encode(&event.partial_flags)?).map_err(error)?;
-        let flags = intern(tx, &flags_json)?;
         let excluded = event.is_excluded_auto_review();
         let anonymous = event.source_kind.as_deref() != Some("token_usage_record")
             && event
                 .partial_flags
                 .iter()
                 .any(|flag| flag == "session_identity_missing");
-        tx.execute("INSERT INTO events(thread_key,ordinal,id,timestamp,model_sid,assumed,effort_sid,response_id,turn_id,source_kind_sid,input,cached,uncached,output,reasoning,cost_usd,flags_sid,excluded,anonymous_legacy,coverage_start_timestamp_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![key,ordinal as i64,event.id,event.timestamp,model,event.model_assumed,effort,event.response_id,event.turn_id,kind,Counter(event.input),Counter(event.cached),Counter(event.uncached),Counter(event.output),Counter(event.reasoning),event.cost_usd,flags,excluded,anonymous,event.coverage_start_timestamp_ms]).map_err(error)?;
-        let event_key = tx.last_insert_rowid();
+        let (event_key, model) = if !changed {
+            let (event_key, old_ordinal, model) =
+                old_row.ok_or_else(|| error("Missing unchanged event row"))?;
+            if old_ordinal != ordinal as i64 {
+                tx.execute(
+                    "UPDATE events SET ordinal=? WHERE event_key=?",
+                    params![ordinal as i64, event_key],
+                )
+                .map_err(error)?;
+                stats.events_written += 1;
+            }
+            (event_key, model)
+        } else {
+            if old_row.is_none()
+                && tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
+                        [&event.id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(error)?
+            {
+                return Err(error("Event ID belongs to another thread"));
+            }
+            let model = intern(tx, &event.model)?;
+            let effort = optional_intern(tx, event.reasoning_effort.as_deref())?;
+            let kind = optional_intern(tx, event.source_kind.as_deref())?;
+            let flags_json = String::from_utf8(encode(&event.partial_flags)?).map_err(error)?;
+            let flags = intern(tx, &flags_json)?;
+            tx.execute("INSERT INTO events(thread_key,ordinal,id,timestamp,model_sid,assumed,effort_sid,response_id,turn_id,source_kind_sid,input,cached,uncached,output,reasoning,cost_usd,flags_sid,excluded,anonymous_legacy,coverage_start_timestamp_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET thread_key=excluded.thread_key,ordinal=excluded.ordinal,timestamp=excluded.timestamp,model_sid=excluded.model_sid,assumed=excluded.assumed,effort_sid=excluded.effort_sid,response_id=excluded.response_id,turn_id=excluded.turn_id,source_kind_sid=excluded.source_kind_sid,input=excluded.input,cached=excluded.cached,uncached=excluded.uncached,output=excluded.output,reasoning=excluded.reasoning,cost_usd=excluded.cost_usd,flags_sid=excluded.flags_sid,excluded=excluded.excluded,anonymous_legacy=excluded.anonymous_legacy,coverage_start_timestamp_ms=excluded.coverage_start_timestamp_ms",params![key,ordinal as i64,event.id,event.timestamp,model,event.model_assumed,effort,event.response_id,event.turn_id,kind,Counter(event.input),Counter(event.cached),Counter(event.uncached),Counter(event.output),Counter(event.reasoning),event.cost_usd,flags,excluded,anonymous,event.coverage_start_timestamp_ms]).map_err(error)?;
+            stats.events_written += 1;
+            (
+                old_row
+                    .map(|row| row.0)
+                    .unwrap_or_else(|| tx.last_insert_rowid()),
+                model,
+            )
+        };
         let partition = partitions.entry((excluded, anonymous)).or_insert_with(|| {
             (
                 0,
@@ -1280,7 +1320,6 @@ fn persist_thread(
             .entry((hk_day(event.timestamp), excluded, anonymous))
             .or_default() += 1;
         *models.entry((model, excluded, anonymous)).or_default() += 1;
-        stats.events_written += 1;
     }
     for ((excluded, anonymous), (count, latest, _, _, first)) in partitions {
         cancellation::check()?;
@@ -1308,6 +1347,11 @@ fn persist_thread(
     }
     for old in old_events.into_values() {
         cancellation::check()?;
+        tx.execute(
+            "DELETE FROM events WHERE thread_key=? AND id=?",
+            params![key, old.id],
+        )
+        .map_err(error)?;
         stats.event_changes.push((Some(old), None));
     }
     stats.threads_written += 1;
@@ -2465,10 +2509,54 @@ mod tests {
         let stats = db
             .commit(&export(vec![original, event("b", "one", 10, false)], 2), 1)
             .unwrap();
-        assert_eq!(stats.events_written, 2);
+        assert_eq!(stats.events_written, 1);
         assert_eq!(stats.event_changes.len(), 1);
         assert!(stats.event_changes[0].0.is_none());
         assert_eq!(stats.event_changes[0].1.as_ref().unwrap().id, "b");
+    }
+    #[test]
+    fn sqlite_incremental_changes_preserve_rows_and_indexes() {
+        let dir = TempDir::new().unwrap();
+        let mut db = TokenDb::open(&dir.path().join("tokens.sqlite3"), true).unwrap();
+        let a = event("a", "one", 100, false);
+        let b = event("b", "one", 200, false);
+        db.commit(&export(vec![a.clone(), b.clone()], 1), 0)
+            .unwrap();
+        let key: i64 = db
+            .conn
+            .query_row("SELECT event_key FROM events WHERE id='a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut updated = a.clone();
+        updated.input = 101;
+        let stats = db
+            .commit(
+                &export(vec![updated.clone(), event("c", "one", 300, false)], 2),
+                1,
+            )
+            .unwrap();
+        assert_eq!(stats.events_written, 2);
+        assert_eq!(stats.event_changes.len(), 3);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT event_key FROM events WHERE id='a'", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            key
+        );
+        assert_eq!(db.count_filtered(None, None, false).unwrap(), 2);
+        assert_eq!(
+            db.query_summary(None, None, &Pricing::demo())
+                .unwrap()
+                .input,
+            401
+        );
+        assert!(db
+            .query_events(None, None, false)
+            .unwrap()
+            .iter()
+            .all(|e| e.id != "b"));
     }
     #[test]
     fn sqlite_migration_preserves_json_and_roundtrips_every_shard() {
