@@ -358,6 +358,14 @@ impl Pricing {
             },
         );
         p.rates.insert(
+            "gpt-6.1-terra".into(),
+            ModelPrice {
+                uncached_input_per_million: 1.0,
+                cached_input_per_million: 0.05,
+                output_per_million: 5.0,
+            },
+        );
+        p.rates.insert(
             "gpt-6-astra".into(),
             ModelPrice {
                 uncached_input_per_million: 10.0,
@@ -391,7 +399,10 @@ impl Pricing {
             return None;
         }
         let long = self.apply_long_context
-            && matches!(model, "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra")
+            && matches!(
+                model,
+                "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra" | "gpt-6.1-terra"
+            )
             && uncached.saturating_add(cached) > 272_000;
         let input_multiplier = if long { 2.0 } else { 1.0 };
         let output_multiplier = if long { 1.5 } else { 1.0 };
@@ -5229,6 +5240,34 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, format!("{}\n{}\n", metadata(), rows.join("\n"))).unwrap();
         path
+    }
+    #[test]
+    fn terra_official_cost_and_long_context() {
+        let standard = Pricing::official_standard();
+        assert!(
+            (standard
+                .cost("gpt-6.1-terra", 100_000, 100_000, 10_000)
+                .unwrap()
+                - 0.155)
+                .abs()
+                < 1e-10
+        );
+        assert!(
+            (standard
+                .cost("gpt-6.1-terra", 200_000, 100_000, 10_000)
+                .unwrap()
+                - 0.485)
+                .abs()
+                < 1e-10
+        );
+        assert!(
+            (Pricing::official_fast()
+                .cost("gpt-6.1-terra", 100_000, 100_000, 10_000)
+                .unwrap()
+                - 0.31)
+                .abs()
+                < 1e-10
+        );
     }
     fn sample_pricing() -> Pricing {
         let mut pricing = Pricing::default();

@@ -160,6 +160,22 @@ fn popup_work_area(ctx: &egui::Context, anchor: Pos2) -> Rect {
 }
 
 fn prepare_widget_settings(settings: &mut Settings) {
+    // Add newly supported official rates without overwriting user customization.
+    let preset = match settings.pricing.tier_label.as_str() {
+        "Standard（假設）" => Some(Pricing::official_standard()),
+        "Fast / Priority（假設）" => Some(Pricing::official_fast()),
+        _ => None,
+    };
+    if let Some(preset) = preset {
+        if let Some(rate) = preset.rates.get("gpt-6.1-terra") {
+            settings
+                .pricing
+                .rates
+                .entry("gpt-6.1-terra".into())
+                .or_insert_with(|| rate.clone());
+        }
+    }
+
     settings.ui_scale_percent = settings.ui_scale_percent.clamp(75, 250);
     if settings.compact_layout_version == 0 {
         settings.size[0] *= 2. / 3.;
@@ -482,12 +498,12 @@ struct TableIntervalRow {
     interval_index: Option<usize>,
     presentation: IntervalPresentation,
     models: Vec<quota_widget::intervals::ModelIntervalUsage>,
-    task_counts: [usize; 4],
+    task_counts: [usize; 5],
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedSegmentUsage {
     models: Vec<intervals::ModelIntervalUsage>,
-    counts: [usize; 4],
+    counts: [usize; 5],
     cost: accounting::ObservedCost,
 }
 // Cache identity includes calculation version, exact boundaries and source files.
@@ -528,7 +544,7 @@ fn segment_cache_path(
         }
     }
     let mut hash = Sha256::new();
-    hash.update(format!("segment-response-v1:{start}:{end}"));
+    hash.update(format!("segment-response-v2:{start}:{end}"));
     for path in sources {
         let meta = std::fs::metadata(&path)?;
         hash.update(format!("{:?}:{}:{:?}", path, meta.len(), meta.modified()?));
@@ -909,10 +925,11 @@ fn daily_quota_segments(
     result.reverse();
     result
 }
-fn interval_task_counts(events: &[&TokenEvent]) -> [usize; 4] {
+fn interval_task_counts(events: &[&TokenEvent]) -> [usize; 5] {
     let mut sol = BTreeSet::new();
     let mut luna = BTreeSet::new();
     let mut astra = BTreeSet::new();
+    let mut terra = BTreeSet::new();
     let mut total = BTreeSet::new();
     for event in events
         .iter()
@@ -932,9 +949,11 @@ fn interval_task_counts(events: &[&TokenEvent]) -> [usize; 4] {
             luna.insert(response);
         } else if model.ends_with("-astra") {
             astra.insert(response);
+        } else if model.ends_with("-terra") {
+            terra.insert(response);
         }
     }
-    [sol.len(), luna.len(), astra.len(), total.len()]
+    [sol.len(), luna.len(), astra.len(), total.len(), terra.len()]
 }
 fn active_segment_presentation(
     change: String,
@@ -1141,7 +1160,10 @@ fn exported_long_context_applied(event: &serde_json::Value, pricing: &Pricing) -
         return Some(false);
     }
     let model = event.get("model")?.as_str()?;
-    if !matches!(model, "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra") {
+    if !matches!(
+        model,
+        "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra" | "gpt-6.1-terra"
+    ) {
         return Some(false);
     }
     let response_scoped = event.get("source_kind").and_then(serde_json::Value::as_str)
@@ -2624,7 +2646,7 @@ impl WidgetApp {
                 && self.tokens.pricing.apply_long_context
                 && matches!(
                     e.model.as_str(),
-                    "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra"
+                    "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra" | "gpt-6.1-terra"
                 )
                 && e.input > 272000
                 && !e
@@ -2993,7 +3015,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.46".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.47".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -4300,8 +4322,12 @@ impl WidgetApp {
                                     ui.strong(tr(label));
                                 }
                                 ui.end_row();
-                                let families =
-                                    [("sol", "Sol"), ("luna", "Luna"), ("astra", "Astra")];
+                                let families = [
+                                    ("sol", "Sol"),
+                                    ("luna", "Luna"),
+                                    ("terra", "Terra"),
+                                    ("astra", "Astra"),
+                                ];
                                 let mut grouped = Vec::new();
                                 for (family, label) in families {
                                     if let Some(model) =
@@ -4372,12 +4398,13 @@ impl WidgetApp {
         let column_widths = [
             table_width * 0.09,
             table_width * 0.25,
-            table_width * 0.165,
-            table_width * 0.165,
-            table_width * 0.165,
-            table_width * 0.165,
+            table_width * 0.132,
+            table_width * 0.132,
+            table_width * 0.132,
+            table_width * 0.132,
+            table_width * 0.132,
         ];
-        let mut column_x = [0.; 6];
+        let mut column_x = [0.; 7];
         for i in 1..column_x.len() {
             column_x[i] = column_x[i - 1] + column_widths[i - 1];
         }
@@ -4392,6 +4419,7 @@ impl WidgetApp {
             "Luna",
             "Sol",
             "Astra",
+            "Terra",
             "Total",
         ]
         .iter()
@@ -4444,6 +4472,7 @@ impl WidgetApp {
                             ("luna", "Luna", 1),
                             ("sol", "Sol", 0),
                             ("astra", "Astra", 2),
+                            ("terra", "Terra", 4),
                         ];
                         let family_models: Vec<_> = families
                             .iter()
@@ -4474,6 +4503,7 @@ impl WidgetApp {
                             family_cell(1, family_models[0].as_ref()),
                             family_cell(0, family_models[1].as_ref()),
                             family_cell(2, family_models[2].as_ref()),
+                            family_cell(4, family_models[3].as_ref()),
                             format!(
                                 "{} 筆 Response\n{}",
                                 row.task_counts[3],
@@ -4497,6 +4527,11 @@ impl WidgetApp {
                                 "Astra（所有版本合併）",
                                 family_models[2].as_ref(),
                                 row.task_counts[2],
+                            ),
+                            model_usage_tooltip(
+                                "Terra（所有版本合併）",
+                                family_models[3].as_ref(),
+                                row.task_counts[4],
                             ),
                             model_usage_tooltip("所有模型總計", Some(&total), row.task_counts[3]),
                         ];
@@ -4846,7 +4881,9 @@ impl WidgetApp {
         }
         let mut choices = self.recorded_price_models.clone();
         choices.extend(self.settings.pricing.rates.keys().cloned());
-        choices.extend(["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"].map(String::from));
+        choices.extend(
+            ["gpt-6.1-sol", "gpt-6-luna", "gpt-6.1-terra", "gpt-6-astra"].map(String::from),
+        );
         choices
     }
     fn load_price_editor(&mut self) {
@@ -6187,7 +6224,7 @@ mod widget_revision_tests {
             &path,
             &CachedSegmentUsage {
                 models: vec![],
-                counts: [0, 169, 0, 169],
+                counts: [0, 169, 0, 169, 0],
                 cost: accounting::ObservedCost {
                     known_usd: 4.317,
                     events: 169,
@@ -6233,6 +6270,7 @@ mod widget_revision_tests {
             make("5", "task-b", None, "gpt-6-luna", vec![]),
             make("6", "task-b", None, "gpt-6-luna", vec![]),
             make("7", "task-c", Some("turn-1"), "gpt-6-astra", vec![]),
+            make("terra", "task-d", None, "gpt-6.1-terra", vec![]),
             make(
                 "8",
                 "task-review",
@@ -6242,7 +6280,7 @@ mod widget_revision_tests {
             ),
         ];
         let refs: Vec<_> = events.iter().collect();
-        assert_eq!(interval_task_counts(&refs), [3, 3, 1, 7]);
+        assert_eq!(interval_task_counts(&refs), [3, 3, 1, 8, 1]);
         let responses: Vec<_> = (0..169)
             .map(|i| {
                 let mut event = make(
@@ -6260,7 +6298,7 @@ mod widget_revision_tests {
         replay.id = "replayed-response".into();
         let mut refs: Vec<_> = responses.iter().collect();
         refs.push(&replay);
-        assert_eq!(interval_task_counts(&refs), [169, 0, 0, 169]);
+        assert_eq!(interval_task_counts(&refs), [169, 0, 0, 169, 0]);
     }
 
     #[test]
@@ -6443,12 +6481,41 @@ mod widget_revision_tests {
         assert!(tip.contains("Reasoning: 未知"));
     }
     #[test]
+    fn terra_pricing_migration_preserves_user_rates() {
+        let mut settings = Settings::default();
+        settings.pricing.rates.remove("gpt-6.1-terra");
+        prepare_widget_settings(&mut settings);
+        let rate = settings.pricing.rates["gpt-6.1-terra"].clone();
+        assert_eq!(rate.output_per_million, 5.0);
+        settings
+            .pricing
+            .rates
+            .get_mut("gpt-6.1-terra")
+            .unwrap()
+            .output_per_million = 7.0;
+        prepare_widget_settings(&mut settings);
+        assert_eq!(
+            settings.pricing.rates["gpt-6.1-terra"].output_per_million,
+            7.0
+        );
+        settings.pricing = Pricing::official_fast();
+        settings.pricing.rates.remove("gpt-6.1-terra");
+        prepare_widget_settings(&mut settings);
+        assert_eq!(
+            settings.pricing.rates["gpt-6.1-terra"].output_per_million,
+            10.0
+        );
+        settings.pricing = Pricing::default();
+        prepare_widget_settings(&mut settings);
+        assert!(!settings.pricing.rates.contains_key("gpt-6.1-terra"));
+    }
+    #[test]
     fn model_picker_and_editor_preserve_other_rates_and_unknowns() {
         let mut app = demo_app();
         app.settings.pricing = Pricing::official_standard();
         let original = app.settings.pricing.rates.clone();
         let choices = app.price_model_choices();
-        for name in ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"] {
+        for name in ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra"] {
             assert!(choices.contains(name));
         }
         app.price_model = "gpt-6-luna".into();
@@ -8878,11 +8945,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.46", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.46", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.47", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.47", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.46",
+                "Codex Quota v3.47",
                 "Interface font size",
             ),
         ] {
