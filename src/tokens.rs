@@ -9,8 +9,9 @@ mod source_path;
 use chrono::{DateTime, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1235,7 +1236,7 @@ pub struct TokenStore {
     #[serde(skip)]
     known_observations: HashMap<String, usize>,
     #[serde(skip)]
-    known_quota: BTreeSet<String>,
+    known_quota: HashSet<QuotaIdentity>,
     #[serde(skip)]
     legacy_quota: BTreeMap<String, usize>,
     #[serde(skip)]
@@ -1284,7 +1285,7 @@ impl Default for TokenStore {
             metadata_names: BTreeMap::new(),
             indexes_ready: false,
             known_observations: HashMap::new(),
-            known_quota: BTreeSet::new(),
+            known_quota: HashSet::new(),
             legacy_quota: BTreeMap::new(),
             mixed_schema_warning: false,
             usage_dirty: false,
@@ -4740,21 +4741,48 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 fn legacy_quota_identity(observation: &ImportedQuotaObservation) -> String {
     format!("{}:{}", observation.timestamp, observation.payload)
 }
-fn quota_identity(observation: &ImportedQuotaObservation) -> String {
+#[derive(Debug, Clone)]
+struct QuotaIdentity {
+    timestamp_ms: i64,
+    source: String,
+    payload: QuotaPayload,
+    payload_hash: u64,
+}
+
+impl PartialEq for QuotaIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp_ms == other.timestamp_ms
+            && self.source == other.source
+            && self.payload_hash == other.payload_hash
+            && (std::sync::Arc::ptr_eq(&self.payload.0, &other.payload.0)
+                || self.payload.to_string() == other.payload.to_string())
+    }
+}
+impl Eq for QuotaIdentity {}
+impl Hash for QuotaIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.timestamp_ms.hash(state);
+        self.source.hash(state);
+        self.payload_hash.hash(state);
+    }
+}
+
+fn quota_identity(observation: &ImportedQuotaObservation) -> QuotaIdentity {
     // Same snapshot copied to another source in the same logical session remains
     // one observation; different sessions retain independent provenance evidence.
-    format!(
-        "{}:{}:{}",
-        observation
+    QuotaIdentity {
+        timestamp_ms: observation
             .timestamp_ms
             .unwrap_or(observation.timestamp.saturating_mul(1000)),
-        observation
+        source: observation
             .origin_session
             .as_deref()
             .or(observation.source_id.as_deref())
-            .unwrap_or(""),
-        observation.payload
-    )
+            .unwrap_or("")
+            .to_owned(),
+        payload: observation.payload.clone(),
+        payload_hash: stable_hash(observation.payload.to_string().as_bytes()),
+    }
 }
 fn hash_range(file: &mut File, offset: u64, len: usize) -> io::Result<u64> {
     checkpoint()?;
@@ -4834,6 +4862,32 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn quota_identity_deduplicates_without_confusing_hash_collisions() {
+        let observation = ImportedQuotaObservation {
+            timestamp: 42,
+            timestamp_ms: Some(42_123),
+            payload: json!({"used_percent": 12}).into(),
+            origin_session: Some("session-a".into()),
+            source_id: None,
+        };
+        let mut identities = HashSet::new();
+        assert!(identities.insert(quota_identity(&observation)));
+        assert!(!identities.insert(quota_identity(&observation)));
+        let mut different = observation.clone();
+        different.payload = json!({"used_percent": 13}).into();
+        let mut collision = quota_identity(&different);
+        collision.payload_hash = quota_identity(&observation).payload_hash;
+        assert!(identities.insert(collision));
+        different = observation.clone();
+        different.origin_session = Some("session-b".into());
+        assert!(identities.insert(quota_identity(&different)));
+        different = observation.clone();
+        different.timestamp_ms = Some(42_124);
+        assert!(identities.insert(quota_identity(&different)));
+        assert_eq!(identities.len(), 4);
+    }
 
     #[test]
     fn quota_payloads_share_duplicates_without_changing_json_or_mutation() {
