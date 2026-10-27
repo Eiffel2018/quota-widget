@@ -398,6 +398,12 @@ fn astra_standard_fast_and_long_context_presets_preserve_unknown_model_behavior(
     );
     assert_eq!(
         standard.cost("gpt-6-astra", 200_000, 100_000, 10_000),
+        Some(2.6)
+    );
+    let mut api = standard.clone();
+    api.apply_long_context = true;
+    assert_eq!(
+        api.cost("gpt-6-astra", 200_000, 100_000, 10_000),
         Some(4.95)
     );
     assert_eq!(standard.cost("codex-auto-review", 100, 0, 10), None);

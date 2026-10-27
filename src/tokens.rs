@@ -337,7 +337,7 @@ impl Pricing {
     pub fn official_standard() -> Self {
         let mut p = Self {
             tier_label: "Standard（假設）".into(),
-            apply_long_context: true,
+            apply_long_context: false,
             verified_at: Some("2026-10-17".into()),
             ..Self::default()
         };
@@ -4500,7 +4500,7 @@ impl CoverageRanges {
     }
 }
 
-pub(crate) fn event_cost(event: &TokenEvent, pricing: &Pricing) -> Option<f64> {
+pub fn event_cost(event: &TokenEvent, pricing: &Pricing) -> Option<f64> {
     if event.partial_flags.iter().any(|s| {
         matches!(
             s.as_str(),
@@ -5242,8 +5242,27 @@ mod tests {
         path
     }
     #[test]
+    fn codex_default_does_not_apply_long_context_multiplier() {
+        let mut pricing = Pricing::official_standard();
+        assert!(!pricing.apply_long_context);
+        let normal = pricing
+            .cost("gpt-6.1-terra", 200_000, 100_000, 10_000)
+            .unwrap();
+        assert!((normal - 0.255).abs() < 1e-10);
+        pricing.apply_long_context = true;
+        assert!(
+            (pricing
+                .cost("gpt-6.1-terra", 200_000, 100_000, 10_000)
+                .unwrap()
+                - 0.485)
+                .abs()
+                < 1e-10
+        );
+    }
+    #[test]
     fn terra_official_cost_and_long_context() {
-        let standard = Pricing::official_standard();
+        let mut standard = Pricing::official_standard();
+        standard.apply_long_context = true;
         assert!(
             (standard
                 .cost("gpt-6.1-terra", 100_000, 100_000, 10_000)
@@ -5261,9 +5280,13 @@ mod tests {
                 < 1e-10
         );
         assert!(
-            (Pricing::official_fast()
-                .cost("gpt-6.1-terra", 100_000, 100_000, 10_000)
-                .unwrap()
+            ({
+                let mut fast = Pricing::official_fast();
+                fast.apply_long_context = true;
+                fast
+            }
+            .cost("gpt-6.1-terra", 100_000, 100_000, 10_000)
+            .unwrap()
                 - 0.31)
                 .abs()
                 < 1e-10
@@ -6219,7 +6242,8 @@ mod tests {
                 Some(c(272_001, 200_000, 100, 20)),
             )],
         );
-        let pricing = Pricing::official_standard();
+        let mut pricing = Pricing::official_standard();
+        pricing.apply_long_context = true;
         let mut store = TokenStore::default();
         store.import_dir(dir.path(), &pricing).unwrap();
         let e = &store.events()[0];

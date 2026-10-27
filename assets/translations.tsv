@@ -61,7 +61,7 @@ CLI 回傳的額度格式不支援；請在設定檢查來源。	Unsupported CLI
 深色外觀	Dark appearance	深色外观
 保持最上層	Always on top	保持最上层
 關閉小工具	Close widget	关闭小工具
-Codex 額度 v3.48	Codex Quota v3.48	Codex 额度 v3.48
+Codex 額度 v3.49	Codex Quota v3.49	Codex 额度 v3.49
 扣額紀錄	Quota history	扣额记录
 Token明細	Token details	Token明细
 — 等待量測	— Awaiting samples	— 等待量测
@@ -369,3 +369,5 @@ Token 明細 · {}	Token details · {}	Token 明细 · {}
 視窗、文字及按鈕一併縮放	Scale windows, text and buttons together	窗口、文字及按钮一并缩放
 還原小視窗	Restore compact window	还原小窗口
 Terra（所有版本合併）	Terra (all versions)	Terra（所有版本合并）
+使用 API key（>272K：輸入／快取 ×2 · 輸出 ×1.5）	API key (>272K: input / cached ×2 · output ×1.5)	使用 API key（>272K：输入／缓存 ×2 · 输出 ×1.5）
+Reasoning（已記錄，屬 Output）	Reasoning (recorded, included in output)	Reasoning（已记录，属 Output）

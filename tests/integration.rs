@@ -734,12 +734,15 @@ fn historical_replay_retains_real_observations_older_than_thirty_days() {
 #[test]
 fn verified_price_presets_apply_per_request_long_context_boundary() {
     use quota_widget::tokens::Pricing;
-    let p = Pricing::official_standard();
+    let mut p = Pricing::official_standard();
+    p.apply_long_context = true;
     let at = p.cost("gpt-6.1-sol", 272_000, 0, 100).unwrap();
     assert!((at - 0.545).abs() < 1e-12);
     let beyond = p.cost("gpt-6.1-sol", 172_001, 100_000, 100).unwrap();
     assert!((beyond - (172001.0 * 4.0 + 100000.0 * 0.20 + 100.0 * 15.0) / 1e6).abs() < 1e-12);
-    let fast = Pricing::official_fast()
+    let mut fast_pricing = Pricing::official_fast();
+    fast_pricing.apply_long_context = true;
+    let fast = fast_pricing
         .cost("gpt-6.1-sol", 172_001, 100_000, 100)
         .unwrap();
     assert!((fast - beyond * 2.0).abs() < 1e-12);
@@ -747,7 +750,7 @@ fn verified_price_presets_apply_per_request_long_context_boundary() {
     assert!((luna - (272001.0 * 0.20 + 100.0 * 0.75) / 1e6).abs() < 1e-12);
     assert!(Pricing::default().cost("gpt-6.1-sol", 1, 0, 1).is_none());
     assert!(
-        quota_widget::storage::Settings::default()
+        !quota_widget::storage::Settings::default()
             .pricing
             .apply_long_context
     );

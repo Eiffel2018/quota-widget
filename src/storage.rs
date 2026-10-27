@@ -40,6 +40,8 @@ pub struct Settings {
     pub sessions_path: String,
     pub import_enabled: bool,
     pub pricing: Pricing,
+    #[serde(default)]
+    pub pricing_mode_migrated: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -70,6 +72,7 @@ impl Default for Settings {
             sessions_path: default_sessions().to_string_lossy().into(),
             import_enabled: true,
             pricing: Pricing::official_standard(),
+            pricing_mode_migrated: false,
         }
     }
 }

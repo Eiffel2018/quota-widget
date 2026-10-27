@@ -160,6 +160,11 @@ fn popup_work_area(ctx: &egui::Context, anchor: Pos2) -> Rect {
 }
 
 fn prepare_widget_settings(settings: &mut Settings) {
+    if !settings.pricing_mode_migrated {
+        settings.pricing.apply_long_context = false;
+        settings.pricing_mode_migrated = true;
+    }
+
     // Add newly supported official rates without overwriting user customization.
     let preset = match settings.pricing.tier_label.as_str() {
         "Standard（假設）" => Some(Pricing::official_standard()),
@@ -512,6 +517,7 @@ fn segment_cache_path(
     database: &std::path::Path,
     start: i64,
     end: i64,
+    pricing: &Pricing,
 ) -> std::io::Result<PathBuf> {
     use sha2::{Digest, Sha256};
     let dir = database
@@ -544,7 +550,8 @@ fn segment_cache_path(
         }
     }
     let mut hash = Sha256::new();
-    hash.update(format!("segment-response-v2:{start}:{end}"));
+    hash.update(format!("segment-response-v3:{start}:{end}"));
+    hash.update(serde_json::to_vec(pricing).map_err(std::io::Error::other)?);
     for path in sources {
         let meta = std::fs::metadata(&path)?;
         hash.update(format!("{:?}:{}:{:?}", path, meta.len(), meta.modified()?));
@@ -560,6 +567,7 @@ fn start_history_usage(
     path: PathBuf,
     segments: Vec<DailyQuotaSegment>,
     writable_cache: bool,
+    pricing: Pricing,
     ctx: egui::Context,
 ) -> mpsc::Receiver<std::io::Result<CachedSegmentUsage>> {
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -567,7 +575,7 @@ fn start_history_usage(
         let mut database = None;
         for segment in segments {
             let result = (|| {
-                let cache = segment_cache_path(&path, segment.start, segment.end).ok();
+                let cache = segment_cache_path(&path, segment.start, segment.end, &pricing).ok();
                 if let Some(usage) = cache
                     .as_ref()
                     .and_then(|cache| storage::load_json::<CachedSegmentUsage>(cache).ok())
@@ -598,6 +606,9 @@ fn start_history_usage(
                 }
                 let mut events: Vec<_> = events.into_values().collect();
                 events.sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+                for event in &mut events {
+                    event.cost_usd = quota_widget::tokens::event_cost(event, &pricing);
+                }
                 let refs: Vec<_> = events.iter().collect();
                 let usage = CachedSegmentUsage {
                     models: intervals::model_usage(refs.iter().copied()),
@@ -1044,6 +1055,7 @@ fn model_family_usage(
         total.cached = total.cached.saturating_add(model.cached);
         total.uncached = total.uncached.saturating_add(model.uncached);
         total.output = total.output.saturating_add(model.output);
+        total.reasoning = total.reasoning.saturating_add(model.reasoning);
         total.known_usd += model.known_usd;
         total.unknown_cost_events += model.unknown_cost_events;
         total.events += model.events;
@@ -1052,7 +1064,6 @@ fn model_family_usage(
         total.partial_events += model.partial_events;
         total.coverage_gap_events += model.coverage_gap_events;
     }
-    total.reasoning = 0;
     Some(total)
 }
 fn total_model_usage(models: &[intervals::ModelIntervalUsage]) -> intervals::ModelIntervalUsage {
@@ -1076,6 +1087,7 @@ fn total_model_usage(models: &[intervals::ModelIntervalUsage]) -> intervals::Mod
         total.cached = total.cached.saturating_add(model.cached);
         total.uncached = total.uncached.saturating_add(model.uncached);
         total.output = total.output.saturating_add(model.output);
+        total.reasoning = total.reasoning.saturating_add(model.reasoning);
         total.known_usd += model.known_usd;
         total.unknown_cost_events += model.unknown_cost_events;
         total.events += model.events;
@@ -1095,12 +1107,13 @@ fn model_usage_tooltip(
         return format!("{label}\nResponse：{turn_count} 筆\n0 筆 · $0.0000");
     };
     format!(
-        "{label}\nResponse：{turn_count} 筆\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}{}",
+        "{label}\nResponse：{turn_count} 筆\nToken 記錄：{} 筆\n估算：{}\nInput：{}\nCached：{}\nOutput：{}\nReasoning（已記錄，屬 Output）：{}{}",
         model.events,
         interval_model_cost(model),
         model.input,
         model.cached,
         model.output,
+        model.reasoning,
         if model.unknown_cost_events > 0 {
             format!("\n價格未設定：{} 筆", model.unknown_cost_events)
         } else {
@@ -1369,7 +1382,8 @@ pub fn launch(args: Vec<String>) -> eframe::Result<()> {
         .as_ref()
         .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
     let mut settings = settings_read.unwrap_or_default();
-    let compact_layout_migrated = settings.compact_layout_version == 0;
+    let compact_layout_migrated =
+        settings.compact_layout_version == 0 || !settings.pricing_mode_migrated;
     prepare_widget_settings(&mut settings);
     let mut viewport = ViewportBuilder::default()
         .with_inner_size(Vec2::from(settings.size) * (settings.ui_scale_percent as f32 / 100.))
@@ -2245,6 +2259,11 @@ impl WidgetApp {
                 error,
             } => {
                 if let Some(snapshot) = snapshot {
+                    if self.tokens.pricing != snapshot.pricing {
+                        self.recent_usage = RecentUsage::default();
+                        self.history_cache.key = None;
+                        self.history_cache.work_key = None;
+                    }
                     self.tokens = snapshot;
                     self.accept_database_view();
                     self.token_generation += 1;
@@ -2778,6 +2797,7 @@ impl WidgetApp {
                     database.database_path.clone(),
                     self.recent_usage.segments.clone(),
                     self._lock.is_some(),
+                    self.tokens.pricing.clone(),
                     ctx.clone(),
                 ));
             } else {
@@ -3015,7 +3035,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.48".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.49".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -4053,6 +4073,7 @@ impl WidgetApp {
                     view.database_path.clone(),
                     self.history_cache.pending_segments.clone(),
                     self._lock.is_some(),
+                    self.tokens.pricing.clone(),
                     ui.ctx().clone(),
                 ));
             }
@@ -5297,7 +5318,7 @@ impl WidgetApp {
         if ui
             .checkbox(
                 &mut self.settings.pricing.apply_long_context,
-                tr("長上下文 >272K：輸入／快取 ×2 · 輸出 ×1.5"),
+                tr("使用 API key（>272K：輸入／快取 ×2 · 輸出 ×1.5）"),
             )
             .changed()
         {
@@ -6214,12 +6235,25 @@ mod widget_revision_tests {
         std::fs::write(&new, b"new").unwrap();
         let (a, b) =
             display_time::day_bounds(NaiveDate::from_ymd_opt(2026, 10, 21).unwrap()).unwrap();
-        let key = segment_cache_path(&db, a, b).unwrap();
+        let standard = Pricing::official_standard();
+        let mut api = standard.clone();
+        api.apply_long_context = true;
+        assert_ne!(
+            segment_cache_path(&db, a, b, &standard).unwrap(),
+            segment_cache_path(&db, a, b, &api).unwrap()
+        );
+        let key = segment_cache_path(&db, a, b, &Pricing::official_standard()).unwrap();
         std::fs::write(&db, b"active updated").unwrap();
-        assert_eq!(key, segment_cache_path(&db, a, b).unwrap());
+        assert_eq!(
+            key,
+            segment_cache_path(&db, a, b, &Pricing::official_standard()).unwrap()
+        );
         std::fs::write(&old, b"old corrected data").unwrap();
-        assert_ne!(key, segment_cache_path(&db, a, b).unwrap());
-        let path = segment_cache_path(&db, a, b).unwrap();
+        assert_ne!(
+            key,
+            segment_cache_path(&db, a, b, &Pricing::official_standard()).unwrap()
+        );
+        let path = segment_cache_path(&db, a, b, &Pricing::official_standard()).unwrap();
         storage::save_json(
             &path,
             &CachedSegmentUsage {
@@ -6479,6 +6513,41 @@ mod widget_revision_tests {
         assert!(tip.contains("Cached: 未知"));
         assert!(tip.contains("Uncached: 未知"));
         assert!(tip.contains("Reasoning: 未知"));
+    }
+    #[test]
+    fn codex_pricing_migration_and_reasoning_tooltip() {
+        let mut settings = Settings::default();
+        settings.pricing.apply_long_context = true;
+        prepare_widget_settings(&mut settings);
+        assert!(!settings.pricing.apply_long_context);
+        settings.pricing.apply_long_context = true; // user explicitly chooses API mode
+        prepare_widget_settings(&mut settings);
+        assert!(settings.pricing.apply_long_context);
+        let a = intervals::ModelIntervalUsage {
+            model: "gpt-6.1-terra".into(),
+            input: 100,
+            cached: 20,
+            uncached: 80,
+            output: 50,
+            reasoning: 30,
+            known_usd: 1.0,
+            unknown_cost_events: 0,
+            events: 1,
+            assumed_model_events: 0,
+            model_assumed: false,
+            partial_events: 0,
+            coverage_gap_events: 0,
+        };
+        let mut b = a.clone();
+        b.model = "gpt-6.2-terra".into();
+        b.reasoning = 10;
+        let family = model_family_usage(&[a.clone(), b.clone()], "terra").unwrap();
+        let total = total_model_usage(&[a, b]);
+        assert_eq!(family.reasoning, 40);
+        assert_eq!(total.reasoning, 40);
+        assert!(model_usage_tooltip("Terra", Some(&family), 2)
+            .contains("Reasoning（已記錄，屬 Output）：40"));
+        assert_eq!(family.known_usd, 2.0);
     }
     #[test]
     fn terra_pricing_migration_preserves_user_rates() {
@@ -7466,7 +7535,7 @@ mod database_display_tests {
                 &serde_json::json!({
                     "timestamp":base + timestamp, "type":"token_usage_record",
                     "payload":{"thread_id":"test", "response_id":id, "model":"gpt-6-luna",
-                        "usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0}}
+                        "usage":{"input_tokens":300000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":30}}
                 })
                 .to_string(),
             );
@@ -7474,9 +7543,14 @@ mod database_display_tests {
         }
         std::fs::write(dir.path().join("records.jsonl"), records).unwrap();
         let mut store = TokenStore::default();
-        store
-            .import_dir(dir.path(), &Pricing::official_standard())
-            .unwrap();
+        let mut api_pricing = Pricing::official_standard();
+        api_pricing.apply_long_context = true;
+        store.import_dir(dir.path(), &api_pricing).unwrap();
+        let mut expected_events = store.events().to_vec();
+        for event in &mut expected_events {
+            event.cost_usd = quota_widget::tokens::event_cost(event, &Pricing::official_standard());
+        }
+        assert!(store.events()[0].cost_usd.unwrap() > expected_events[0].cost_usd.unwrap());
         let legacy = dir.path().join("tokens.json");
         store.save(&legacy).unwrap();
         let path = quota_widget::token_db::TokenDb::open_or_migrate(&legacy, true, &mut |_| {})
@@ -7495,6 +7569,7 @@ mod database_display_tests {
             })
             .collect();
         let mut recent_app = app();
+        Arc::get_mut(&mut recent_app.tokens).unwrap().pricing = Pricing::official_standard();
         Arc::get_mut(&mut recent_app.tokens)
             .unwrap()
             .database
@@ -7528,7 +7603,8 @@ mod database_display_tests {
         }
         let cost = recent_app.recent_usage.costs[0].unwrap();
         assert_eq!(cost.events, 2);
-        let expected = accounting::CostIndex::new(store.events()).observed(base + 100, base + 110);
+        let expected =
+            accounting::CostIndex::new(&expected_events).observed(base + 100, base + 110);
         assert!((cost.known_usd - expected.known_usd).abs() < 1e-12);
         assert_eq!(cost.unknown_events, expected.unknown_events);
         let output = ctx.run(Default::default(), |ctx| {
@@ -7548,7 +7624,7 @@ mod database_display_tests {
         assert!(labels.contains(&"89% → 88%"));
         assert!(labels.contains(&"結算時間"));
         assert!(labels.contains(&"Total"));
-        assert!(labels.contains(&"$0.00"));
+        assert!(labels.contains(&"$0.06"));
         assert!(!labels.iter().any(|label| label.contains("未知")));
         let key = recent_app.recent_usage.key.clone();
         recent_app.refresh_recent_usage(&ctx);
@@ -7560,6 +7636,7 @@ mod database_display_tests {
                 path.clone(),
                 segments.clone(),
                 true,
+                Pricing::official_standard(),
                 egui::Context::default(),
             );
             let mut results = Vec::new();
@@ -7570,8 +7647,8 @@ mod database_display_tests {
                     .unwrap();
                 assert_eq!(usage.counts[3], expected);
                 assert_eq!(usage.cost.events, expected);
-                let direct =
-                    accounting::CostIndex::new(store.events()).observed(segment.start, segment.end);
+                let direct = accounting::CostIndex::new(&expected_events)
+                    .observed(segment.start, segment.end);
                 assert!((usage.cost.known_usd - direct.known_usd).abs() < 1e-10);
                 assert!(usage.cost.known_usd > 0.);
                 results.push(serde_json::to_string(&usage).unwrap());
@@ -7593,6 +7670,7 @@ mod database_display_tests {
             path,
             segments,
             false,
+            Pricing::official_standard(),
             egui::Context::default(),
         ));
     }
@@ -8138,7 +8216,8 @@ mod database_display_tests {
     }
     #[test]
     fn long_context_export_labels_thresholds_without_changing_costs() {
-        let pricing = Pricing::official_standard();
+        let mut pricing = Pricing::official_standard();
+        pricing.apply_long_context = true;
         for (input, expected) in [(271_999, false), (272_000, false), (272_001, true)] {
             let cost = pricing.cost("gpt-6.1-sol", input - 200_000, 200_000, 100);
             let mut value = serde_json::json!({
@@ -8189,7 +8268,8 @@ mod database_display_tests {
     #[test]
     fn actual_json_export_separates_enabled_and_applied_long_context_fields() {
         let temp = tempfile::tempdir().unwrap();
-        let pricing = Pricing::official_standard();
+        let mut pricing = Pricing::official_standard();
+        pricing.apply_long_context = true;
         let t = now();
         let mut events = Vec::new();
         for (index, input) in [271_999, 272_000, 272_001, 0].into_iter().enumerate() {
@@ -8945,11 +9025,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.48", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.48", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.49", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.49", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.48",
+                "Codex Quota v3.49",
                 "Interface font size",
             ),
         ] {
