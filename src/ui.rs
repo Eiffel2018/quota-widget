@@ -3015,7 +3015,7 @@ impl WidgetApp {
                     .as_ref()
                     .filter(|v| v.window_duration_mins != Some(10080))
                     .map(|v| v.window_label.clone())
-                    .unwrap_or_else(|| "Codex 額度 v3.47".into());
+                    .unwrap_or_else(|| "Codex 額度 v3.48".into());
                 painter.circle_filled(pt(21., 22.), 3. * scale, accent);
                 painter
                     .with_clip_rect(Rect::from_min_max(pt(32., 10.), pt(229., 35.)))
@@ -4323,9 +4323,9 @@ impl WidgetApp {
                                 }
                                 ui.end_row();
                                 let families = [
-                                    ("sol", "Sol"),
                                     ("luna", "Luna"),
                                     ("terra", "Terra"),
+                                    ("sol", "Sol"),
                                     ("astra", "Astra"),
                                 ];
                                 let mut grouped = Vec::new();
@@ -4417,9 +4417,9 @@ impl WidgetApp {
             "額度變化",
             &format!("變化時間（{}）", display_time::zone_label()),
             "Luna",
+            "Terra",
             "Sol",
             "Astra",
-            "Terra",
             "Total",
         ]
         .iter()
@@ -4470,9 +4470,9 @@ impl WidgetApp {
                             change_time.replace(&format!(" {}", display_time::offset_label()), "");
                         let families = [
                             ("luna", "Luna", 1),
+                            ("terra", "Terra", 4),
                             ("sol", "Sol", 0),
                             ("astra", "Astra", 2),
-                            ("terra", "Terra", 4),
                         ];
                         let family_models: Vec<_> = families
                             .iter()
@@ -4501,9 +4501,9 @@ impl WidgetApp {
                             view.change.clone(),
                             change_time,
                             family_cell(1, family_models[0].as_ref()),
-                            family_cell(0, family_models[1].as_ref()),
-                            family_cell(2, family_models[2].as_ref()),
-                            family_cell(4, family_models[3].as_ref()),
+                            family_cell(4, family_models[1].as_ref()),
+                            family_cell(0, family_models[2].as_ref()),
+                            family_cell(2, family_models[3].as_ref()),
                             format!(
                                 "{} 筆 Response\n{}",
                                 row.task_counts[3],
@@ -4519,19 +4519,19 @@ impl WidgetApp {
                                 row.task_counts[1],
                             ),
                             model_usage_tooltip(
-                                "Sol（所有版本合併）",
+                                "Terra（所有版本合併）",
                                 family_models[1].as_ref(),
+                                row.task_counts[4],
+                            ),
+                            model_usage_tooltip(
+                                "Sol（所有版本合併）",
+                                family_models[2].as_ref(),
                                 row.task_counts[0],
                             ),
                             model_usage_tooltip(
                                 "Astra（所有版本合併）",
-                                family_models[2].as_ref(),
-                                row.task_counts[2],
-                            ),
-                            model_usage_tooltip(
-                                "Terra（所有版本合併）",
                                 family_models[3].as_ref(),
-                                row.task_counts[4],
+                                row.task_counts[2],
                             ),
                             model_usage_tooltip("所有模型總計", Some(&total), row.task_counts[3]),
                         ];
@@ -8945,11 +8945,11 @@ mod accessible_ui_tests {
     #[test]
     fn languages_render_in_the_compact_widget_and_settings() {
         for (language, title, settings_label) in [
-            (Language::Traditional, "Codex 額度 v3.47", "介面字體大小"),
-            (Language::Simplified, "Codex 额度 v3.47", "界面字体大小"),
+            (Language::Traditional, "Codex 額度 v3.48", "介面字體大小"),
+            (Language::Simplified, "Codex 额度 v3.48", "界面字体大小"),
             (
                 Language::English,
-                "Codex Quota v3.47",
+                "Codex Quota v3.48",
                 "Interface font size",
             ),
         ] {
