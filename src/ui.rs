@@ -2258,6 +2258,11 @@ impl WidgetApp {
                 report,
                 error,
             } => {
+                // Measure the polling interval from completion, not start. A scan
+                // longer than the interval would otherwise run continuously.
+                if self.import_pending && (report.is_some() || error.is_some()) {
+                    self.last_import = Instant::now();
+                }
                 if let Some(snapshot) = snapshot {
                     if self.tokens.pricing != snapshot.pricing {
                         self.recent_usage = RecentUsage::default();
@@ -7128,6 +7133,16 @@ mod import_diagnostics_tests {
         assert!(!app.worker_failed);
         assert!(app.notice.contains("儲存失敗"));
         assert!(app.notice.contains("synthetic disk unavailable"));
+    }
+    #[test]
+    fn completed_long_import_waits_before_next_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.import_pending = true;
+        app.last_import = Instant::now() - Duration::from_secs(60);
+        app.handle_worker_event(updated(Some(ImportReport::default()), None));
+        assert!(!app.import_pending);
+        assert!(app.last_import.elapsed() < Duration::from_secs(1));
     }
     #[test]
     fn interrupted_progress_cannot_leave_perpetual_busy_state() {
