@@ -656,6 +656,7 @@ struct WidgetApp {
     selected_interval: Option<String>,
     token_generation: u64,
     history_generation: u64,
+    reset_guard_generation: Option<(u64, Option<String>)>,
     expanded_tasks: BTreeSet<String>,
     tree_generation: u64,
     boundary_after: Option<i64>,
@@ -1618,6 +1619,7 @@ impl WidgetApp {
             selected_interval: None,
             token_generation: 0,
             history_generation: 0,
+            reset_guard_generation: None,
             expanded_tasks: BTreeSet::new(),
             tree_generation: 0,
             boundary_after: None,
@@ -2069,7 +2071,14 @@ impl WidgetApp {
             }
             BridgeEvent::Connected => self.status = "CONNECTED · 等待額度".into(),
             BridgeEvent::RateLimits(v) => {
-                self.quota.remember_reset_guards(&self.history);
+                let guard_key = (
+                    self.history_generation,
+                    self.quota.account_id().map(str::to_owned),
+                );
+                if self.reset_guard_generation.as_ref() != Some(&guard_key) {
+                    self.quota.remember_reset_guards(&self.history);
+                    self.reset_guard_generation = Some(guard_key);
+                }
                 let previous_account = self.quota.account_id().map(str::to_owned);
                 match self.quota.ingest_json(&v, now()) {
                     Ok(_) => {
@@ -2184,7 +2193,9 @@ impl WidgetApp {
         }
         self.retry_quota_connection(Instant::now());
         self.retry_write_lock();
-        if !self.demo && !self.import_pending && self.last_import.elapsed() > Duration::from_secs(5)
+        if !self.demo
+            && !self.import_pending
+            && self.last_import.elapsed() > Duration::from_secs(15)
         {
             self.start_import();
         }
