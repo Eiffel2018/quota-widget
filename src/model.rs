@@ -218,6 +218,7 @@ pub struct IngestReport {
 
 #[derive(Debug, Clone, PartialEq)]
 struct WindowState {
+    credit_exhausted: bool,
     source_key: String,
     source_label: String,
     window_key: String,
@@ -406,11 +407,33 @@ impl QuotaModel {
         let mut seen_windows = BTreeSet::new();
         let mut seen_credits = BTreeSet::new();
         for source in observation.sources {
-            for incoming in source.windows {
+            let credit_decreased = source.credits.as_ref().is_some_and(|incoming| {
+                incoming.valid
+                    && !incoming.unlimited
+                    && self
+                        .credit_states
+                        .get(&source.key)
+                        .filter(|old| old.available && !old.unlimited)
+                        .and_then(|old| old.balance.as_ref().zip(incoming.balance.as_ref()))
+                        .is_some_and(|(before, after)| after.cmp(before) == Ordering::Less)
+            });
+            for mut incoming in source.windows {
                 let key = (source.key.clone(), incoming.key.clone());
                 seen_windows.insert(key.clone());
                 report.windows_updated += 1;
                 let old = self.windows.remove(&key);
+                // Credit billing resolves the provider's rounded 0..1% remainder.
+                // Retain that evidence through unchanged polls, until quota returns.
+                let credit_exhausted = incoming.used_percent.is_some_and(|used| used >= 99.)
+                    && (credit_decreased || old.as_ref().is_some_and(|old| old.credit_exhausted))
+                    && !quota_deadline_rollover(
+                        old.as_ref().and_then(|old| old.reset_at),
+                        incoming.reset_at,
+                        observed_at,
+                    );
+                if credit_exhausted {
+                    incoming.used_percent = Some(100.);
+                }
                 let history_guard = self.reset_guards.get(&key).copied();
                 let pre = old
                     .as_ref()
@@ -438,6 +461,7 @@ impl QuotaModel {
                     .or_else(|| old.as_ref().and_then(|old| old.duration));
                 let label = window_label(&incoming.key, duration);
                 let mut state = WindowState {
+                    credit_exhausted,
                     source_key: source.key.clone(),
                     source_label: source.label.clone(),
                     window_key: incoming.key.clone(),
@@ -1268,6 +1292,22 @@ mod tests {
     use super::*;
     use crate::prediction::PredictionState;
     use serde_json::json;
+
+    #[test]
+    fn credit_billing_resolves_fractional_zero_and_clears_on_reset() {
+        let mut model = QuotaModel::new("credit-zero");
+        let snapshot = |used, balance| json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":used,"windowDurationMins":10080,"resetsAt":99999},"credits":{"balance":balance}}});
+        model.ingest_json(&snapshot(99.4, "1000"), 100).unwrap();
+        assert!((view(&model, 100).remaining_percent.unwrap() - 0.6).abs() < 0.000001);
+        model.ingest_json(&snapshot(99.4, "990"), 130).unwrap();
+        assert_eq!(view(&model, 130).remaining_percent, Some(0.));
+        model.ingest_json(&snapshot(99.4, "990"), 160).unwrap();
+        assert_eq!(view(&model, 160).remaining_percent, Some(0.));
+        model.ingest_json(&snapshot(0., "990"), 190).unwrap();
+        assert_eq!(view(&model, 190).remaining_percent, Some(100.));
+        model.ingest_json(&snapshot(50., "980"), 220).unwrap();
+        assert_eq!(view(&model, 220).remaining_percent, Some(50.));
+    }
 
     fn payload(used: f64, reset: i64) -> Value {
         json!({"rateLimits": {"limitId":"codex", "primary":{"usedPercent":used, "windowDurationMins":300,"resetsAt":reset}}})

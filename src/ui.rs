@@ -352,6 +352,7 @@ struct MainCache {
     recent_events: Vec<HistoryEvent>,
     recent_tooltip: String,
     historical_rate: Option<f64>,
+    historical_credit_rate: Option<f64>,
 }
 /// Native window managers may apply a stale minimum height to the first
 /// resize request. Constraints are sent first; height converges separately,
@@ -2665,6 +2666,13 @@ impl WidgetApp {
                     self.quota.account_id(),
                 )
             }),
+            historical_credit_rate: live.as_ref().and_then(|v| {
+                quota_widget::consumption::historical_credit_rate(
+                    &self.history,
+                    &v.source_key,
+                    v.observed_at,
+                )
+            }),
         };
     }
     fn event_pricing_tooltip(&self, e: &TokenEvent) -> String {
@@ -3178,13 +3186,24 @@ impl WidgetApp {
                     .as_ref()
                     .and_then(|v| v.rate_per_hour)
                     .or(historical_rate);
-                let rate = measured_rate
-                    .map(|r| format!("{r:.2} 百分點 / 小時"))
-                    .unwrap_or_else(|| "— 等待量測".into());
                 let credits = self.quota.credits(now());
                 let credit = credits
                     .iter()
                     .find(|c| view.as_ref().is_none_or(|v| c.source_key == v.source_key));
+                let credit_mode = view
+                    .as_ref()
+                    .and_then(|v| v.remaining_percent)
+                    .is_some_and(|p| p <= 0.);
+                let credit_rate = credit
+                    .and_then(|c| c.rate_per_minute)
+                    .map(|r| r * 60.)
+                    .or(self.main_cache.historical_credit_rate);
+                let rate = if credit_mode {
+                    credit_rate.map(|r| format!("{r:.2} 點 / 小時"))
+                } else {
+                    measured_rate.map(|r| format!("{r:.2} 百分點 / 小時"))
+                }
+                .unwrap_or_else(|| "— 等待量測".into());
                 let credit_text = credit
                     .map(|c| {
                         if c.unlimited {
@@ -3200,9 +3219,12 @@ impl WidgetApp {
                     .filter(|v| v.is_finite())
                     .map(|v| format!("{v:.2}"))
                     .unwrap_or_else(|| credit_text.clone());
-                let short_rate = measured_rate
-                    .map(|r| format!("{r:.2}%/時"))
-                    .unwrap_or_else(|| "等待量測".into());
+                let short_rate = if credit_mode {
+                    credit_rate.map(|r| format!("{r:.2}點/時"))
+                } else {
+                    measured_rate.map(|r| format!("{r:.2}%/時"))
+                }
+                .unwrap_or_else(|| "等待量測".into());
                 let short_rate = tr(short_rate);
                 let rate = tr(rate);
                 let short_credit = tr(short_credit);

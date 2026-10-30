@@ -4,6 +4,52 @@ use crate::{
     model::{HistoryEvent, HistoryKind, WindowView},
 };
 
+/// Recent recorded credit deltas survive an app restart and intermittent polls.
+pub fn historical_credit_rate(history: &[HistoryEvent], source: &str, at: i64) -> Option<f64> {
+    let mut rows: Vec<_> = history
+        .iter()
+        .filter(|e| {
+            e.source_key == source
+                && e.observed_at_unix <= at
+                && matches!(
+                    e.kind,
+                    HistoryKind::CreditDecrease
+                        | HistoryKind::CreditTopUp
+                        | HistoryKind::QuotaReset
+                )
+        })
+        .collect();
+    rows.sort_by_key(|e| e.observed_at_unix);
+    let mut recent = Vec::new();
+    for row in rows.iter().rev() {
+        if row.kind != HistoryKind::CreditDecrease {
+            break;
+        }
+        recent.push(*row);
+        if recent.len() == 6 {
+            break;
+        }
+    }
+    let latest = *recent.first()?;
+    let earliest = *recent.last()?;
+    let elapsed = latest.observed_at_unix - earliest.observed_at_unix;
+    if elapsed <= 0 {
+        return None;
+    }
+    let amount = recent
+        .iter()
+        .take(recent.len() - 1)
+        .try_fold(0., |total, row| {
+            row.delta
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.)
+                .map(|v| total + v)
+        })?;
+    let rate = amount * 3600. / elapsed as f64;
+    (rate.is_finite() && rate > 0.).then_some(rate)
+}
+
 pub fn historical_rate(
     history: &[HistoryEvent],
     view: &WindowView,
@@ -57,6 +103,24 @@ pub fn historical_rate(
 mod tests {
     use super::*;
     use crate::model::QuotaModel;
+    #[test]
+    fn recorded_credit_rate_survives_restart_and_stops_at_top_up() {
+        let mut model = QuotaModel::new("credit-rate");
+        for (at, balance) in [(100, "1000"), (130, "990"), (160, "980"), (190, "970")] {
+            model.ingest_json(&serde_json::json!({"rateLimits":{"limitId":"codex","credits":{"balance":balance}}}), at).unwrap();
+        }
+        let saved = serde_json::to_string(&model.history).unwrap();
+        let history = serde_json::from_str::<Vec<HistoryEvent>>(&saved).unwrap();
+        assert_eq!(historical_credit_rate(&history, "codex", 190), Some(1200.));
+        assert_eq!(historical_credit_rate(&history, "other", 190), None);
+        model
+            .ingest_json(
+                &serde_json::json!({"rateLimits":{"limitId":"codex","credits":{"balance":"1100"}}}),
+                220,
+            )
+            .unwrap();
+        assert_eq!(historical_credit_rate(&model.history, "codex", 220), None);
+    }
     fn fixtures() -> (Vec<HistoryEvent>, WindowView) {
         let mut model = QuotaModel::default();
         for (t, used) in [(100, 20), (700, 21), (1300, 22), (1900, 23)] {

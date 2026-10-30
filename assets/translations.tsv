@@ -191,6 +191,8 @@ DEMO：不讀取任何真實歷史	DEMO: no real history is read	DEMO：不读�
 點數 {short_credit}	Credits {short_credit}	点数 {short_credit}
 {r:.2} 百分點 / 小時	{r:.2} percentage points / hour	{r:.2} 百分点 / 小时
 {r:.2}%/時	{r:.2}%/h	{r:.2}%/时
+{r:.2}點/時	{r:.2} credits/h	{r:.2}点/时
+{r:.2} 點 / 小時	{r:.2} credits / hour	{r:.2} 点 / 小时
 {r:.2}%/時（歷史）	{r:.2}%/h (history)	{r:.2}%/时（历史）
 狀態：{}	Status: {}	状态：{}
 匯入警告：{}	Import warnings: {}	导入警告：{}
